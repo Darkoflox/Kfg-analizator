@@ -14,16 +14,3 @@ https://cdn.jsdelivr.net/gh/xiaoji235/airport-free/v2ray/v2rayshare.txt
 https://raw.githubusercontent.com/barry-far/V2ray-config/main/Sub1.txt
 https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt
 
-# Telegram каналы
-https://t.me/s/vless_free_keys
-https://t.me/s/SOSkeyNET
-https://t.me/s/iranconnecting
-https://t.me/s/Groove_Vpn
-https://t.me/s/Farah_VPN
-https://t.me/s/byiroh
-https://t.me/s/v2ray_free_conf
-https://t.me/s/Natrixo
-https://t.me/s/vless_vpns
-https://t.me/s/VlessTrogan
-https://t.me/s/vlesstrojan
-https://t.me/s/outlinevpn_ru
