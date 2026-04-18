@@ -20,8 +20,8 @@ STATS = OUTPUT_DIR / "stats.json"
 SOURCES_FILE = Path("sources.txt")
 README = Path("README.md")
 
-REQUEST_DELAY = 4.0      # ← Увеличено для безопасности
-TCP_TIMEOUT = 6
+REQUEST_DELAY = 4.0
+TCP_TIMEOUT = 3                           # уменьшено с 6 до 3 секунд
 
 SUPPORTED = ["vmess", "vless", "trojan", "ss", "ssr", "hysteria2", "tuic"]
 
@@ -44,12 +44,16 @@ def fetch(url):
         return None
 
 def tcp_check(link):
+    """Быстрая TCP‑проверка с connect_ex"""
     try:
         p = urlparse(link)
         host = p.hostname
         port = p.port or 443
-        with socket.create_connection((host, port), TCP_TIMEOUT):
-            return True
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(TCP_TIMEOUT)
+        result = sock.connect_ex((host, port))
+        sock.close()
+        return result == 0
     except:
         return False
 
@@ -120,9 +124,13 @@ def main():
                 all_configs.extend([l.strip() for l in lines if any(l.startswith(p + "://") for p in SUPPORTED)])
         time.sleep(REQUEST_DELAY)
 
-    # Очистка + фильтрация
+    print(f"📦 Всего найдено ссылок: {len(all_configs)}")
+    print("🔍 Начинаю TCP‑проверку и фильтрацию по белому списку...")
+
     unique = {}
-    for link in all_configs:
+    for i, link in enumerate(all_configs, 1):
+        if i % 100 == 0:
+            print(f"   Прогресс: {i}/{len(all_configs)}")
         if tcp_check(link) and is_in_whitelist(link):
             unique[config_hash(link)] = link
 
@@ -147,7 +155,11 @@ def main():
     with open(SINGBOX_SUB, 'w', encoding='utf-8') as f:
         json.dump({"outbounds": [{"type": "urltest", "tag": "Kfg-analyzer", "outbounds": android_configs}]}, f, indent=2)
 
-    stats = {"total_android": len(android_configs), "ios_top50": len(ios_configs), "last_update": datetime.now().strftime("%Y-%m-%d %H:%M UTC")}
+    stats = {
+        "total_android": len(android_configs),
+        "ios_top50": len(ios_configs),
+        "last_update": datetime.now().strftime("%Y-%m-%d %H:%M UTC")
+    }
     json.dump(stats, open(STATS, 'w'), indent=2)
 
     print(f"✅ Готово! Android: {len(android_configs)} | iOS: {len(ios_configs)}")
