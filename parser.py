@@ -1,5 +1,4 @@
 import sys
-# Принудительный сброс буфера вывода
 sys.stdout.reconfigure(line_buffering=True)
 
 import requests
@@ -13,8 +12,10 @@ import os
 from urllib.parse import urlparse, unquote, parse_qs, urlunparse
 from datetime import datetime, timedelta
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
-# Попытка импорта telethon (если не установлен - не fatal)
+# Попытка импорта telethon
 try:
     from telethon import TelegramClient
     from telethon.tl.types import MessageEntityTextUrl
@@ -32,16 +33,16 @@ IOS_SUB = OUTPUT_DIR / "sub_ios.txt"
 SINGBOX_SUB = OUTPUT_DIR / "sub_singbox.json"
 STATS = OUTPUT_DIR / "stats.json"
 SOURCES_FILE = Path("sources.txt")
-README = Path("README.md")
 LAST_IDS_FILE = Path("last_ids.json")
 
 REQUEST_DELAY = 4.0
-TCP_TIMEOUT = 3
+TCP_TIMEOUT = 2.5                # чуть снижено
 FRESH_HOURS_LIMIT = 2
+MAX_WORKERS = 30                 # количество одновременных TCP-проверок
 
 SUPPORTED = ["vmess", "vless", "trojan", "ss", "ssr", "hysteria2", "tuic"]
 
-# ========== ЗАГРУЗКА БЕЛОГО СПИСКА ==========
+# ========== БЕЛЫЙ СПИСОК ==========
 def load_whitelist():
     domain_list = set()
     try:
@@ -57,8 +58,7 @@ DOMAIN_WHITELIST = load_whitelist()
 def fetch(url):
     try:
         return requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15).content
-    except Exception as e:
-        print(f"⚠️ Ошибка загрузки {url}: {e}", flush=True)
+    except:
         return None
 
 def tcp_check(link):
@@ -120,7 +120,7 @@ def priority_key(link):
     if 'trojan' in lower: return 40
     return 20
 
-# ========== TELEGRAM ==========
+# ========== TELEGRAM (как было) ==========
 def load_last_ids():
     if LAST_IDS_FILE.exists():
         with open(LAST_IDS_FILE, 'r') as f:
@@ -169,7 +169,7 @@ async def fetch_new_telegram_configs(client, channel_username):
 
 # ========== MAIN ==========
 def main():
-    print("🚀 Kfg-analyzer Parser v3.3 запущен", flush=True)
+    print("🚀 Kfg-analyzer Parser v3.4 (многопоточный) запущен", flush=True)
 
     if not SOURCES_FILE.exists():
         print(f"❌ Файл {SOURCES_FILE} не найден!", flush=True)
@@ -182,12 +182,12 @@ def main():
     telegram_sources = [s for s in sources if 't.me' in s]
     other_sources = [s for s in sources if 't.me' not in s]
 
-    # Telegram
+    # --- Telegram ---
     if telegram_sources and TELETHON_AVAILABLE:
         api_id = os.environ.get('TG_API_ID')
         api_hash = os.environ.get('TG_API_HASH')
         if not api_id or not api_hash:
-            print("⚠️ Не заданы TG_API_ID / TG_API_HASH в секретах. Пропускаю Telegram.", flush=True)
+            print("⚠️ Нет TG_API_ID / TG_API_HASH, Telegram пропущен.", flush=True)
         else:
             try:
                 api_id = int(api_id)
@@ -203,13 +203,13 @@ def main():
                         new = client.loop.run_until_complete(
                             fetch_new_telegram_configs(client, username)
                         )
-                        print(f"   ➕ Найдено новых конфигов: {len(new)}", flush=True)
+                        print(f"   ➕ Новых конфигов: {len(new)}", flush=True)
                         all_configs.extend(new)
                     except Exception as e:
-                        print(f"❌ Ошибка при обработке {username}: {e}", flush=True)
+                        print(f"❌ Ошибка {username}: {e}", flush=True)
                     time.sleep(2)
 
-    # Обычные URL
+    # --- Обычные URL ---
     for src in other_sources:
         print(f"📥 Скачиваю {src}", flush=True)
         content = fetch(src)
@@ -219,15 +219,32 @@ def main():
             all_configs.extend(configs_from_file)
         time.sleep(REQUEST_DELAY)
 
-    print(f"📦 Всего найдено ссылок: {len(all_configs)}", flush=True)
-    print("🔍 Начинаю TCP‑проверку и фильтрацию по белому списку...", flush=True)
+    # Удаление дубликатов перед проверкой (по точному совпадению строки)
+    all_configs = list(set(all_configs))
+    total = len(all_configs)
+    print(f"📦 Всего уникальных ссылок: {total}", flush=True)
+    print("🔍 Многопоточная TCP-проверка и белый список...", flush=True)
+
+    # --- Функция проверки одного конфига ---
+    def check_config(link):
+        if tcp_check(link) and is_in_whitelist(link):
+            return config_hash(link), link
+        return None, None
 
     unique = {}
-    for i, link in enumerate(all_configs, 1):
-        if i % 100 == 0:
-            print(f"   Прогресс: {i}/{len(all_configs)}", flush=True)
-        if tcp_check(link) and is_in_whitelist(link):
-            unique[config_hash(link)] = link
+    progress_lock = Lock()
+    completed = 0
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(check_config, link): link for link in all_configs}
+        for future in as_completed(futures):
+            h, link = future.result()
+            if h:
+                unique[h] = link
+            with progress_lock:
+                completed += 1
+                if completed % 100 == 0 or completed == total:
+                    print(f"   Прогресс: {completed}/{total}", flush=True)
 
     valid = [rename_config(link) for link in unique.values()]
     valid.sort(key=priority_key, reverse=True)
@@ -235,7 +252,7 @@ def main():
     android_configs = valid[:4000]
     ios_configs = valid[:50]
 
-    # Сохранение
+    # --- Сохранение ---
     b64 = base64.b64encode('\n'.join(android_configs).encode()).decode()
     MAIN_SUB.write_text(b64)
 
