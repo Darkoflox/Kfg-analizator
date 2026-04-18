@@ -5,27 +5,35 @@ import re
 import time
 import hashlib
 import socket
+import os
 from urllib.parse import urlparse, unquote, parse_qs, urlunparse
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from collections import defaultdict
 
+# --- Telethon для Telegram ---
+from telethon import TelegramClient
+from telethon.tl.types import MessageEntityTextUrl
+
+# ========== НАСТРОЙКИ ==========
 OUTPUT_DIR = Path("public")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-MAIN_SUB = OUTPUT_DIR / "sub.txt"          # Android — до 4000
-IOS_SUB = OUTPUT_DIR / "sub_ios.txt"       # iOS — топ-50
+MAIN_SUB = OUTPUT_DIR / "sub.txt"
+IOS_SUB = OUTPUT_DIR / "sub_ios.txt"
 SINGBOX_SUB = OUTPUT_DIR / "sub_singbox.json"
 STATS = OUTPUT_DIR / "stats.json"
 SOURCES_FILE = Path("sources.txt")
 README = Path("README.md")
+LAST_IDS_FILE = Path("last_ids.json")          # хранение ID обработанных постов ТГ
 
 REQUEST_DELAY = 4.0
-TCP_TIMEOUT = 3                           # уменьшено с 6 до 3 секунд
+TCP_TIMEOUT = 3                                 # секунд на TCP‑проверку
+FRESH_HOURS_LIMIT = 2                           # брать посты не старше N часов
 
 SUPPORTED = ["vmess", "vless", "trojan", "ss", "ssr", "hysteria2", "tuic"]
 
-# Загрузка белых списков RKP
+# ========== ЗАГРУЗКА БЕЛОГО СПИСКА ==========
 def load_whitelist():
     domain_list = set()
     try:
@@ -37,6 +45,7 @@ def load_whitelist():
 
 DOMAIN_WHITELIST = load_whitelist()
 
+# ========== УТИЛИТЫ ==========
 def fetch(url):
     try:
         return requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15).content
@@ -44,7 +53,6 @@ def fetch(url):
         return None
 
 def tcp_check(link):
-    """Быстрая TCP‑проверка с connect_ex"""
     try:
         p = urlparse(link)
         host = p.hostname
@@ -103,27 +111,107 @@ def priority_key(link):
     if 'trojan' in lower: return 40
     return 20
 
-def main():
-    print("🚀 Kfg-analyzer Parser v3.2 (4000 для Android) запущен")
+# ========== ОБРАБОТКА TELEGRAM (НОВОЕ) ==========
+def load_last_ids():
+    if LAST_IDS_FILE.exists():
+        with open(LAST_IDS_FILE, 'r') as f:
+            return json.load(f)
+    return {}
 
+def save_last_ids(ids_dict):
+    with open(LAST_IDS_FILE, 'w') as f:
+        json.dump(ids_dict, f, indent=2)
+
+def extract_configs_from_text(text):
+    pat = r'(vmess://|vless://|trojan://|ss://|ssr://|hysteria2://|tuic://)[^\s<>"\']+'
+    return re.findall(pat, text)
+
+async def fetch_new_telegram_configs(client, channel_username):
+    """Асинхронно получает новые конфиги из Telegram-канала."""
+    new_configs = []
+    last_ids = load_last_ids()
+    last_id = last_ids.get(channel_username, 0)
+
+    try:
+        messages = await client.get_messages(channel_username, limit=20)
+
+        for message in messages:
+            if message.id <= last_id:
+                break
+
+            # Фильтр по времени
+            time_diff = datetime.now(message.date.tzinfo) - message.date
+            if time_diff > timedelta(hours=FRESH_HOURS_LIMIT):
+                continue
+
+            # Текст сообщения
+            if message.text:
+                new_configs.extend(extract_configs_from_text(message.text))
+
+            # Ссылки в entities
+            if message.entities:
+                for entity in message.entities:
+                    if isinstance(entity, MessageEntityTextUrl):
+                        url = entity.url
+                        if any(url.startswith(p + "://") for p in SUPPORTED):
+                            new_configs.append(url)
+
+        if messages:
+            last_ids[channel_username] = max(last_id, messages[0].id)
+            save_last_ids(last_ids)
+
+    except Exception as e:
+        print(f"❌ Ошибка в канале {channel_username}: {e}")
+
+    return new_configs
+
+# ========== ГЛАВНАЯ ЛОГИКА ==========
+def main():
+    print("🚀 Kfg-analyzer Parser v3.3 (Telegram только свежее)")
+
+    # Читаем источники
     with open(SOURCES_FILE, 'r', encoding='utf-8') as f:
         sources = [line.strip() for line in f if line.strip() and not line.startswith('#')]
 
     all_configs = []
-    for src in sources:
-        if 't.me' in src:
-            content = fetch(src)
-            if content:
-                html = content.decode('utf-8', errors='ignore')
-                pat = r'(vmess://|vless://|trojan://|ss://|ssr://|hysteria2://|tuic://)[^\s<>"\']+'
-                all_configs.extend(re.findall(pat, html))
+
+    # Разделяем источники: Telegram и остальные
+    telegram_sources = [s for s in sources if 't.me' in s]
+    other_sources = [s for s in sources if 't.me' not in s]
+
+    # --- Обработка Telegram через Telethon ---
+    if telegram_sources:
+        api_id = int(os.environ.get('TG_API_ID', 0))
+        api_hash = os.environ.get('TG_API_HASH', '')
+        if api_id == 0 or not api_hash:
+            print("⚠️ Не заданы TG_API_ID / TG_API_HASH в секретах. Пропускаю Telegram.")
         else:
-            content = fetch(src)
-            if content:
-                lines = content.decode('utf-8', errors='ignore').splitlines()
-                all_configs.extend([l.strip() for l in lines if any(l.startswith(p + "://") for p in SUPPORTED)])
+            client = TelegramClient('tg_session', api_id, api_hash)
+            with client:
+                for channel_url in telegram_sources:
+                    username = '@' + channel_url.split('/')[-1]
+                    print(f"📡 Проверяю канал {username}...")
+                    try:
+                        new = client.loop.run_until_complete(
+                            fetch_new_telegram_configs(client, username)
+                        )
+                        print(f"   ➕ Найдено новых конфигов: {len(new)}")
+                        all_configs.extend(new)
+                    except Exception as e:
+                        print(f"❌ Ошибка при обработке {username}: {e}")
+                    time.sleep(2)
+
+    # --- Обработка обычных URL (подписки, файлы) ---
+    for src in other_sources:
+        print(f"📥 Скачиваю {src}")
+        content = fetch(src)
+        if content:
+            lines = content.decode('utf-8', errors='ignore').splitlines()
+            configs_from_file = [l.strip() for l in lines if any(l.startswith(p + "://") for p in SUPPORTED)]
+            all_configs.extend(configs_from_file)
         time.sleep(REQUEST_DELAY)
 
+    # --- Удаление дубликатов ---
     print(f"📦 Всего найдено ссылок: {len(all_configs)}")
     print("🔍 Начинаю TCP‑проверку и фильтрацию по белому списку...")
 
@@ -135,23 +223,18 @@ def main():
             unique[config_hash(link)] = link
 
     valid = [rename_config(link) for link in unique.values()]
-
-    # Сортировка по качеству
     valid.sort(key=priority_key, reverse=True)
 
-    # Android — максимум 4000
     android_configs = valid[:4000]
-    # iOS — топ-50
     ios_configs = valid[:50]
 
-    # Сохранение
+    # --- Сохранение результатов ---
     b64 = base64.b64encode('\n'.join(android_configs).encode()).decode()
     MAIN_SUB.write_text(b64)
 
     b64_ios = base64.b64encode('\n'.join(ios_configs).encode()).decode()
     IOS_SUB.write_text(b64_ios)
 
-    # Sing-Box
     with open(SINGBOX_SUB, 'w', encoding='utf-8') as f:
         json.dump({"outbounds": [{"type": "urltest", "tag": "Kfg-analyzer", "outbounds": android_configs}]}, f, indent=2)
 
