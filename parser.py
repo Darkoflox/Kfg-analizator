@@ -1,3 +1,7 @@
+import sys
+# Принудительный сброс буфера вывода
+sys.stdout.reconfigure(line_buffering=True)
+
 import requests
 import base64
 import json
@@ -9,11 +13,15 @@ import os
 from urllib.parse import urlparse, unquote, parse_qs, urlunparse
 from datetime import datetime, timedelta
 from pathlib import Path
-from collections import defaultdict
 
-# --- Telethon для Telegram ---
-from telethon import TelegramClient
-from telethon.tl.types import MessageEntityTextUrl
+# Попытка импорта telethon (если не установлен - не fatal)
+try:
+    from telethon import TelegramClient
+    from telethon.tl.types import MessageEntityTextUrl
+    TELETHON_AVAILABLE = True
+except ImportError:
+    TELETHON_AVAILABLE = False
+    print("⚠️ Telethon не установлен, Telegram-каналы будут пропущены", flush=True)
 
 # ========== НАСТРОЙКИ ==========
 OUTPUT_DIR = Path("public")
@@ -25,11 +33,11 @@ SINGBOX_SUB = OUTPUT_DIR / "sub_singbox.json"
 STATS = OUTPUT_DIR / "stats.json"
 SOURCES_FILE = Path("sources.txt")
 README = Path("README.md")
-LAST_IDS_FILE = Path("last_ids.json")          # хранение ID обработанных постов ТГ
+LAST_IDS_FILE = Path("last_ids.json")
 
 REQUEST_DELAY = 4.0
-TCP_TIMEOUT = 3                                 # секунд на TCP‑проверку
-FRESH_HOURS_LIMIT = 2                           # брать посты не старше N часов
+TCP_TIMEOUT = 3
+FRESH_HOURS_LIMIT = 2
 
 SUPPORTED = ["vmess", "vless", "trojan", "ss", "ssr", "hysteria2", "tuic"]
 
@@ -39,8 +47,8 @@ def load_whitelist():
     try:
         r = requests.get("https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/refs/heads/main/domain.txt", timeout=10)
         domain_list = {line.strip().lower() for line in r.text.splitlines() if line.strip()}
-    except:
-        pass
+    except Exception as e:
+        print(f"⚠️ Не удалось загрузить белый список: {e}", flush=True)
     return domain_list
 
 DOMAIN_WHITELIST = load_whitelist()
@@ -49,7 +57,8 @@ DOMAIN_WHITELIST = load_whitelist()
 def fetch(url):
     try:
         return requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15).content
-    except:
+    except Exception as e:
+        print(f"⚠️ Ошибка загрузки {url}: {e}", flush=True)
         return None
 
 def tcp_check(link):
@@ -111,7 +120,7 @@ def priority_key(link):
     if 'trojan' in lower: return 40
     return 20
 
-# ========== ОБРАБОТКА TELEGRAM (НОВОЕ) ==========
+# ========== TELEGRAM ==========
 def load_last_ids():
     if LAST_IDS_FILE.exists():
         with open(LAST_IDS_FILE, 'r') as f:
@@ -127,7 +136,6 @@ def extract_configs_from_text(text):
     return re.findall(pat, text)
 
 async def fetch_new_telegram_configs(client, channel_username):
-    """Асинхронно получает новые конфиги из Telegram-канала."""
     new_configs = []
     last_ids = load_last_ids()
     last_id = last_ids.get(channel_username, 0)
@@ -138,17 +146,11 @@ async def fetch_new_telegram_configs(client, channel_username):
         for message in messages:
             if message.id <= last_id:
                 break
-
-            # Фильтр по времени
             time_diff = datetime.now(message.date.tzinfo) - message.date
             if time_diff > timedelta(hours=FRESH_HOURS_LIMIT):
                 continue
-
-            # Текст сообщения
             if message.text:
                 new_configs.extend(extract_configs_from_text(message.text))
-
-            # Ссылки в entities
             if message.entities:
                 for entity in message.entities:
                     if isinstance(entity, MessageEntityTextUrl):
@@ -161,49 +163,55 @@ async def fetch_new_telegram_configs(client, channel_username):
             save_last_ids(last_ids)
 
     except Exception as e:
-        print(f"❌ Ошибка в канале {channel_username}: {e}")
+        print(f"❌ Ошибка в канале {channel_username}: {e}", flush=True)
 
     return new_configs
 
-# ========== ГЛАВНАЯ ЛОГИКА ==========
+# ========== MAIN ==========
 def main():
-    print("🚀 Kfg-analyzer Parser v3.3 (Telegram только свежее)")
+    print("🚀 Kfg-analyzer Parser v3.3 запущен", flush=True)
 
-    # Читаем источники
+    if not SOURCES_FILE.exists():
+        print(f"❌ Файл {SOURCES_FILE} не найден!", flush=True)
+        return
+
     with open(SOURCES_FILE, 'r', encoding='utf-8') as f:
         sources = [line.strip() for line in f if line.strip() and not line.startswith('#')]
 
     all_configs = []
-
-    # Разделяем источники: Telegram и остальные
     telegram_sources = [s for s in sources if 't.me' in s]
     other_sources = [s for s in sources if 't.me' not in s]
 
-    # --- Обработка Telegram через Telethon ---
-    if telegram_sources:
-        api_id = int(os.environ.get('TG_API_ID', 0))
-        api_hash = os.environ.get('TG_API_HASH', '')
-        if api_id == 0 or not api_hash:
-            print("⚠️ Не заданы TG_API_ID / TG_API_HASH в секретах. Пропускаю Telegram.")
+    # Telegram
+    if telegram_sources and TELETHON_AVAILABLE:
+        api_id = os.environ.get('TG_API_ID')
+        api_hash = os.environ.get('TG_API_HASH')
+        if not api_id or not api_hash:
+            print("⚠️ Не заданы TG_API_ID / TG_API_HASH в секретах. Пропускаю Telegram.", flush=True)
         else:
+            try:
+                api_id = int(api_id)
+            except ValueError:
+                print("❌ TG_API_ID должен быть числом!", flush=True)
+                return
             client = TelegramClient('tg_session', api_id, api_hash)
             with client:
                 for channel_url in telegram_sources:
                     username = '@' + channel_url.split('/')[-1]
-                    print(f"📡 Проверяю канал {username}...")
+                    print(f"📡 Проверяю канал {username}...", flush=True)
                     try:
                         new = client.loop.run_until_complete(
                             fetch_new_telegram_configs(client, username)
                         )
-                        print(f"   ➕ Найдено новых конфигов: {len(new)}")
+                        print(f"   ➕ Найдено новых конфигов: {len(new)}", flush=True)
                         all_configs.extend(new)
                     except Exception as e:
-                        print(f"❌ Ошибка при обработке {username}: {e}")
+                        print(f"❌ Ошибка при обработке {username}: {e}", flush=True)
                     time.sleep(2)
 
-    # --- Обработка обычных URL (подписки, файлы) ---
+    # Обычные URL
     for src in other_sources:
-        print(f"📥 Скачиваю {src}")
+        print(f"📥 Скачиваю {src}", flush=True)
         content = fetch(src)
         if content:
             lines = content.decode('utf-8', errors='ignore').splitlines()
@@ -211,14 +219,13 @@ def main():
             all_configs.extend(configs_from_file)
         time.sleep(REQUEST_DELAY)
 
-    # --- Удаление дубликатов ---
-    print(f"📦 Всего найдено ссылок: {len(all_configs)}")
-    print("🔍 Начинаю TCP‑проверку и фильтрацию по белому списку...")
+    print(f"📦 Всего найдено ссылок: {len(all_configs)}", flush=True)
+    print("🔍 Начинаю TCP‑проверку и фильтрацию по белому списку...", flush=True)
 
     unique = {}
     for i, link in enumerate(all_configs, 1):
         if i % 100 == 0:
-            print(f"   Прогресс: {i}/{len(all_configs)}")
+            print(f"   Прогресс: {i}/{len(all_configs)}", flush=True)
         if tcp_check(link) and is_in_whitelist(link):
             unique[config_hash(link)] = link
 
@@ -228,7 +235,7 @@ def main():
     android_configs = valid[:4000]
     ios_configs = valid[:50]
 
-    # --- Сохранение результатов ---
+    # Сохранение
     b64 = base64.b64encode('\n'.join(android_configs).encode()).decode()
     MAIN_SUB.write_text(b64)
 
@@ -245,7 +252,7 @@ def main():
     }
     json.dump(stats, open(STATS, 'w'), indent=2)
 
-    print(f"✅ Готово! Android: {len(android_configs)} | iOS: {len(ios_configs)}")
+    print(f"✅ Готово! Android: {len(android_configs)} | iOS: {len(ios_configs)}", flush=True)
 
 if __name__ == "__main__":
     main()
