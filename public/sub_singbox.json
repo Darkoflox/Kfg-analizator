@@ -1,0 +1,9 @@
+{
+  "outbounds": [
+    {
+      "type": "urltest",
+      "tag": "Kfg-analyzer",
+      "outbounds": []
+    }
+  ]
+}
