@@ -44,13 +44,21 @@ DOMAIN_WHITELIST = load_whitelist()
 check_cache = {}
 
 def get_cache_key(link):
-    p = urlparse(link)
+    # FIX: обрабатываем ValueError при парсинге IPv6
+    try:
+        p = urlparse(link)
+    except ValueError:
+        return None
     sni = parse_qs(p.query).get('sni', [''])[0] or parse_qs(p.query).get('host', [''])[0]
     return (p.hostname, p.port or 443, sni)
 
 # ==================== ПРОВЕРКА ====================
 def check_server(link):
     key = get_cache_key(link)
+    if key is None:
+        # Некорректный URL – сразу считаем нерабочим
+        check_cache[key] = False
+        return False
     if key in check_cache:
         return check_cache[key]
 
@@ -61,14 +69,14 @@ def check_server(link):
 
     # 2. Простая HTTP-проверка (самый эффективный способ)
     try:
-        p = urlparse(link)
+        p = urlparse(link)  # здесь уже не вызовет ошибки, т.к. get_cache_key прошёл
         host = p.hostname
         port = p.port or 443
 
         proxies = {"http": None, "https": f"http://{host}:{port}" if "socks" not in link.lower() else None}
 
-        r = requests.get("https://www.gstatic.com/generate_204", 
-                        proxies=proxies, 
+        r = requests.get("https://www.gstatic.com/generate_204",
+                        proxies=proxies,
                         timeout=CHECK_TIMEOUT,
                         allow_redirects=False)
         success = r.status_code in (204, 200)
@@ -81,25 +89,44 @@ def check_server(link):
 def is_in_whitelist(link):
     if not DOMAIN_WHITELIST:
         return True
-    p = urlparse(link)
+    # FIX: обработка ошибки парсинга
+    try:
+        p = urlparse(link)
+    except ValueError:
+        return False
     sni = parse_qs(p.query).get('sni', [''])[0] or parse_qs(p.query).get('host', [''])[0]
     return bool(sni and sni.lower() in DOMAIN_WHITELIST)
 
 # ==================== ОСТАЛЬНЫЕ ФУНКЦИИ ====================
 def config_hash(link):
-    return hashlib.md5(urlparse(link)._replace(fragment="").geturl().encode()).hexdigest()
+    # FIX: обработка ошибки парсинга
+    try:
+        parsed = urlparse(link)
+    except ValueError:
+        return None
+    return hashlib.md5(parsed._replace(fragment="").geturl().encode()).hexdigest()
 
 def rename_config(link):
     protocol = link.split("://")[0].upper()
     transport = ""
     sni = ""
-    if "reality" in link.lower(): transport = "Reality"
-    elif "ws" in link.lower(): transport = "WS"
-    elif "grpc" in link.lower(): transport = "gRPC"
-    elif "hysteria2" in link.lower(): transport = "Hysteria2"
+    if "reality" in link.lower():
+        transport = "Reality"
+    elif "ws" in link.lower():
+        transport = "WS"
+    elif "grpc" in link.lower():
+        transport = "gRPC"
+    elif "hysteria2" in link.lower():
+        transport = "Hysteria2"
 
-    if "sni=" in link or "host=" in link:
-        sni = parse_qs(urlparse(link).query).get('sni', [''])[0] or parse_qs(urlparse(link).query).get('host', [''])[0]
+    # FIX: обработка ошибки парсинга
+    try:
+        parsed = urlparse(link)
+        if "sni=" in link or "host=" in link:
+            sni = parse_qs(parsed.query).get('sni', [''])[0] or parse_qs(parsed.query).get('host', [''])[0]
+    except ValueError:
+        # Если не удалось распарсить, возвращаем ссылку без изменений
+        return link
 
     name = f"{protocol}-{transport}-{sni}-#Kfg-analyzer" if transport else f"{protocol}-#Kfg-analyzer"
     name = re.sub(r'-+', '-', name).strip('-')
@@ -112,16 +139,23 @@ def rename_config(link):
         except:
             pass
     else:
-        parsed = urlparse(link)
+        try:
+            parsed = urlparse(link)  # снова парсим, но уже с обработкой
+        except ValueError:
+            return link
         return urlunparse(parsed._replace(fragment=name))
     return link
 
 def priority_key(link):
     lower = link.lower()
-    if 'reality' in lower: return 100
-    if 'vless' in lower: return 80
-    if 'hysteria2' in lower: return 60
-    if 'trojan' in lower: return 40
+    if 'reality' in lower:
+        return 100
+    if 'vless' in lower:
+        return 80
+    if 'hysteria2' in lower:
+        return 60
+    if 'trojan' in lower:
+        return 40
     return 20
 
 def fetch(url):
@@ -153,8 +187,14 @@ def main():
                 all_configs.extend([l.strip() for l in lines if any(l.startswith(p + "://") for p in SUPPORTED)])
         time.sleep(REQUEST_DELAY)
 
-    # Дедупликация
-    unique_raw = {config_hash(link): link for link in all_configs if any(link.startswith(p + "://") for p in SUPPORTED)}
+    # Дедупликация (пропускаем ссылки с невалидным хешем)
+    unique_raw = {}
+    for link in all_configs:
+        if not any(link.startswith(p + "://") for p in SUPPORTED):
+            continue
+        h = config_hash(link)
+        if h is not None:
+            unique_raw[h] = link
 
     print(f"📦 Уникальных конфигов: {len(unique_raw)}")
 
