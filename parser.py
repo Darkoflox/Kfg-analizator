@@ -110,7 +110,7 @@ def main():
     print("🚀 Kfg-analyzer Parser v3.8 запущен")
 
     if not SOURCES_FILE.exists():
-        print(f"❌ Файл {SOURCES_FILE} не найден! Создайте папку sources/ и файл sources.txt")
+        print(f"❌ Файл {SOURCES_FILE} не найден!")
         return
 
     with open(SOURCES_FILE, 'r', encoding='utf-8') as f:
@@ -153,7 +153,7 @@ def main():
     ios_configs = valid[:50]
 
     if len(android_configs) == 0:
-        print("⚠️ После фильтрации ничего не осталось. Беру первые 200 без проверок.")
+        print("⚠️ После фильтрации 0 конфигов! Беру первые 200.")
         fallback = list(unique_raw.values())[:200]
         android_configs = [rename_config(link) for link in fallback]
         ios_configs = android_configs[:50]
