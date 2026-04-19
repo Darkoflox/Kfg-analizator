@@ -12,8 +12,8 @@ from pathlib import Path
 OUTPUT_DIR = Path("public")
 OUTPUT_DIR.mkdir(exist_ok=True)
 
-MAIN_SUB = OUTPUT_DIR / "sub.txt"          # Android — без лимита
-IOS_SUB = OUTPUT_DIR / "sub_ios.txt"       # iOS — топ-50
+MAIN_SUB = OUTPUT_DIR / "sub.txt"
+IOS_SUB = OUTPUT_DIR / "sub_ios.txt"
 SINGBOX_SUB = OUTPUT_DIR / "sub_singbox.json"
 STATS = OUTPUT_DIR / "stats.json"
 
@@ -27,7 +27,7 @@ CHECK_TIMEOUT = 8
 
 SUPPORTED = ["vmess", "vless", "trojan", "ss", "ssr", "hysteria2", "tuic"]
 
-# ==================== БЕЛЫЕ СПИСКИ RKP ====================
+# ==================== БЕЛЫЕ СПИСКИ ====================
 def load_whitelist():
     domain_list = set()
     ip_list = set()
@@ -60,12 +60,12 @@ def check_server(link):
     if key is None or key in check_cache:
         return check_cache.get(key, False)
 
-    # 1. Проверка белого списка (SNI или IP)
+    # Смягчённая проверка белого списка
     if not is_in_whitelist(link):
         check_cache[key] = False
         return False
 
-    # 2. Быстрая HTTP-проверка (самый эффективный способ)
+    # Быстрая HTTP-проверка
     try:
         p = urlparse(link)
         host = p.hostname
@@ -91,15 +91,13 @@ def is_in_whitelist(link):
         sni = parse_qs(p.query).get('sni', [''])[0] or parse_qs(p.query).get('host', [''])[0]
         target = sni if sni else p.hostname
 
-        # IP-адрес
         if re.match(r'^(\d{1,3}\.){3}\d{1,3}$', target):
             return target in IP_WHITELIST
-        # Домен
         if DOMAIN_WHITELIST:
             return target.lower() in DOMAIN_WHITELIST
         return True
     except:
-        return True
+        return True   # если ошибка — пропускаем
 
 # ==================== ОСТАЛЬНЫЕ ФУНКЦИИ ====================
 def config_hash(link):
@@ -157,7 +155,7 @@ def fetch(url):
         return None
 
 def main():
-    print("🚀 Kfg-analyzer Parser v5.4 (без лимита Android + улучшенная проверка) запущен")
+    print("🚀 Kfg-analyzer Parser v5.5 (финальная версия) запущен")
 
     if not SOURCES_FILE.exists():
         print(f"❌ {SOURCES_FILE} не найден!")
@@ -199,13 +197,12 @@ def main():
     android_configs = valid                    # ← БЕЗ ЛИМИТА
     ios_configs = valid[:50]
 
-    if len(android_configs) == 0:
-        print("⚠️ Ничего не прошло фильтрацию. Беру первые 400 без проверки.")
-        fallback = list(unique_raw.values())[:400]
+    if len(android_configs) < 300:
+        print(f"⚠️ После фильтрации осталось мало ({len(android_configs)}). Включаю мягкий режим.")
+        fallback = list(unique_raw.values())[:800]
         android_configs = [rename_config(link) for link in fallback]
         ios_configs = android_configs[:50]
 
-    # Сохранение
     MAIN_SUB.write_text(base64.b64encode('\n'.join(android_configs).encode()).decode())
     IOS_SUB.write_text(base64.b64encode('\n'.join(ios_configs).encode()).decode())
 
