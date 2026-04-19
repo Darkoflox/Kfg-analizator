@@ -5,7 +5,6 @@ import re
 import time
 import hashlib
 import socket
-import sys
 from urllib.parse import urlparse, parse_qs, urlunparse
 from datetime import datetime
 from pathlib import Path
@@ -22,49 +21,30 @@ SOURCES_DIR = Path("sources")
 SOURCES_DIR.mkdir(exist_ok=True)
 SOURCES_FILE = SOURCES_DIR / "sources.txt"
 
-REQUEST_DELAY = 4.0
+REQUEST_DELAY = 2.5      # ← уменьшил для скорости
 TCP_TIMEOUT = 5.0
-FETCH_TIMEOUT = 15   # максимум 15 секунд на один источник
+FETCH_TIMEOUT = 15
 
 SUPPORTED = ["vmess", "vless", "trojan", "ss", "ssr", "hysteria2", "tuic"]
 
-# ---------- БЕЛЫЙ СПИСОК ----------
 def load_whitelist():
     try:
         r = requests.get("https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/refs/heads/main/domain.txt", timeout=10)
         r.raise_for_status()
         return {line.strip().lower() for line in r.text.splitlines() if line.strip()}
-    except Exception as e:
-        print(f"⚠️ Не удалось загрузить domain.txt: {e}")
+    except:
+        print("⚠️ Не удалось загрузить domain.txt")
         return set()
 
 DOMAIN_WHITELIST = load_whitelist()
 
-# ---------- ЗАЩИЩЁННЫЕ ФУНКЦИИ ----------
-def is_valid_config_url(link):
-    """Жёсткая проверка — пропускает только нормальные конфиги"""
-    if not any(link.startswith(p + "://") for p in SUPPORTED):
-        return False
-    try:
-        parsed = urlparse(link)
-        if not parsed.scheme or not parsed.netloc:
-            return False
-        # Защита от IPv6 ошибок
-        if parsed.hostname and ':' in parsed.hostname and not parsed.hostname.startswith('['):
-            return False
-        return True
-    except:
-        return False
-
 def fetch(url):
-    print(f"📥 Скачиваю {url}")
+    print(f"📥 {url}")
     try:
-        r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=FETCH_TIMEOUT)
-        r.raise_for_status()
-        return r.content
+        return requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=FETCH_TIMEOUT).content
     except Exception as e:
-        print(f"❌ Ошибка скачивания {url}: {e}")
-        return None   # продолжаем работу
+        print(f"❌ Ошибка {url}: {e}")
+        return None
 
 def tcp_check(link):
     try:
@@ -84,9 +64,7 @@ def is_in_whitelist(link):
         return True
     parsed = urlparse(link)
     sni = parse_qs(parsed.query).get('sni', [''])[0] or parse_qs(parsed.query).get('host', [''])[0]
-    if sni and sni.lower() in DOMAIN_WHITELIST:
-        return True
-    return False
+    return bool(sni and sni.lower() in DOMAIN_WHITELIST)
 
 def config_hash(link):
     return hashlib.md5(urlparse(link)._replace(fragment="").geturl().encode()).hexdigest()
@@ -110,8 +88,7 @@ def rename_config(link):
         try:
             data = json.loads(base64.b64decode(link[8:] + "===").decode(errors='ignore'))
             data["ps"] = name
-            new_b64 = base64.b64encode(json.dumps(data, ensure_ascii=False).encode()).decode().rstrip("=")
-            return "vmess://" + new_b64
+            return "vmess://" + base64.b64encode(json.dumps(data, ensure_ascii=False).encode()).decode().rstrip("=")
         except:
             pass
     else:
@@ -128,10 +105,10 @@ def priority_key(link):
     return 20
 
 def main():
-    print("🚀 Kfg-analyzer Parser v3.9 (устойчивая версия) запущен")
+    print("🚀 Kfg-analyzer Parser v3.9 (быстрая версия) запущен")
 
     if not SOURCES_FILE.exists():
-        print(f"❌ Файл {SOURCES_FILE} не найден!")
+        print(f"❌ {SOURCES_FILE} не найден!")
         return
 
     with open(SOURCES_FILE, 'r', encoding='utf-8') as f:
@@ -145,22 +122,19 @@ def main():
             if 't.me' in src:
                 pat = r'(vmess://|vless://|trojan://|ss://|ssr://|hysteria2://|tuic://)[^\s<>"\']+'
                 found = re.findall(pat, text)
-                valid_found = [u for u in found if is_valid_config_url(u)]
-                print(f"   ↳ TG: найдено {len(found)} → валидных {len(valid_found)}")
-                all_configs.extend(valid_found)
+                all_configs.extend(found)
+                print(f"   ↳ TG: {len(found)}")
             else:
                 lines = text.splitlines()
-                from_file = [l.strip() for l in lines if is_valid_config_url(l.strip())]
-                print(f"   ↳ Загружено: {len(from_file)}")
+                from_file = [l.strip() for l in lines if any(l.startswith(p + "://") for p in SUPPORTED)]
                 all_configs.extend(from_file)
+                print(f"   ↳ Загружено: {len(from_file)}")
         time.sleep(REQUEST_DELAY)
 
-    # Дедупликация
-    unique_raw = {config_hash(link): link for link in all_configs}
+    unique_raw = {config_hash(link): link for link in all_configs if any(link.startswith(p + "://") for p in SUPPORTED)}
 
-    print(f"📦 Уникальных конфигов: {len(unique_raw)}")
+    print(f"📦 Уникальных: {len(unique_raw)}")
 
-    # Фильтрация
     unique = {}
     for link in unique_raw.values():
         if tcp_check(link) and is_in_whitelist(link):
@@ -173,12 +147,11 @@ def main():
     ios_configs = valid[:50]
 
     if len(android_configs) == 0:
-        print("⚠️ После фильтрации 0 конфигов! Беру первые 200.")
+        print("⚠️ Ничего не прошло фильтрацию. Беру первые 200.")
         fallback = list(unique_raw.values())[:200]
         android_configs = [rename_config(link) for link in fallback]
         ios_configs = android_configs[:50]
 
-    # Сохранение
     MAIN_SUB.write_text(base64.b64encode('\n'.join(android_configs).encode()).decode())
     IOS_SUB.write_text(base64.b64encode('\n'.join(ios_configs).encode()).decode())
 
