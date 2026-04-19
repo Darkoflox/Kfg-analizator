@@ -15,14 +15,14 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from threading import Lock
 
-# Попытка импорта telethon (если не установлен - не fatal)
+# Попытка импорта telethon
 try:
     from telethon import TelegramClient
     from telethon.tl.types import MessageEntityTextUrl
     TELETHON_AVAILABLE = True
 except ImportError:
     TELETHON_AVAILABLE = False
-    print("⚠️ Telethon не установлен, Telegram-каналы будут пропущены", flush=True)
+    print("⚠️ Telethon не установлен, Telegram-каналы пропущены", flush=True)
 
 # ---------- НАСТРОЙКИ ----------
 OUTPUT_DIR = Path("public")
@@ -36,7 +36,7 @@ SOURCES_FILE = Path("sources.txt")
 LAST_IDS_FILE = Path("last_ids.json")
 
 REQUEST_DELAY = 4.0
-TCP_TIMEOUT = 2.5
+TCP_TIMEOUT = 4.0                # увеличен для надёжности
 FRESH_HOURS_LIMIT = 2
 MAX_WORKERS = 30
 
@@ -48,6 +48,7 @@ def load_whitelist():
     try:
         r = requests.get("https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/refs/heads/main/domain.txt", timeout=10)
         domain_list = {line.strip().lower() for line in r.text.splitlines() if line.strip()}
+        print(f"✅ Белый список загружен: {len(domain_list)} доменов", flush=True)
     except Exception as e:
         print(f"⚠️ Белый список не загружен: {e}", flush=True)
     return domain_list
@@ -169,7 +170,7 @@ async def fetch_new_telegram_configs(client, channel_username):
 
 # ---------- MAIN ----------
 def main():
-    print("🚀 Kfg-analyzer Parser v3.5 (устойчивый) запущен", flush=True)
+    print("🚀 Kfg-analyzer Parser v3.6 (с резервным режимом) запущен", flush=True)
 
     if not SOURCES_FILE.exists():
         print(f"❌ Файл {SOURCES_FILE} не найден! Создаю пустые файлы и выхожу.", flush=True)
@@ -232,9 +233,18 @@ def main():
 
     print("🔍 Многопоточная TCP-проверка и белый список...", flush=True)
 
+    tcp_passed = 0
+    whitelist_passed = 0
+
     def check_config(link):
-        if tcp_check(link) and is_in_whitelist(link):
-            return config_hash(link), link
+        nonlocal tcp_passed, whitelist_passed
+        tcp_ok = tcp_check(link)
+        if tcp_ok:
+            tcp_passed += 1
+            wl_ok = is_in_whitelist(link)
+            if wl_ok:
+                whitelist_passed += 1
+                return config_hash(link), link
         return None, None
 
     unique = {}
@@ -250,7 +260,9 @@ def main():
             with progress_lock:
                 completed += 1
                 if completed % 100 == 0 or completed == total:
-                    print(f"   Прогресс: {completed}/{total}", flush=True)
+                    print(f"   Прогресс: {completed}/{total} (TCP: {tcp_passed}, WL: {whitelist_passed})", flush=True)
+
+    print(f"📊 Итог фильтрации: TCP прошло {tcp_passed}, белый список прошло {whitelist_passed}", flush=True)
 
     valid = [rename_config(link) for link in unique.values()]
     valid.sort(key=priority_key, reverse=True)
@@ -258,7 +270,14 @@ def main():
     android_configs = valid[:4000]
     ios_configs = valid[:50]
 
-    # --- Сохранение (всегда создаём файлы) ---
+    # --- Резервный режим: если после фильтрации ноль, берём первые 200 уникальных ссылок ---
+    if len(android_configs) == 0:
+        print("⚠️ После фильтрации 0 конфигов! Включаю резервный режим (без проверок).", flush=True)
+        fallback = all_configs[:200]
+        android_configs = [rename_config(link) for link in fallback]
+        ios_configs = android_configs[:50]
+
+    # --- Сохранение ---
     create_output_files(android_configs, ios_configs)
 
     print(f"✅ Готово! Android: {len(android_configs)} | iOS: {len(ios_configs)}", flush=True)
