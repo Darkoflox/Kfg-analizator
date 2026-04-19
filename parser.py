@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Kfg-analyzer Parser v4.4 – спецзаголовки подписки + московское время
+# Kfg-analyzer Parser v4.5 – отладка фильтрации + raw-ссылка в README
 
 import requests
 import base64
@@ -13,6 +13,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import sys
+import os
 
 # ==================== НАСТРОЙКИ ====================
 OUTPUT_DIR = Path("public")
@@ -21,7 +22,7 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 MAIN_SUB = OUTPUT_DIR / "sub.txt"
 IOS_SUB = OUTPUT_DIR / "sub_ios.txt"
 SINGBOX_SUB = OUTPUT_DIR / "sub_singbox.json"
-STATS = Path("stats.json")          # в корне для workflow
+STATS = Path("stats.json")
 README = Path("README.md")
 
 SOURCES_DIR = Path("sources")
@@ -29,31 +30,33 @@ SOURCES_DIR.mkdir(exist_ok=True)
 SOURCES_FILE = SOURCES_DIR / "sources.txt"
 
 REQUEST_DELAY = 0.5
-TCP_TIMEOUT = 2.0
+TCP_TIMEOUT = 4.0          # увеличен для надёжности
 FETCH_TIMEOUT = 10
 MAX_WORKERS_FETCH = 10
 MAX_WORKERS_CHECK = 30
 SUPPORTED = ["vmess", "vless", "trojan", "ss", "ssr", "hysteria2", "tuic"]
 
-# Московское время (UTC+3, без перехода на летнее время)
+# Московское время (UTC+3)
 MOSCOW_TZ = timezone(timedelta(hours=3))
 
 def moscow_now():
-    """Возвращает текущее московское время (UTC+3)"""
     return datetime.now(MOSCOW_TZ)
 
-# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
+# ==================== ЗАГРУЗКА БЕЛОГО СПИСКА ====================
 def load_whitelist():
     try:
         r = requests.get("https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/refs/heads/main/domain.txt", timeout=10)
         r.raise_for_status()
-        return {line.strip().lower() for line in r.text.splitlines() if line.strip()}
-    except:
-        print("⚠️ Не удалось загрузить domain.txt", flush=True)
+        whitelist = {line.strip().lower() for line in r.text.splitlines() if line.strip()}
+        print(f"✅ Загружен whitelist: {len(whitelist)} доменов", flush=True)
+        return whitelist
+    except Exception as e:
+        print(f"⚠️ Не удалось загрузить domain.txt: {e}", flush=True)
         return set()
 
 DOMAIN_WHITELIST = load_whitelist()
 
+# ==================== TCP КЭШ ====================
 _tcp_cache = {}
 
 def tcp_check_cached(link):
@@ -71,6 +74,7 @@ def tcp_check_cached(link):
     except (ValueError, socket.error):
         return False
 
+# ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 def get_server_key(link, include_sni=True):
     try:
         p = urlparse(link)
@@ -94,11 +98,13 @@ def priority_key(link):
 
 def is_in_whitelist(link):
     if not DOMAIN_WHITELIST:
-        return True
+        return True   # если белый список пуст, пропускаем
     try:
         parsed = urlparse(link)
         sni = parse_qs(parsed.query).get('sni', [''])[0] or parse_qs(parsed.query).get('host', [''])[0]
-        return bool(sni and sni.lower() in DOMAIN_WHITELIST)
+        if not sni:
+            return False   # нет sni/host – не проходим
+        return sni.lower() in DOMAIN_WHITELIST
     except ValueError:
         return False
 
@@ -165,10 +171,13 @@ def process_source(src):
         print(f"   ↳ Загружено: {len(from_file)}", flush=True)
         return from_file
 
-def update_readme(total_count, update_time_str):
+def update_readme(total_count, update_time_str, raw_url):
     stats_block = f"""<!-- STATS_START -->
 **Всего конфигов:** {total_count}  
 **Обновлено (МСК):** {update_time_str}
+
+**Ссылка для импорта в VPN:**  
+`{raw_url}`
 <!-- STATS_END -->"""
 
     if README.exists():
@@ -201,7 +210,7 @@ def update_readme(total_count, update_time_str):
 
 # ==================== ОСНОВНАЯ ФУНКЦИЯ ====================
 def main():
-    print("🚀 Kfg-analyzer Parser v4.4 (спецзаголовки + МСК) запущен", flush=True)
+    print("🚀 Kfg-analyzer Parser v4.5 (отладка фильтрации) запущен", flush=True)
     sys.stdout.reconfigure(line_buffering=True)
 
     if not SOURCES_FILE.exists():
@@ -233,15 +242,31 @@ def main():
 
     print(f"📦 Уникальных серверов (до проверки): {len(server_best)}", flush=True)
 
-    unique = {}
-    for key, (link, _) in server_best.items():
-        try:
-            if is_in_whitelist(link) and tcp_check_cached(link):
-                unique[config_hash(link)] = link
-        except Exception as e:
-            print(f"⚠️ Ошибка при проверке {key}: {e}", flush=True)
-            continue
+    # --- ОТЛАДКА: проверяем первые 10 серверов ---
+    debug_links = list(server_best.values())[:10]
+    print("\n🔍 Отладка первых 10 серверов:", flush=True)
+    for i, (link, prio) in enumerate(debug_links, 1):
+        wl = is_in_whitelist(link)
+        tcp = tcp_check_cached(link)
+        print(f"  {i}. whitelist={wl}, TCP={tcp}, prio={prio}\n     {link[:100]}...", flush=True)
+    print("", flush=True)
 
+    # Фильтрация
+    unique = {}
+    stats_whitelist_fail = 0
+    stats_tcp_fail = 0
+    for key, (link, _) in server_best.items():
+        if not is_in_whitelist(link):
+            stats_whitelist_fail += 1
+            continue
+        if not tcp_check_cached(link):
+            stats_tcp_fail += 1
+            continue
+        unique[config_hash(link)] = link
+
+    print(f"📊 Статистика фильтрации:", flush=True)
+    print(f"   Отсеяно по whitelist: {stats_whitelist_fail}", flush=True)
+    print(f"   Отсеяно по TCP: {stats_tcp_fail}", flush=True)
     print(f"✅ Отобрано серверов после проверки: {len(unique)}", flush=True)
 
     valid = [rename_config(link) for link in unique.values()]
@@ -250,13 +275,14 @@ def main():
     android_configs = valid[:4000]
     ios_configs = valid[:50]
 
+    # Если ничего не отобрано – используем первые 200 уникальных серверов, но с предупреждением
     if len(android_configs) == 0:
-        print("⚠️ Ничего не прошло фильтрацию. Беру первые 200 уникальных серверов.", flush=True)
+        print("⚠️ Ничего не прошло фильтрацию. Использую первые 200 уникальных серверов (без TCP-проверки).", flush=True)
         fallback = [link for (link, _) in list(server_best.values())[:200]]
         android_configs = [rename_config(link) for link in fallback]
         ios_configs = android_configs[:50]
 
-    # --- Формируем заголовки подписки ---
+    # Заголовки подписки
     sub_header = (
         "#profile-title: Kfg-analyzer\n"
         "#profile-update-interval: 2\n"
@@ -268,33 +294,39 @@ def main():
     full_sub_content = sub_header + "\n".join(android_configs)
     MAIN_SUB.write_text(base64.b64encode(full_sub_content.encode()).decode())
 
-    # Для iOS (можно такой же заголовок)
-    ios_header = sub_header  # или другой, но оставим одинаковый
-    ios_full = ios_header + "\n".join(ios_configs)
+    ios_full = sub_header + "\n".join(ios_configs)
     IOS_SUB.write_text(base64.b64encode(ios_full.encode()).decode())
 
-    # Sing-box файл (без заголовков)
     with open(SINGBOX_SUB, 'w', encoding='utf-8') as f:
         json.dump({"outbounds": [{"type": "urltest", "tag": "Kfg-analyzer", "outbounds": android_configs}]}, f, indent=2)
 
-    # --- Время по Москве ---
+    # Время и статистика
     now_moscow = moscow_now()
-    now_str = now_moscow.strftime("%Y-%m-%d %H:%M:%S %Z")  # например, 2026-04-19 14:03:47 MSK
-    # Для JSON используем просто ISO без часового пояса
+    now_str = now_moscow.strftime("%Y-%m-%d %H:%M:%S MSK")
     now_json = now_moscow.strftime("%Y-%m-%d %H:%M UTC+3")
 
     stats = {
         "total_android": len(android_configs),
         "ios_top50": len(ios_configs),
-        "last_update": now_json
+        "last_update": now_json,
+        "debug_whitelist_fail": stats_whitelist_fail,
+        "debug_tcp_fail": stats_tcp_fail,
+        "unique_servers_before_filter": len(server_best)
     }
     with open(STATS, 'w', encoding='utf-8') as f:
         json.dump(stats, f, indent=2)
 
-    # Обновляем README с московским временем
-    update_readme(len(android_configs), now_str)
+    # Генерация raw-ссылки на sub.txt (если работаем в GitHub Actions)
+    raw_url = "https://raw.githubusercontent.com/REPO_OWNER/REPO_NAME/main/public/sub.txt"
+    if os.getenv("GITHUB_REPOSITORY"):
+        repo = os.getenv("GITHUB_REPOSITORY")
+        raw_url = f"https://raw.githubusercontent.com/{repo}/main/public/sub.txt"
+    else:
+        print("⚠️ Переменная GITHUB_REPOSITORY не найдена, используется шаблон", flush=True)
 
-    # Проверка создания файлов
+    update_readme(len(android_configs), now_str, raw_url)
+
+    # Проверка файлов
     for f in [MAIN_SUB, IOS_SUB, SINGBOX_SUB, STATS]:
         if f.exists():
             print(f"✅ Создан {f}", flush=True)
