@@ -39,6 +39,18 @@ def load_whitelist():
 
 DOMAIN_WHITELIST = load_whitelist()
 
+def is_valid_url(link):
+    """Безопасная проверка, что это валидный URL конфига"""
+    if not any(link.startswith(p + "://") for p in SUPPORTED):
+        return False
+    try:
+        parsed = urlparse(link)
+        if not parsed.scheme or not parsed.netloc:
+            return False
+        return True
+    except:
+        return False
+
 def fetch(url):
     try:
         return requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15).content
@@ -107,7 +119,7 @@ def priority_key(link):
     return 20
 
 def main():
-    print("🚀 Kfg-analyzer Parser v3.8 запущен")
+    print("🚀 Kfg-analyzer Parser v3.8 (исправленный) запущен")
 
     if not SOURCES_FILE.exists():
         print(f"❌ Файл {SOURCES_FILE} не найден!")
@@ -125,19 +137,19 @@ def main():
             if 't.me' in src:
                 pat = r'(vmess://|vless://|trojan://|ss://|ssr://|hysteria2://|tuic://)[^\s<>"\']+'
                 found = re.findall(pat, text)
-                print(f"   ↳ Найдено в TG: {len(found)}")
-                all_configs.extend(found)
+                valid_found = [u for u in found if is_valid_url(u)]
+                print(f"   ↳ Найдено в TG: {len(found)} → валидных: {len(valid_found)}")
+                all_configs.extend(valid_found)
             else:
                 lines = text.splitlines()
-                from_file = [l.strip() for l in lines if any(l.startswith(p + "://") for p in SUPPORTED)]
+                from_file = [l.strip() for l in lines if any(l.startswith(p + "://") for p in SUPPORTED) and is_valid_url(l.strip())]
                 print(f"   ↳ Загружено: {len(from_file)}")
                 all_configs.extend(from_file)
         time.sleep(REQUEST_DELAY)
 
     unique_raw = {}
     for link in all_configs:
-        if any(link.startswith(p + "://") for p in SUPPORTED):
-            unique_raw[config_hash(link)] = link
+        unique_raw[config_hash(link)] = link
 
     print(f"📦 Уникальных конфигов: {len(unique_raw)}")
 
