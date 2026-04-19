@@ -1,38 +1,64 @@
-name: Kfg-analyzer Auto Update
+# 🔧 Kfg-analyzer
 
-on:
-  schedule:
-    - cron: '0 */2 * * *'   # каждые 2 часа
-  workflow_dispatch:
+**Автоматический сборщик и валидатор конфигураций**  
+*Актуальные данные из публичных источников*
 
-permissions:
-  contents: write
+---
 
-jobs:
-  update:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+## 📊 Статистика
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
+<!-- STATS_START -->
+**Всего конфигураций (основной набор):** `...`  
+**Сокращённый набор (топ-50):** `...`  
+**Обновлено:** `...`
+<!-- STATS_END -->
 
-      - name: Install dependencies
-        run: pip install -r requirements.txt
+---
 
-      - name: Run parser
-        run: python parser.py
+## 🔗 Готовые наборы
 
-      - name: Commit & Push
-        run: |
-          git config --global user.name "Kfg Bot"
-          git config --global user.email "bot@kfg.dev"
-          git add public/ README.md
-          if git diff --cached --quiet; then
-            echo "No changes"
-          else
-            git commit -m "🔄 Auto-update $(date -u +'%Y-%m-%d %H:%M UTC')"
-            git push
-          fi
+| Вариант | Ссылка |
+|---------|--------|
+| **Полный набор (до 4000)** | [Основной файл](public/sub.txt) |
+| **Сокращённый набор (топ-50)** | [Файл для iOS](public/sub_ios.txt) |
+| **Формат Sing‑Box** | [JSON‑конфиг](public/sub_singbox.json) |
+
+> 💡 **Использование:**  
+> Ссылку на нужный файл можно импортировать в поддерживаемые приложения.
+
+---
+
+## 📡 Источники данных
+
+Парсер собирает ссылки из:
+- Открытых репозиториев на GitHub
+- Публичных URL‑списков
+- Публичных каналов (веб‑архив)
+
+*Полный перечень источников находится в `sources/sources.txt`*
+
+---
+
+## ⚙️ Принцип работы
+
+1. Каждые **2 часа** запускается автоматический процесс (GitHub Actions)
+2. Скрипт получает данные из всех указанных источников
+3. Проверяет доступность конечных точек
+4. Фильтрует по заданным критериям
+5. Сохраняет результат в папку `public/`
+6. Обновляет файлы в репозитории
+
+---
+
+## 📢 Новости
+
+Обновления и информация:  
+👉 [@Niyakwi_news](https://t.me/Niyakwi_news)
+
+---
+
+## 🛠️ Локальный запуск
+
+```bash
+pip install -r requirements.txt
+python parser.py
