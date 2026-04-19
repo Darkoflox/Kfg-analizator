@@ -1,5 +1,8 @@
 {
   "total_android": 200,
   "ios_top50": 50,
-  "last_update": "2026-04-19 14:08 UTC+3"
+  "last_update": "2026-04-19 14:14 UTC+3",
+  "debug_whitelist_fail": 6409,
+  "debug_tcp_fail": 0,
+  "unique_servers_before_filter": 6409
 }
