@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Kfg-analyzer Parser v4.1 – дедупликация по серверам, многопоточность, кэш TCP
+# Kfg-analyzer Parser v4.2 – обновление README, комментарий в подписке
 
 import requests
 import base64
@@ -22,6 +22,7 @@ MAIN_SUB = OUTPUT_DIR / "sub.txt"
 IOS_SUB = OUTPUT_DIR / "sub_ios.txt"
 SINGBOX_SUB = OUTPUT_DIR / "sub_singbox.json"
 STATS = OUTPUT_DIR / "stats.json"
+README = Path("README.md")          # файл с описанием
 
 SOURCES_DIR = Path("sources")
 SOURCES_DIR.mkdir(exist_ok=True)
@@ -36,7 +37,6 @@ SUPPORTED = ["vmess", "vless", "trojan", "ss", "ssr", "hysteria2", "tuic"]
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 def load_whitelist():
-    """Загружает белый список доменов (sni/host)"""
     try:
         r = requests.get("https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/refs/heads/main/domain.txt", timeout=10)
         r.raise_for_status()
@@ -47,11 +47,9 @@ def load_whitelist():
 
 DOMAIN_WHITELIST = load_whitelist()
 
-# ---------- КЭШ TCP ----------
 _tcp_cache = {}
 
 def tcp_check_cached(link):
-    """Проверяет доступность порта (хост+порт), кэширует результат"""
     try:
         p = urlparse(link)
         if not p.hostname or not p.port:
@@ -66,13 +64,7 @@ def tcp_check_cached(link):
     except (ValueError, socket.error):
         return False
 
-# ---------- Обработка ссылок ----------
 def get_server_key(link, include_sni=True):
-    """
-    Возвращает уникальный ключ сервера:
-    - если include_sni=True: (host, port, sni) – разделяет виртуальные хосты
-    - иначе: (host, port)
-    """
     try:
         p = urlparse(link)
         if not p.hostname or not p.port:
@@ -86,7 +78,6 @@ def get_server_key(link, include_sni=True):
         return None
 
 def priority_key(link):
-    """Приоритет для выбора лучшего конфига на сервере (выше = лучше)"""
     lower = link.lower()
     if 'reality' in lower: return 100
     if 'vless' in lower: return 80
@@ -95,7 +86,6 @@ def priority_key(link):
     return 20
 
 def is_in_whitelist(link):
-    """Проверяет sni/host по белому списку"""
     if not DOMAIN_WHITELIST:
         return True
     try:
@@ -106,11 +96,9 @@ def is_in_whitelist(link):
         return False
 
 def config_hash(link):
-    """MD5 хеш ссылки (без фрагмента) для уникальности"""
     return hashlib.md5(urlparse(link)._replace(fragment="").geturl().encode()).hexdigest()
 
 def rename_config(link):
-    """Переименовывает конфиг: добавляет теги (протокол, транспорт, sni)"""
     protocol = link.split("://")[0].upper()
     transport = ""
     sni = ""
@@ -146,9 +134,7 @@ def rename_config(link):
         except:
             return link
 
-# ---------- Загрузка источников ----------
 def fetch(url):
-    """Загружает содержимое источника"""
     print(f"📥 {url}", flush=True)
     try:
         return requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=FETCH_TIMEOUT).content
@@ -157,7 +143,6 @@ def fetch(url):
         return None
 
 def process_source(src):
-    """Загружает один источник и извлекает ссылки"""
     content = fetch(src)
     if not content:
         return []
@@ -173,9 +158,46 @@ def process_source(src):
         print(f"   ↳ Загружено: {len(from_file)}", flush=True)
         return from_file
 
+def update_readme(total_count, update_time_str):
+    """Обновляет README.md: заменяет блок между <!-- STATS_START --> и <!-- STATS_END -->"""
+    stats_block = f"""<!-- STATS_START -->
+**Всего конфигов:** {total_count}  
+**Обновлено:** {update_time_str}
+<!-- STATS_END -->"""
+
+    if README.exists():
+        with open(README, 'r', encoding='utf-8') as f:
+            content = f.read()
+        # Заменяем содержимое между маркерами
+        pattern = r'(<!-- STATS_START -->).*?(<!-- STATS_END -->)'
+        new_content = re.sub(pattern, rf'\1\n{stats_block}\n\2', content, flags=re.DOTALL)
+        with open(README, 'w', encoding='utf-8') as f:
+            f.write(new_content)
+        print("✅ README.md обновлён", flush=True)
+    else:
+        # Если README нет, создаём с базовой структурой
+        readme_content = f"""# Kfg-analyzer
+
+**Автоматический парсер конфигов**
+
+{stats_block}
+
+### Подписки
+- [Полная](public/sub.txt)
+- [iOS топ-50](public/sub_ios.txt)
+- [Sing-Box](public/sub_singbox.json)
+
+ТГК: https://t.me/Niyakwi_news
+
+Обновление каждые 2 часа.
+"""
+        with open(README, 'w', encoding='utf-8') as f:
+            f.write(readme_content)
+        print("✅ README.md создан", flush=True)
+
 # ==================== ОСНОВНАЯ ФУНКЦИЯ ====================
 def main():
-    print("🚀 Kfg-analyzer Parser v4.1 (дедупликация по серверам) запущен", flush=True)
+    print("🚀 Kfg-analyzer Parser v4.2 (дедупликация по серверам, README) запущен", flush=True)
     sys.stdout.reconfigure(line_buffering=True)
 
     if not SOURCES_FILE.exists():
@@ -192,18 +214,18 @@ def main():
         futures = [executor.submit(process_source, src) for src in sources]
         for future in as_completed(futures):
             all_configs.extend(future.result())
-            time.sleep(REQUEST_DELAY)   # небольшая пауза после каждого источника
+            time.sleep(REQUEST_DELAY)
 
     print(f"📦 Всего ссылок (до дедупликации): {len(all_configs)}", flush=True)
 
     # 3. Группировка по серверам (с учётом SNI) и выбор лучшей ссылки для каждого сервера
-    server_best = {}   # key -> (link, priority)
+    server_best = {}
     for link in all_configs:
         if not any(link.startswith(p + "://") for p in SUPPORTED):
             continue
         key = get_server_key(link, include_sni=True)
         if not key:
-            continue   # ссылки без хоста/порта пропускаем
+            continue
         prio = priority_key(link)
         if key not in server_best or prio > server_best[key][1]:
             server_best[key] = (link, prio)
@@ -236,21 +258,37 @@ def main():
         android_configs = [rename_config(link) for link in fallback]
         ios_configs = android_configs[:50]
 
-    # Запись sub.txt (base64)
-    MAIN_SUB.write_text(base64.b64encode('\n'.join(android_configs).encode()).decode())
-    IOS_SUB.write_text(base64.b64encode('\n'.join(ios_configs).encode()).decode())
+    # Добавляем комментарий в начало sub.txt (для клиентов, поддерживающих #)
+    sub_header = f"# Kfg-analyzer | Обновление каждые 2 часа | TG: https://t.me/Niyakwi_news\n"
+    full_sub_content = sub_header + "\n".join(android_configs)
+    MAIN_SUB.write_text(base64.b64encode(full_sub_content.encode()).decode())
+    # Для iOS тоже добавим комментарий
+    ios_header = f"# Kfg-analyzer (iOS top-50) | Обновление каждые 2 часа | TG: https://t.me/Niyakwi_news\n"
+    ios_full = ios_header + "\n".join(ios_configs)
+    IOS_SUB.write_text(base64.b64encode(ios_full.encode()).decode())
 
     # Запись sub_singbox.json
     with open(SINGBOX_SUB, 'w', encoding='utf-8') as f:
         json.dump({"outbounds": [{"type": "urltest", "tag": "Kfg-analyzer", "outbounds": android_configs}]}, f, indent=2)
 
-    # Статистика
+    # Статистика и обновление README
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M UTC")
     stats = {
         "total_android": len(android_configs),
         "ios_top50": len(ios_configs),
-        "last_update": datetime.now().strftime("%Y-%m-%d %H:%M UTC")
+        "last_update": now_str
     }
     json.dump(stats, open(STATS, 'w'), indent=2)
+
+    # Обновляем README.md
+    update_readme(len(android_configs), now_str)
+
+    # Проверка создания файлов
+    for f in [MAIN_SUB, IOS_SUB, SINGBOX_SUB, STATS]:
+        if f.exists():
+            print(f"✅ Создан {f}", flush=True)
+        else:
+            print(f"⚠️ Файл {f} не создан!", flush=True)
 
     print(f"✅ Готово! Android: {len(android_configs)} | iOS: {len(ios_configs)}", flush=True)
 
