@@ -5,6 +5,7 @@ import re
 import time
 import hashlib
 import socket
+import sys
 from urllib.parse import urlparse, parse_qs, urlunparse
 from datetime import datetime
 from pathlib import Path
@@ -22,40 +23,33 @@ SOURCES_DIR.mkdir(exist_ok=True)
 SOURCES_FILE = SOURCES_DIR / "sources.txt"
 
 REQUEST_DELAY = 4.0
-TCP_TIMEOUT = 4.0
+TCP_TIMEOUT = 5.0
+FETCH_TIMEOUT = 20
 
 SUPPORTED = ["vmess", "vless", "trojan", "ss", "ssr", "hysteria2", "tuic"]
 
 def load_whitelist():
-    domain_list = set()
     try:
         r = requests.get("https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/refs/heads/main/domain.txt", timeout=10)
         r.raise_for_status()
         domain_list = {line.strip().lower() for line in r.text.splitlines() if line.strip()}
         print(f"✅ Загружено {len(domain_list)} доменов из белого списка RKP")
+        return domain_list
     except Exception as e:
-        print(f"⚠️ Не удалось загрузить domain.txt: {e}")
-    return domain_list
+        print(f"❌ Критическая ошибка загрузки белого списка: {e}")
+        sys.exit(1)   # ← Останавливаемся сразу
 
 DOMAIN_WHITELIST = load_whitelist()
 
-def is_valid_url(link):
-    """Безопасная проверка, что это валидный URL конфига"""
-    if not any(link.startswith(p + "://") for p in SUPPORTED):
-        return False
-    try:
-        parsed = urlparse(link)
-        if not parsed.scheme or not parsed.netloc:
-            return False
-        return True
-    except:
-        return False
-
 def fetch(url):
+    print(f"📥 Запрос: {url}")
     try:
-        return requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=15).content
-    except Exception:
-        return None
+        r = requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=FETCH_TIMEOUT)
+        r.raise_for_status()
+        return r.content
+    except Exception as e:
+        print(f"❌ Ошибка при скачивании {url}: {e}")
+        sys.exit(1)   # ← Останавливаемся при любой ошибке скачивания
 
 def tcp_check(link):
     try:
@@ -67,7 +61,8 @@ def tcp_check(link):
         result = sock.connect_ex((host, port))
         sock.close()
         return result == 0
-    except Exception:
+    except Exception as e:
+        print(f"❌ TCP-check ошибка: {e}")
         return False
 
 def is_in_whitelist(link):
@@ -75,14 +70,13 @@ def is_in_whitelist(link):
         return True
     parsed = urlparse(link)
     sni = parse_qs(parsed.query).get('sni', [''])[0] or parse_qs(parsed.query).get('host', [''])[0]
-    if sni and sni.lower() in DOMAIN_WHITELIST:
-        return True
-    return False
+    return bool(sni and sni.lower() in DOMAIN_WHITELIST)
 
 def config_hash(link):
     return hashlib.md5(urlparse(link)._replace(fragment="").geturl().encode()).hexdigest()
 
 def rename_config(link):
+    # ... (твой текущий rename_config без изменений)
     protocol = link.split("://")[0].upper()
     transport = ""
     sni = ""
@@ -119,37 +113,34 @@ def priority_key(link):
     return 20
 
 def main():
-    print("🚀 Kfg-analyzer Parser v3.8 (исправленный) запущен")
+    print("🚀 Kfg-analyzer Parser v3.9 (строгий режим) запущен")
 
     if not SOURCES_FILE.exists():
         print(f"❌ Файл {SOURCES_FILE} не найден!")
-        return
+        sys.exit(1)
 
     with open(SOURCES_FILE, 'r', encoding='utf-8') as f:
         sources = [line.strip() for line in f if line.strip() and not line.startswith('#')]
 
     all_configs = []
     for src in sources:
-        print(f"📥 Скачиваю {src}")
-        content = fetch(src)
+        content = fetch(src)          # ← любая ошибка здесь остановит парсер
         if content:
             text = content.decode('utf-8', errors='ignore')
             if 't.me' in src:
                 pat = r'(vmess://|vless://|trojan://|ss://|ssr://|hysteria2://|tuic://)[^\s<>"\']+'
                 found = re.findall(pat, text)
-                valid_found = [u for u in found if is_valid_url(u)]
-                print(f"   ↳ Найдено в TG: {len(found)} → валидных: {len(valid_found)}")
-                all_configs.extend(valid_found)
+                all_configs.extend(found)
+                print(f"   ↳ TG: найдено {len(found)}")
             else:
                 lines = text.splitlines()
-                from_file = [l.strip() for l in lines if any(l.startswith(p + "://") for p in SUPPORTED) and is_valid_url(l.strip())]
-                print(f"   ↳ Загружено: {len(from_file)}")
+                from_file = [l.strip() for l in lines if any(l.startswith(p + "://") for p in SUPPORTED)]
                 all_configs.extend(from_file)
+                print(f"   ↳ Загружено: {len(from_file)}")
         time.sleep(REQUEST_DELAY)
 
-    unique_raw = {}
-    for link in all_configs:
-        unique_raw[config_hash(link)] = link
+    # Дальше всё как раньше...
+    unique_raw = {config_hash(link): link for link in all_configs if any(link.startswith(p + "://") for p in SUPPORTED)}
 
     print(f"📦 Уникальных конфигов: {len(unique_raw)}")
 
@@ -165,7 +156,7 @@ def main():
     ios_configs = valid[:50]
 
     if len(android_configs) == 0:
-        print("⚠️ После фильтрации 0 конфигов! Беру первые 200.")
+        print("⚠️ После фильтрации 0 конфигов!")
         fallback = list(unique_raw.values())[:200]
         android_configs = [rename_config(link) for link in fallback]
         ios_configs = android_configs[:50]
