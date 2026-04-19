@@ -21,7 +21,7 @@ SOURCES_DIR = Path("sources")
 SOURCES_DIR.mkdir(exist_ok=True)
 SOURCES_FILE = SOURCES_DIR / "sources.txt"
 
-REQUEST_DELAY = 2.5      # ← уменьшил для скорости
+REQUEST_DELAY = 2.5
 TCP_TIMEOUT = 5.0
 FETCH_TIMEOUT = 15
 
@@ -49,22 +49,25 @@ def fetch(url):
 def tcp_check(link):
     try:
         p = urlparse(link)
-        host = p.hostname
-        port = p.port or 443
+        if not p.hostname or not p.port:
+            return False
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(TCP_TIMEOUT)
-        result = sock.connect_ex((host, port))
+        result = sock.connect_ex((p.hostname, p.port))
         sock.close()
         return result == 0
-    except:
+    except (ValueError, socket.error):
         return False
 
 def is_in_whitelist(link):
     if not DOMAIN_WHITELIST:
         return True
-    parsed = urlparse(link)
-    sni = parse_qs(parsed.query).get('sni', [''])[0] or parse_qs(parsed.query).get('host', [''])[0]
-    return bool(sni and sni.lower() in DOMAIN_WHITELIST)
+    try:
+        parsed = urlparse(link)
+        sni = parse_qs(parsed.query).get('sni', [''])[0] or parse_qs(parsed.query).get('host', [''])[0]
+        return bool(sni and sni.lower() in DOMAIN_WHITELIST)
+    except ValueError:
+        return False
 
 def config_hash(link):
     return hashlib.md5(urlparse(link)._replace(fragment="").geturl().encode()).hexdigest()
@@ -73,13 +76,21 @@ def rename_config(link):
     protocol = link.split("://")[0].upper()
     transport = ""
     sni = ""
-    if "reality" in link.lower(): transport = "Reality"
-    elif "ws" in link.lower(): transport = "WS"
-    elif "grpc" in link.lower(): transport = "gRPC"
-    elif "hysteria2" in link.lower(): transport = "Hysteria2"
 
-    if "sni=" in link or "host=" in link:
-        sni = parse_qs(urlparse(link).query).get('sni', [''])[0] or parse_qs(urlparse(link).query).get('host', [''])[0]
+    if "reality" in link.lower():
+        transport = "Reality"
+    elif "ws" in link.lower():
+        transport = "WS"
+    elif "grpc" in link.lower():
+        transport = "gRPC"
+    elif "hysteria2" in link.lower():
+        transport = "Hysteria2"
+
+    try:
+        parsed = urlparse(link)
+        sni = parse_qs(parsed.query).get('sni', [''])[0] or parse_qs(parsed.query).get('host', [''])[0]
+    except ValueError:
+        sni = ""
 
     name = f"{protocol}-{transport}-{sni}-#Kfg-analyzer" if transport else f"{protocol}-#Kfg-analyzer"
     name = re.sub(r'-+', '-', name).strip('-')
@@ -90,11 +101,12 @@ def rename_config(link):
             data["ps"] = name
             return "vmess://" + base64.b64encode(json.dumps(data, ensure_ascii=False).encode()).decode().rstrip("=")
         except:
-            pass
+            return link
     else:
-        parsed = urlparse(link)
-        return urlunparse(parsed._replace(fragment=name))
-    return link
+        try:
+            return urlunparse(parsed._replace(fragment=name))
+        except:
+            return link
 
 def priority_key(link):
     lower = link.lower()
@@ -131,14 +143,27 @@ def main():
                 print(f"   ↳ Загружено: {len(from_file)}")
         time.sleep(REQUEST_DELAY)
 
-    unique_raw = {config_hash(link): link for link in all_configs if any(link.startswith(p + "://") for p in SUPPORTED)}
+    unique_raw = {}
+    for link in all_configs:
+        if not any(link.startswith(p + "://") for p in SUPPORTED):
+            continue
+        try:
+            h = config_hash(link)
+            unique_raw[h] = link
+        except ValueError:
+            print(f"⚠️ Пропущена некорректная ссылка (IPv6): {link[:80]}...")
+            continue
 
     print(f"📦 Уникальных: {len(unique_raw)}")
 
     unique = {}
     for link in unique_raw.values():
-        if tcp_check(link) and is_in_whitelist(link):
-            unique[config_hash(link)] = link
+        try:
+            if tcp_check(link) and is_in_whitelist(link):
+                unique[config_hash(link)] = link
+        except Exception as e:
+            print(f"⚠️ Ошибка при проверке ссылки: {e}\n   {link[:100]}")
+            continue
 
     valid = [rename_config(link) for link in unique.values()]
     valid.sort(key=priority_key, reverse=True)
