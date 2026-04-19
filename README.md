@@ -29,7 +29,7 @@ jobs:
         run: |
           git config --global user.name "Kfg Bot"
           git config --global user.email "bot@kfg.dev"
-          git add public/ stats.json README.md sources/
+          git add public/ README.md sources/
           if git diff --cached --quiet; then
             echo "No changes"
           else
