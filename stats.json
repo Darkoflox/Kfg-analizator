@@ -1,8 +1,8 @@
 {
-  "total_android": 408,
-  "ios_top50": 50,
-  "last_update": "2026-04-19 17:39 UTC+3",
-  "whitelist_fail": 5997,
-  "tcp_fail": 279,
-  "unique_servers_before_filter": 6684
+  "total_android": 18,
+  "ios_top50": 18,
+  "last_update": "2026-04-19 20:37 UTC+3",
+  "whitelist_fail": 5758,
+  "protocol_fail": 670,
+  "unique_servers_before_filter": 6446
 }

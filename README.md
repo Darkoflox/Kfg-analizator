@@ -4,11 +4,12 @@
 
 <!-- STATS_START -->
 <!-- STATS_START -->
-**Всего конфигов:** 408  
-**Обновлено (МСК):** 2026-04-19 17:39:10 MSK
+**Всего конфигов:** 18  
+**Обновлено (МСК):** 2026-04-19 20:37:02 MSK
 
 **Ссылка для импорта в VPN (нажмите для копирования):**  
 `https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/public/sub.txt`
+<!-- STATS_END -->
 <!-- STATS_END -->
 <!-- STATS_END -->
 <!-- STATS_END -->
