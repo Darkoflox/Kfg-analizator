@@ -14,3 +14,7 @@ https://cdn.jsdelivr.net/gh/xiaoji235/airport-free/v2ray/v2rayshare.txt
 https://raw.githubusercontent.com/barry-far/V2ray-config/main/Sub1.txt
 https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile.txt
 
+# Telegram
+https://t.me/v2nodes
+https://t.me/Farah_VPN
+https://t.me/startraderconfig
