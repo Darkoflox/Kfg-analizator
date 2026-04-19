@@ -21,7 +21,7 @@ SOURCES_DIR = Path("sources")
 SOURCES_DIR.mkdir(exist_ok=True)
 SOURCES_FILE = SOURCES_DIR / "sources.txt"
 
-REQUEST_DELAY = 3.5
+REQUEST_DELAY = 3.0
 FETCH_TIMEOUT = 15
 CHECK_TIMEOUT = 8
 
@@ -60,12 +60,10 @@ def check_server(link):
     if key is None or key in check_cache:
         return check_cache.get(key, False)
 
-    # 1. Проверка белого списка (SNI / IP)
     if not is_in_whitelist(link):
         check_cache[key] = False
         return False
 
-    # 2. Быстрая HTTP-проверка (как в RKP)
     try:
         p = urlparse(link)
         host = p.hostname
@@ -155,7 +153,7 @@ def fetch(url):
         return None
 
 def main():
-    print("🚀 Kfg-analyzer Parser v6.0 (финальная версия) запущен")
+    print("🚀 Kfg-analyzer Parser v6.1 (два пула + маршрутизация) запущен")
 
     if not SOURCES_FILE.exists():
         print(f"❌ {SOURCES_FILE} не найден!")
@@ -186,38 +184,51 @@ def main():
 
     print(f"📦 Уникальных конфигов: {len(unique_raw)}")
 
-    unique = {}
+    # ДВА ПУЛА
+    white_configs = []
+    general_configs = []
+
     for link in unique_raw.values():
         if check_server(link):
-            unique[config_hash(link)] = link
+            if is_in_whitelist(link):
+                white_configs.append(link)
+            else:
+                general_configs.append(link)
 
-    valid = [rename_config(link) for link in unique.values()]
+    print(f"📊 White-list пул: {len(white_configs)} | General пул: {len(general_configs)}")
+
+    # Объединяем с приоритетом white
+    valid = white_configs + general_configs
+    valid = [rename_config(link) for link in valid]
     valid.sort(key=priority_key, reverse=True)
 
     android_configs = valid                    # ← БЕЗ ЛИМИТА
     ios_configs = valid[:50]
 
-    if len(android_configs) < 300:
-        print(f"⚠️ После строгой фильтрации осталось мало ({len(android_configs)}). Включаю мягкий режим.")
-        fallback = list(unique_raw.values())[:800]
-        android_configs = [rename_config(link) for link in fallback]
-        ios_configs = android_configs[:50]
-
     # Сохранение
     MAIN_SUB.write_text(base64.b64encode('\n'.join(android_configs).encode()).decode())
     IOS_SUB.write_text(base64.b64encode('\n'.join(ios_configs).encode()).decode())
 
+    # Sing-Box с простой маршрутизацией
+    singbox_config = {
+        "outbounds": [
+            {"type": "urltest", "tag": "Kfg-analyzer", "outbounds": android_configs}
+        ]
+    }
     with open(SINGBOX_SUB, 'w', encoding='utf-8') as f:
-        json.dump({"outbounds": [{"type": "urltest", "tag": "Kfg-analyzer", "outbounds": android_configs}]}, f, indent=2)
+        json.dump(singbox_config, f, indent=2)
 
     stats = {
         "total_android": len(android_configs),
         "ios_top50": len(ios_configs),
+        "white_configs": len(white_configs),
+        "general_configs": len(general_configs),
         "last_update": datetime.now().strftime("%Y-%m-%d %H:%M UTC")
     }
     json.dump(stats, open(STATS, 'w'), indent=2)
 
     print(f"✅ Готово! Android: {len(android_configs)} | iOS: {len(ios_configs)}")
+    print(f"   White: {len(white_configs)} | General: {len(general_configs)}")
 
 if __name__ == "__main__":
     main()
