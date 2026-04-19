@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Kfg-analyzer Parser v4.3 – stats.json в корне для совместимости с workflow
+# Kfg-analyzer Parser v4.4 – спецзаголовки подписки + московское время
 
 import requests
 import base64
@@ -9,7 +9,7 @@ import time
 import hashlib
 import socket
 from urllib.parse import urlparse, parse_qs, urlunparse
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import sys
@@ -21,7 +21,7 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 MAIN_SUB = OUTPUT_DIR / "sub.txt"
 IOS_SUB = OUTPUT_DIR / "sub_ios.txt"
 SINGBOX_SUB = OUTPUT_DIR / "sub_singbox.json"
-STATS = Path("stats.json")          # ← теперь в корне
+STATS = Path("stats.json")          # в корне для workflow
 README = Path("README.md")
 
 SOURCES_DIR = Path("sources")
@@ -34,6 +34,13 @@ FETCH_TIMEOUT = 10
 MAX_WORKERS_FETCH = 10
 MAX_WORKERS_CHECK = 30
 SUPPORTED = ["vmess", "vless", "trojan", "ss", "ssr", "hysteria2", "tuic"]
+
+# Московское время (UTC+3, без перехода на летнее время)
+MOSCOW_TZ = timezone(timedelta(hours=3))
+
+def moscow_now():
+    """Возвращает текущее московское время (UTC+3)"""
+    return datetime.now(MOSCOW_TZ)
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
 def load_whitelist():
@@ -161,7 +168,7 @@ def process_source(src):
 def update_readme(total_count, update_time_str):
     stats_block = f"""<!-- STATS_START -->
 **Всего конфигов:** {total_count}  
-**Обновлено:** {update_time_str}
+**Обновлено (МСК):** {update_time_str}
 <!-- STATS_END -->"""
 
     if README.exists():
@@ -171,7 +178,7 @@ def update_readme(total_count, update_time_str):
         new_content = re.sub(pattern, rf'\1\n{stats_block}\n\2', content, flags=re.DOTALL)
         with open(README, 'w', encoding='utf-8') as f:
             f.write(new_content)
-        print("✅ README.md обновлён", flush=True)
+        print("✅ README.md обновлён (МСК)", flush=True)
     else:
         readme_content = f"""# Kfg-analyzer
 
@@ -194,7 +201,7 @@ def update_readme(total_count, update_time_str):
 
 # ==================== ОСНОВНАЯ ФУНКЦИЯ ====================
 def main():
-    print("🚀 Kfg-analyzer Parser v4.3 (stats.json в корне) запущен", flush=True)
+    print("🚀 Kfg-analyzer Parser v4.4 (спецзаголовки + МСК) запущен", flush=True)
     sys.stdout.reconfigure(line_buffering=True)
 
     if not SOURCES_FILE.exists():
@@ -249,27 +256,42 @@ def main():
         android_configs = [rename_config(link) for link in fallback]
         ios_configs = android_configs[:50]
 
-    # Добавляем комментарий в начало sub.txt
-    sub_header = f"# Kfg-analyzer | Обновление каждые 2 часа | TG: https://t.me/Niyakwi_news\n"
+    # --- Формируем заголовки подписки ---
+    sub_header = (
+        "#profile-title: Kfg-analyzer\n"
+        "#profile-update-interval: 2\n"
+        "#support-url: https://t.me/Niyakwi_news\n"
+        "#announce: Свобода заключается в смелости! Использовать ТОЛЬКО при белом списке.\n"
+        "#subscription-userinfo: upload=0; download=0; total=0; expire=0\n"
+        "\n"
+    )
     full_sub_content = sub_header + "\n".join(android_configs)
     MAIN_SUB.write_text(base64.b64encode(full_sub_content.encode()).decode())
 
-    ios_header = f"# Kfg-analyzer (iOS top-50) | Обновление каждые 2 часа | TG: https://t.me/Niyakwi_news\n"
+    # Для iOS (можно такой же заголовок)
+    ios_header = sub_header  # или другой, но оставим одинаковый
     ios_full = ios_header + "\n".join(ios_configs)
     IOS_SUB.write_text(base64.b64encode(ios_full.encode()).decode())
 
+    # Sing-box файл (без заголовков)
     with open(SINGBOX_SUB, 'w', encoding='utf-8') as f:
         json.dump({"outbounds": [{"type": "urltest", "tag": "Kfg-analyzer", "outbounds": android_configs}]}, f, indent=2)
 
-    now_str = datetime.now().strftime("%Y-%m-%d %H:%M UTC")
+    # --- Время по Москве ---
+    now_moscow = moscow_now()
+    now_str = now_moscow.strftime("%Y-%m-%d %H:%M:%S %Z")  # например, 2026-04-19 14:03:47 MSK
+    # Для JSON используем просто ISO без часового пояса
+    now_json = now_moscow.strftime("%Y-%m-%d %H:%M UTC+3")
+
     stats = {
         "total_android": len(android_configs),
         "ios_top50": len(ios_configs),
-        "last_update": now_str
+        "last_update": now_json
     }
     with open(STATS, 'w', encoding='utf-8') as f:
         json.dump(stats, f, indent=2)
 
+    # Обновляем README с московским временем
     update_readme(len(android_configs), now_str)
 
     # Проверка создания файлов
@@ -279,7 +301,7 @@ def main():
         else:
             print(f"⚠️ Файл {f} не создан!", flush=True)
 
-    print(f"✅ Готово! Android: {len(android_configs)} | iOS: {len(ios_configs)}", flush=True)
+    print(f"✅ Готово! Android: {len(android_configs)} | iOS: {len(ios_configs)} (МСК {now_str})", flush=True)
 
 if __name__ == "__main__":
     main()
