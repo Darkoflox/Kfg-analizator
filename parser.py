@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Kfg-analyzer Parser v4.2 – обновление README, комментарий в подписке
+# Kfg-analyzer Parser v4.3 – stats.json в корне для совместимости с workflow
 
 import requests
 import base64
@@ -21,18 +21,18 @@ OUTPUT_DIR.mkdir(exist_ok=True)
 MAIN_SUB = OUTPUT_DIR / "sub.txt"
 IOS_SUB = OUTPUT_DIR / "sub_ios.txt"
 SINGBOX_SUB = OUTPUT_DIR / "sub_singbox.json"
-STATS = OUTPUT_DIR / "stats.json"
-README = Path("README.md")          # файл с описанием
+STATS = Path("stats.json")          # ← теперь в корне
+README = Path("README.md")
 
 SOURCES_DIR = Path("sources")
 SOURCES_DIR.mkdir(exist_ok=True)
 SOURCES_FILE = SOURCES_DIR / "sources.txt"
 
-REQUEST_DELAY = 0.5          # задержка между источниками (сек)
-TCP_TIMEOUT = 2.0            # таймаут TCP-проверки
-FETCH_TIMEOUT = 10           # таймаут загрузки источника
-MAX_WORKERS_FETCH = 10       # потоков для загрузки источников
-MAX_WORKERS_CHECK = 30       # потоков для TCP-проверки
+REQUEST_DELAY = 0.5
+TCP_TIMEOUT = 2.0
+FETCH_TIMEOUT = 10
+MAX_WORKERS_FETCH = 10
+MAX_WORKERS_CHECK = 30
 SUPPORTED = ["vmess", "vless", "trojan", "ss", "ssr", "hysteria2", "tuic"]
 
 # ==================== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ====================
@@ -159,7 +159,6 @@ def process_source(src):
         return from_file
 
 def update_readme(total_count, update_time_str):
-    """Обновляет README.md: заменяет блок между <!-- STATS_START --> и <!-- STATS_END -->"""
     stats_block = f"""<!-- STATS_START -->
 **Всего конфигов:** {total_count}  
 **Обновлено:** {update_time_str}
@@ -168,14 +167,12 @@ def update_readme(total_count, update_time_str):
     if README.exists():
         with open(README, 'r', encoding='utf-8') as f:
             content = f.read()
-        # Заменяем содержимое между маркерами
         pattern = r'(<!-- STATS_START -->).*?(<!-- STATS_END -->)'
         new_content = re.sub(pattern, rf'\1\n{stats_block}\n\2', content, flags=re.DOTALL)
         with open(README, 'w', encoding='utf-8') as f:
             f.write(new_content)
         print("✅ README.md обновлён", flush=True)
     else:
-        # Если README нет, создаём с базовой структурой
         readme_content = f"""# Kfg-analyzer
 
 **Автоматический парсер конфигов**
@@ -197,18 +194,16 @@ def update_readme(total_count, update_time_str):
 
 # ==================== ОСНОВНАЯ ФУНКЦИЯ ====================
 def main():
-    print("🚀 Kfg-analyzer Parser v4.2 (дедупликация по серверам, README) запущен", flush=True)
+    print("🚀 Kfg-analyzer Parser v4.3 (stats.json в корне) запущен", flush=True)
     sys.stdout.reconfigure(line_buffering=True)
 
     if not SOURCES_FILE.exists():
         print(f"❌ {SOURCES_FILE} не найден!", flush=True)
         return
 
-    # 1. Чтение источников
     with open(SOURCES_FILE, 'r', encoding='utf-8') as f:
         sources = [line.strip() for line in f if line.strip() and not line.startswith('#')]
 
-    # 2. Параллельная загрузка всех источников
     all_configs = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS_FETCH) as executor:
         futures = [executor.submit(process_source, src) for src in sources]
@@ -218,7 +213,6 @@ def main():
 
     print(f"📦 Всего ссылок (до дедупликации): {len(all_configs)}", flush=True)
 
-    # 3. Группировка по серверам (с учётом SNI) и выбор лучшей ссылки для каждого сервера
     server_best = {}
     for link in all_configs:
         if not any(link.startswith(p + "://") for p in SUPPORTED):
@@ -232,7 +226,6 @@ def main():
 
     print(f"📦 Уникальных серверов (до проверки): {len(server_best)}", flush=True)
 
-    # 4. Фильтрация: whitelist + TCP-проверка (с кэшем)
     unique = {}
     for key, (link, _) in server_best.items():
         try:
@@ -244,11 +237,9 @@ def main():
 
     print(f"✅ Отобрано серверов после проверки: {len(unique)}", flush=True)
 
-    # 5. Переименование и сортировка
     valid = [rename_config(link) for link in unique.values()]
     valid.sort(key=priority_key, reverse=True)
 
-    # 6. Формирование выходных файлов
     android_configs = valid[:4000]
     ios_configs = valid[:50]
 
@@ -258,29 +249,27 @@ def main():
         android_configs = [rename_config(link) for link in fallback]
         ios_configs = android_configs[:50]
 
-    # Добавляем комментарий в начало sub.txt (для клиентов, поддерживающих #)
+    # Добавляем комментарий в начало sub.txt
     sub_header = f"# Kfg-analyzer | Обновление каждые 2 часа | TG: https://t.me/Niyakwi_news\n"
     full_sub_content = sub_header + "\n".join(android_configs)
     MAIN_SUB.write_text(base64.b64encode(full_sub_content.encode()).decode())
-    # Для iOS тоже добавим комментарий
+
     ios_header = f"# Kfg-analyzer (iOS top-50) | Обновление каждые 2 часа | TG: https://t.me/Niyakwi_news\n"
     ios_full = ios_header + "\n".join(ios_configs)
     IOS_SUB.write_text(base64.b64encode(ios_full.encode()).decode())
 
-    # Запись sub_singbox.json
     with open(SINGBOX_SUB, 'w', encoding='utf-8') as f:
         json.dump({"outbounds": [{"type": "urltest", "tag": "Kfg-analyzer", "outbounds": android_configs}]}, f, indent=2)
 
-    # Статистика и обновление README
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M UTC")
     stats = {
         "total_android": len(android_configs),
         "ios_top50": len(ios_configs),
         "last_update": now_str
     }
-    json.dump(stats, open(STATS, 'w'), indent=2)
+    with open(STATS, 'w', encoding='utf-8') as f:
+        json.dump(stats, f, indent=2)
 
-    # Обновляем README.md
     update_readme(len(android_configs), now_str)
 
     # Проверка создания файлов
