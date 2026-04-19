@@ -27,55 +27,21 @@ CHECK_TIMEOUT = 8
 
 SUPPORTED = ["vmess", "vless", "trojan", "ss", "ssr", "hysteria2", "tuic"]
 
-# ==================== БЕЛЫЕ СПИСКИ (RKP) ====================
+# ==================== БЕЛЫЕ СПИСКИ ====================
 def load_whitelist():
     domain_list = set()
     ip_list = set()
     try:
-        # Домены
         r = requests.get("https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/refs/heads/main/domain.txt", timeout=10)
-        r.raise_for_status()
         domain_list = {line.strip().lower() for line in r.text.splitlines() if line.strip()}
-
-        # IP
         r = requests.get("https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/refs/heads/main/iP.txt", timeout=10)
-        r.raise_for_status()
         ip_list = {line.strip() for line in r.text.splitlines() if line.strip() and not line.startswith('#')}
-        
         print(f"✅ Загружено: {len(domain_list)} доменов + {len(ip_list)} IP")
     except Exception as e:
         print(f"⚠️ Не удалось загрузить белые списки: {e}")
     return domain_list, ip_list
 
 DOMAIN_WHITELIST, IP_WHITELIST = load_whitelist()
-
-# ==================== БЕЗОПАСНЫЕ ФУНКЦИИ ====================
-def safe_port(parsed):
-    """Защита от IPv6 ошибок"""
-    netloc = parsed.netloc
-    if not netloc:
-        return 443
-    if ']:' in netloc:
-        parts = netloc.rsplit(']:', 1)
-    else:
-        parts = netloc.rsplit(':', 1)
-    if len(parts) == 2:
-        try:
-            return int(parts[1])
-        except ValueError:
-            return 443
-    return 443
-
-def is_valid_config_url(link):
-    if not any(link.startswith(p + "://") for p in SUPPORTED):
-        return False
-    try:
-        p = urlparse(link)
-        if not p.scheme or not p.hostname:
-            return False
-        return True
-    except:
-        return False
 
 # ==================== ПРОВЕРКА ====================
 check_cache = {}
@@ -84,7 +50,7 @@ def get_cache_key(link):
     try:
         p = urlparse(link)
         sni = parse_qs(p.query).get('sni', [''])[0] or parse_qs(p.query).get('host', [''])[0]
-        port = safe_port(p)
+        port = p.port or 443
         return (p.hostname, port, sni)
     except:
         return None
@@ -94,17 +60,16 @@ def check_server(link):
     if key is None or key in check_cache:
         return check_cache.get(key, False)
 
-    # 1. Белый список (домен или IP)
+    # 1. Проверка белого списка (смягчённая)
     if not is_in_whitelist(link):
         check_cache[key] = False
         return False
 
-    # 2. Быстрая HTTP-проверка (самый надёжный способ)
+    # 2. Быстрая HTTP-проверка
     try:
         p = urlparse(link)
         host = p.hostname
-        port = safe_port(p)
-
+        port = p.port or 443
         proxies = {"http": None, "https": f"http://{host}:{port}" if "socks" not in link.lower() else None}
 
         r = requests.get("https://www.gstatic.com/generate_204",
@@ -129,10 +94,12 @@ def is_in_whitelist(link):
         # Если это IP — проверяем по IP_WHITELIST
         if re.match(r'^(\d{1,3}\.){3}\d{1,3}$', target):
             return target in IP_WHITELIST
-        # Иначе — по доменам
-        return target.lower() in DOMAIN_WHITELIST
+        # Если домен — проверяем по DOMAIN_WHITELIST
+        if DOMAIN_WHITELIST:
+            return target.lower() in DOMAIN_WHITELIST
+        return True
     except:
-        return False
+        return True   # если ошибка — пропускаем (лучше иметь конфиг, чем ничего)
 
 # ==================== ОСТАЛЬНЫЕ ФУНКЦИИ ====================
 def config_hash(link):
@@ -190,7 +157,7 @@ def fetch(url):
         return None
 
 def main():
-    print("🚀 Kfg-analyzer Parser v5.2 (стабильная + быстрый check) запущен")
+    print("🚀 Kfg-analyzer Parser v5.3 (смягчённая фильтрация) запущен")
 
     if not SOURCES_FILE.exists():
         print(f"❌ {SOURCES_FILE} не найден!")
@@ -232,9 +199,9 @@ def main():
     android_configs = valid[:4000]
     ios_configs = valid[:50]
 
-    if len(android_configs) == 0:
-        print("⚠️ Ничего не прошло фильтрацию. Беру первые 200.")
-        fallback = list(unique_raw.values())[:200]
+    if len(android_configs) < 100:
+        print(f"⚠️ После фильтрации осталось всего {len(android_configs)} конфигов. Включаю резервный режим.")
+        fallback = list(unique_raw.values())[:400]
         android_configs = [rename_config(link) for link in fallback]
         ios_configs = android_configs[:50]
 
