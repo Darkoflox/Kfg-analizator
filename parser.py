@@ -8,7 +8,6 @@ import socket
 from urllib.parse import urlparse, parse_qs, urlunparse
 from datetime import datetime
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 OUTPUT_DIR = Path("public")
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -28,57 +27,90 @@ CHECK_TIMEOUT = 8
 
 SUPPORTED = ["vmess", "vless", "trojan", "ss", "ssr", "hysteria2", "tuic"]
 
-# ==================== БЕЛЫЙ СПИСОК ====================
+# ==================== БЕЛЫЕ СПИСКИ (RKP) ====================
 def load_whitelist():
+    domain_list = set()
+    ip_list = set()
     try:
+        # Домены
         r = requests.get("https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/refs/heads/main/domain.txt", timeout=10)
         r.raise_for_status()
-        return {line.strip().lower() for line in r.text.splitlines() if line.strip()}
+        domain_list = {line.strip().lower() for line in r.text.splitlines() if line.strip()}
+
+        # IP
+        r = requests.get("https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/refs/heads/main/iP.txt", timeout=10)
+        r.raise_for_status()
+        ip_list = {line.strip() for line in r.text.splitlines() if line.strip() and not line.startswith('#')}
+        
+        print(f"✅ Загружено: {len(domain_list)} доменов + {len(ip_list)} IP")
+    except Exception as e:
+        print(f"⚠️ Не удалось загрузить белые списки: {e}")
+    return domain_list, ip_list
+
+DOMAIN_WHITELIST, IP_WHITELIST = load_whitelist()
+
+# ==================== БЕЗОПАСНЫЕ ФУНКЦИИ ====================
+def safe_port(parsed):
+    """Защита от IPv6 ошибок"""
+    netloc = parsed.netloc
+    if not netloc:
+        return 443
+    if ']:' in netloc:
+        parts = netloc.rsplit(']:', 1)
+    else:
+        parts = netloc.rsplit(':', 1)
+    if len(parts) == 2:
+        try:
+            return int(parts[1])
+        except ValueError:
+            return 443
+    return 443
+
+def is_valid_config_url(link):
+    if not any(link.startswith(p + "://") for p in SUPPORTED):
+        return False
+    try:
+        p = urlparse(link)
+        if not p.scheme or not p.hostname:
+            return False
+        return True
     except:
-        print("⚠️ Не удалось загрузить domain.txt")
-        return set()
+        return False
 
-DOMAIN_WHITELIST = load_whitelist()
-
-# ==================== КЭШ ПРОВЕРОК ====================
+# ==================== ПРОВЕРКА ====================
 check_cache = {}
 
 def get_cache_key(link):
-    # FIX: обрабатываем ValueError при парсинге IPv6
     try:
         p = urlparse(link)
-    except ValueError:
+        sni = parse_qs(p.query).get('sni', [''])[0] or parse_qs(p.query).get('host', [''])[0]
+        port = safe_port(p)
+        return (p.hostname, port, sni)
+    except:
         return None
-    sni = parse_qs(p.query).get('sni', [''])[0] or parse_qs(p.query).get('host', [''])[0]
-    return (p.hostname, p.port or 443, sni)
 
-# ==================== ПРОВЕРКА ====================
 def check_server(link):
     key = get_cache_key(link)
-    if key is None:
-        # Некорректный URL – сразу считаем нерабочим
-        check_cache[key] = False
-        return False
-    if key in check_cache:
-        return check_cache[key]
+    if key is None or key in check_cache:
+        return check_cache.get(key, False)
 
-    # 1. Быстрый TCP + SNI
+    # 1. Белый список (домен или IP)
     if not is_in_whitelist(link):
         check_cache[key] = False
         return False
 
-    # 2. Простая HTTP-проверка (самый эффективный способ)
+    # 2. Быстрая HTTP-проверка (самый надёжный способ)
     try:
-        p = urlparse(link)  # здесь уже не вызовет ошибки, т.к. get_cache_key прошёл
+        p = urlparse(link)
         host = p.hostname
-        port = p.port or 443
+        port = safe_port(p)
 
         proxies = {"http": None, "https": f"http://{host}:{port}" if "socks" not in link.lower() else None}
 
         r = requests.get("https://www.gstatic.com/generate_204",
-                        proxies=proxies,
-                        timeout=CHECK_TIMEOUT,
-                        allow_redirects=False)
+                         proxies=proxies,
+                         timeout=CHECK_TIMEOUT,
+                         allow_redirects=False)
         success = r.status_code in (204, 200)
         check_cache[key] = success
         return success
@@ -87,46 +119,43 @@ def check_server(link):
         return False
 
 def is_in_whitelist(link):
-    if not DOMAIN_WHITELIST:
+    if not DOMAIN_WHITELIST and not IP_WHITELIST:
         return True
-    # FIX: обработка ошибки парсинга
     try:
         p = urlparse(link)
-    except ValueError:
+        sni = parse_qs(p.query).get('sni', [''])[0] or parse_qs(p.query).get('host', [''])[0]
+        target = sni if sni else p.hostname
+
+        # Если это IP — проверяем по IP_WHITELIST
+        if re.match(r'^(\d{1,3}\.){3}\d{1,3}$', target):
+            return target in IP_WHITELIST
+        # Иначе — по доменам
+        return target.lower() in DOMAIN_WHITELIST
+    except:
         return False
-    sni = parse_qs(p.query).get('sni', [''])[0] or parse_qs(p.query).get('host', [''])[0]
-    return bool(sni and sni.lower() in DOMAIN_WHITELIST)
 
 # ==================== ОСТАЛЬНЫЕ ФУНКЦИИ ====================
 def config_hash(link):
-    # FIX: обработка ошибки парсинга
     try:
-        parsed = urlparse(link)
-    except ValueError:
+        p = urlparse(link)
+        return hashlib.md5(p._replace(fragment="").geturl().encode()).hexdigest()
+    except:
         return None
-    return hashlib.md5(parsed._replace(fragment="").geturl().encode()).hexdigest()
 
 def rename_config(link):
     protocol = link.split("://")[0].upper()
     transport = ""
     sni = ""
-    if "reality" in link.lower():
-        transport = "Reality"
-    elif "ws" in link.lower():
-        transport = "WS"
-    elif "grpc" in link.lower():
-        transport = "gRPC"
-    elif "hysteria2" in link.lower():
-        transport = "Hysteria2"
+    if "reality" in link.lower(): transport = "Reality"
+    elif "ws" in link.lower(): transport = "WS"
+    elif "grpc" in link.lower(): transport = "gRPC"
+    elif "hysteria2" in link.lower(): transport = "Hysteria2"
 
-    # FIX: обработка ошибки парсинга
     try:
         parsed = urlparse(link)
-        if "sni=" in link or "host=" in link:
-            sni = parse_qs(parsed.query).get('sni', [''])[0] or parse_qs(parsed.query).get('host', [''])[0]
-    except ValueError:
-        # Если не удалось распарсить, возвращаем ссылку без изменений
-        return link
+        sni = parse_qs(parsed.query).get('sni', [''])[0] or parse_qs(parsed.query).get('host', [''])[0]
+    except:
+        sni = ""
 
     name = f"{protocol}-{transport}-{sni}-#Kfg-analyzer" if transport else f"{protocol}-#Kfg-analyzer"
     name = re.sub(r'-+', '-', name).strip('-')
@@ -140,22 +169,18 @@ def rename_config(link):
             pass
     else:
         try:
-            parsed = urlparse(link)  # снова парсим, но уже с обработкой
-        except ValueError:
-            return link
-        return urlunparse(parsed._replace(fragment=name))
+            parsed = urlparse(link)
+            return urlunparse(parsed._replace(fragment=name))
+        except:
+            pass
     return link
 
 def priority_key(link):
     lower = link.lower()
-    if 'reality' in lower:
-        return 100
-    if 'vless' in lower:
-        return 80
-    if 'hysteria2' in lower:
-        return 60
-    if 'trojan' in lower:
-        return 40
+    if 'reality' in lower: return 100
+    if 'vless' in lower: return 80
+    if 'hysteria2' in lower: return 60
+    if 'trojan' in lower: return 40
     return 20
 
 def fetch(url):
@@ -165,7 +190,7 @@ def fetch(url):
         return None
 
 def main():
-    print("🚀 Kfg-analyzer Parser v5.1 (улучшенная проверка) запущен")
+    print("🚀 Kfg-analyzer Parser v5.2 (стабильная + быстрый check) запущен")
 
     if not SOURCES_FILE.exists():
         print(f"❌ {SOURCES_FILE} не найден!")
@@ -187,18 +212,15 @@ def main():
                 all_configs.extend([l.strip() for l in lines if any(l.startswith(p + "://") for p in SUPPORTED)])
         time.sleep(REQUEST_DELAY)
 
-    # Дедупликация (пропускаем ссылки с невалидным хешем)
     unique_raw = {}
     for link in all_configs:
-        if not any(link.startswith(p + "://") for p in SUPPORTED):
-            continue
-        h = config_hash(link)
-        if h is not None:
-            unique_raw[h] = link
+        if any(link.startswith(p + "://") for p in SUPPORTED):
+            h = config_hash(link)
+            if h:
+                unique_raw[h] = link
 
     print(f"📦 Уникальных конфигов: {len(unique_raw)}")
 
-    # Проверка
     unique = {}
     for link in unique_raw.values():
         if check_server(link):
@@ -211,12 +233,11 @@ def main():
     ios_configs = valid[:50]
 
     if len(android_configs) == 0:
-        print("⚠️ Ничего не прошло. Беру первые 200.")
+        print("⚠️ Ничего не прошло фильтрацию. Беру первые 200.")
         fallback = list(unique_raw.values())[:200]
         android_configs = [rename_config(link) for link in fallback]
         ios_configs = android_configs[:50]
 
-    # Сохранение
     MAIN_SUB.write_text(base64.b64encode('\n'.join(android_configs).encode()).decode())
     IOS_SUB.write_text(base64.b64encode('\n'.join(ios_configs).encode()).decode())
 
