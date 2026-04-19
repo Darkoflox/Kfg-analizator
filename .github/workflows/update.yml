@@ -2,7 +2,7 @@ name: Kfg-analyzer Auto Update
 
 on:
   schedule:
-    - cron: '0 */2 * * *'     # каждые 2 часа
+    - cron: '0 */2 * * *'   # каждые 2 часа
   workflow_dispatch:
 
 permissions:
@@ -29,7 +29,7 @@ jobs:
         run: |
           git config --global user.name "Kfg Bot"
           git config --global user.email "bot@kfg.dev"
-          git add public/ README.md
+          git add public/ stats.json README.md sources/
           if git diff --cached --quiet; then
             echo "No changes"
           else
