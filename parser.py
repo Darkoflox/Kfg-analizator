@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# Kfg-analyzer Parser v4.5 – отладка фильтрации + raw-ссылка в README
+# Kfg-analyzer Parser v4.6 – фикс whitelist (пропуск ссылок без sni/host)
 
 import requests
 import base64
@@ -30,19 +30,18 @@ SOURCES_DIR.mkdir(exist_ok=True)
 SOURCES_FILE = SOURCES_DIR / "sources.txt"
 
 REQUEST_DELAY = 0.5
-TCP_TIMEOUT = 4.0          # увеличен для надёжности
+TCP_TIMEOUT = 4.0
 FETCH_TIMEOUT = 10
 MAX_WORKERS_FETCH = 10
 MAX_WORKERS_CHECK = 30
 SUPPORTED = ["vmess", "vless", "trojan", "ss", "ssr", "hysteria2", "tuic"]
 
-# Московское время (UTC+3)
 MOSCOW_TZ = timezone(timedelta(hours=3))
 
 def moscow_now():
     return datetime.now(MOSCOW_TZ)
 
-# ==================== ЗАГРУЗКА БЕЛОГО СПИСКА ====================
+# ==================== БЕЛЫЙ СПИСОК ====================
 def load_whitelist():
     try:
         r = requests.get("https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/refs/heads/main/domain.txt", timeout=10)
@@ -97,16 +96,18 @@ def priority_key(link):
     return 20
 
 def is_in_whitelist(link):
+    """Проверяет sni/host по белому списку. Если sni/host отсутствует – пропускаем (True)."""
     if not DOMAIN_WHITELIST:
-        return True   # если белый список пуст, пропускаем
+        return True
     try:
         parsed = urlparse(link)
         sni = parse_qs(parsed.query).get('sni', [''])[0] or parse_qs(parsed.query).get('host', [''])[0]
         if not sni:
-            return False   # нет sni/host – не проходим
+            # Нет sni/host – нечего проверять, считаем что прошло
+            return True
         return sni.lower() in DOMAIN_WHITELIST
     except ValueError:
-        return False
+        return True   # при ошибке парсинга тоже не блокируем
 
 def config_hash(link):
     return hashlib.md5(urlparse(link)._replace(fragment="").geturl().encode()).hexdigest()
@@ -176,7 +177,7 @@ def update_readme(total_count, update_time_str, raw_url):
 **Всего конфигов:** {total_count}  
 **Обновлено (МСК):** {update_time_str}
 
-**Ссылка для импорта в VPN:**  
+**Ссылка для импорта в VPN (нажмите для копирования):**  
 `{raw_url}`
 <!-- STATS_END -->"""
 
@@ -210,7 +211,7 @@ def update_readme(total_count, update_time_str, raw_url):
 
 # ==================== ОСНОВНАЯ ФУНКЦИЯ ====================
 def main():
-    print("🚀 Kfg-analyzer Parser v4.5 (отладка фильтрации) запущен", flush=True)
+    print("🚀 Kfg-analyzer Parser v4.6 (фикс whitelist) запущен", flush=True)
     sys.stdout.reconfigure(line_buffering=True)
 
     if not SOURCES_FILE.exists():
@@ -229,6 +230,7 @@ def main():
 
     print(f"📦 Всего ссылок (до дедупликации): {len(all_configs)}", flush=True)
 
+    # Группировка по серверам
     server_best = {}
     for link in all_configs:
         if not any(link.startswith(p + "://") for p in SUPPORTED):
@@ -242,13 +244,13 @@ def main():
 
     print(f"📦 Уникальных серверов (до проверки): {len(server_best)}", flush=True)
 
-    # --- ОТЛАДКА: проверяем первые 10 серверов ---
-    debug_links = list(server_best.values())[:10]
-    print("\n🔍 Отладка первых 10 серверов:", flush=True)
+    # Отладка первых 5 (чтобы видеть, что whitelist теперь не блокирует)
+    debug_links = list(server_best.values())[:5]
+    print("\n🔍 Отладка первых 5 серверов:", flush=True)
     for i, (link, prio) in enumerate(debug_links, 1):
         wl = is_in_whitelist(link)
         tcp = tcp_check_cached(link)
-        print(f"  {i}. whitelist={wl}, TCP={tcp}, prio={prio}\n     {link[:100]}...", flush=True)
+        print(f"  {i}. whitelist={wl}, TCP={tcp}, prio={prio}", flush=True)
     print("", flush=True)
 
     # Фильтрация
@@ -275,7 +277,7 @@ def main():
     android_configs = valid[:4000]
     ios_configs = valid[:50]
 
-    # Если ничего не отобрано – используем первые 200 уникальных серверов, но с предупреждением
+    # Если всё же ничего не прошло (например, все TCP упали) – берём первые 200
     if len(android_configs) == 0:
         print("⚠️ Ничего не прошло фильтрацию. Использую первые 200 уникальных серверов (без TCP-проверки).", flush=True)
         fallback = [link for (link, _) in list(server_best.values())[:200]]
@@ -309,20 +311,30 @@ def main():
         "total_android": len(android_configs),
         "ios_top50": len(ios_configs),
         "last_update": now_json,
-        "debug_whitelist_fail": stats_whitelist_fail,
-        "debug_tcp_fail": stats_tcp_fail,
+        "whitelist_fail": stats_whitelist_fail,
+        "tcp_fail": stats_tcp_fail,
         "unique_servers_before_filter": len(server_best)
     }
     with open(STATS, 'w', encoding='utf-8') as f:
         json.dump(stats, f, indent=2)
 
-    # Генерация raw-ссылки на sub.txt (если работаем в GitHub Actions)
+    # Генерация raw-ссылки для README
     raw_url = "https://raw.githubusercontent.com/REPO_OWNER/REPO_NAME/main/public/sub.txt"
     if os.getenv("GITHUB_REPOSITORY"):
         repo = os.getenv("GITHUB_REPOSITORY")
         raw_url = f"https://raw.githubusercontent.com/{repo}/main/public/sub.txt"
     else:
-        print("⚠️ Переменная GITHUB_REPOSITORY не найдена, используется шаблон", flush=True)
+        # Попробуем определить из git remote (локально)
+        try:
+            import subprocess
+            remote = subprocess.check_output(["git", "config", "--get", "remote.origin.url"], text=True).strip()
+            # Извлекаем owner/repo из URL
+            match = re.search(r"github\.com[:/](.+?)(\.git)?$", remote)
+            if match:
+                repo = match.group(1)
+                raw_url = f"https://raw.githubusercontent.com/{repo}/main/public/sub.txt"
+        except:
+            pass
 
     update_readme(len(android_configs), now_str, raw_url)
 
@@ -334,6 +346,7 @@ def main():
             print(f"⚠️ Файл {f} не создан!", flush=True)
 
     print(f"✅ Готово! Android: {len(android_configs)} | iOS: {len(ios_configs)} (МСК {now_str})", flush=True)
+    print(f"📋 Raw-ссылка для импорта: {raw_url}", flush=True)
 
 if __name__ == "__main__":
     main()
