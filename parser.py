@@ -27,7 +27,7 @@ CHECK_TIMEOUT = 8
 
 SUPPORTED = ["vmess", "vless", "trojan", "ss", "ssr", "hysteria2", "tuic"]
 
-# ==================== БЕЛЫЕ СПИСКИ RKP ====================
+# ==================== БЕЛЫЕ СПИСКИ ====================
 def load_whitelist():
     domain_list = set()
     ip_list = set()
@@ -43,51 +43,40 @@ def load_whitelist():
 
 DOMAIN_WHITELIST, IP_WHITELIST = load_whitelist()
 
-# ==================== ПРОВЕРКА ====================
-check_cache = {}
-
-def get_cache_key(link):
+# ==================== ЗАЩИЩЁННЫЕ ФУНКЦИИ ====================
+def is_valid_config_url(link):
+    if not any(link.startswith(p + "://") for p in SUPPORTED):
+        return False
     try:
         p = urlparse(link)
-        sni = parse_qs(p.query).get('sni', [''])[0] or parse_qs(p.query).get('host', [''])[0]
-        port = p.port or 443
-        return (p.hostname, port, sni)
+        if not p.scheme or not p.hostname:
+            return False
+        # Защита от битых IPv6
+        if ':' in p.hostname and not p.hostname.startswith('['):
+            return False
+        return True
     except:
+        return False
+
+def fetch(url):
+    print(f"📥 {url}")
+    try:
+        return requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=FETCH_TIMEOUT).content
+    except Exception as e:
+        print(f"❌ Ошибка скачивания {url}: {e}")
         return None
 
-def check_server(link):
-    key = get_cache_key(link)
-    if key is None or key in check_cache:
-        return check_cache.get(key, False)
-
-    # TCP + SNI/IP
+def tcp_check(link):
     try:
         p = urlparse(link)
         host = p.hostname
         port = p.port or 443
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(CHECK_TIMEOUT)
-        if sock.connect_ex((host, port)) != 0:
-            sock.close()
-            check_cache[key] = False
-            return False
+        result = sock.connect_ex((host, port))
         sock.close()
+        return result == 0
     except:
-        check_cache[key] = False
-        return False
-
-    # HTTP-проверка
-    try:
-        proxies = {"http": None, "https": f"http://{host}:{port}" if "socks" not in link.lower() else None}
-        r = requests.get("https://www.gstatic.com/generate_204",
-                         proxies=proxies,
-                         timeout=CHECK_TIMEOUT,
-                         allow_redirects=False)
-        success = r.status_code in (204, 200)
-        check_cache[key] = success
-        return success
-    except:
-        check_cache[key] = False
         return False
 
 def is_in_whitelist(link):
@@ -106,7 +95,6 @@ def is_in_whitelist(link):
     except:
         return True
 
-# ==================== ОСТАЛЬНЫЕ ФУНКЦИИ ====================
 def config_hash(link):
     try:
         p = urlparse(link)
@@ -155,14 +143,8 @@ def priority_key(link):
     if 'trojan' in lower: return 40
     return 20
 
-def fetch(url):
-    try:
-        return requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=FETCH_TIMEOUT).content
-    except:
-        return None
-
 def main():
-    print("🚀 Kfg-analyzer Parser v6.2 (мягкая проверка + без лимита Android) запущен")
+    print("🚀 Kfg-analyzer Parser v6.3 (максимальная устойчивость) запущен")
 
     if not SOURCES_FILE.exists():
         print(f"❌ {SOURCES_FILE} не найден!")
@@ -178,10 +160,15 @@ def main():
             text = content.decode('utf-8', errors='ignore')
             if 't.me' in src:
                 pat = r'(vmess://|vless://|trojan://|ss://|ssr://|hysteria2://|tuic://)[^\s<>"\']+'
-                all_configs.extend(re.findall(pat, text))
+                found = re.findall(pat, text)
+                valid_found = [u for u in found if is_valid_config_url(u)]
+                print(f"   ↳ TG: найдено {len(found)} → валидных {len(valid_found)}")
+                all_configs.extend(valid_found)
             else:
                 lines = text.splitlines()
-                all_configs.extend([l.strip() for l in lines if any(l.startswith(p + "://") for p in SUPPORTED)])
+                from_file = [l.strip() for l in lines if is_valid_config_url(l.strip())]
+                print(f"   ↳ Загружено: {len(from_file)}")
+                all_configs.extend(from_file)
         time.sleep(REQUEST_DELAY)
 
     unique_raw = {}
@@ -212,7 +199,6 @@ def main():
         android_configs = [rename_config(link) for link in fallback]
         ios_configs = android_configs[:50]
 
-    # Сохранение
     MAIN_SUB.write_text(base64.b64encode('\n'.join(android_configs).encode()).decode())
     IOS_SUB.write_text(base64.b64encode('\n'.join(ios_configs).encode()).decode())
 
