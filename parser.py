@@ -8,7 +8,6 @@ import socket
 from urllib.parse import urlparse, parse_qs, urlunparse
 from datetime import datetime
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 OUTPUT_DIR = Path("public")
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -22,24 +21,25 @@ SOURCES_DIR = Path("sources")
 SOURCES_DIR.mkdir(exist_ok=True)
 SOURCES_FILE = SOURCES_DIR / "sources.txt"
 
-REQUEST_DELAY = 2.0          # уменьшил для скорости
-FETCH_TIMEOUT = 12
-CHECK_TIMEOUT = 7
+REQUEST_DELAY = 3.0
+FETCH_TIMEOUT = 15
+CHECK_TIMEOUT = 8
 
 SUPPORTED = ["vmess", "vless", "trojan", "ss", "ssr", "hysteria2", "tuic"]
 
-# ==================== БЕЛЫЕ СПИСКИ (для справки) ====================
+# ==================== БЕЛЫЕ СПИСКИ RKP ====================
 def load_whitelist():
+    domain_list = set()
+    ip_list = set()
     try:
         r = requests.get("https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/refs/heads/main/domain.txt", timeout=10)
         domain_list = {line.strip().lower() for line in r.text.splitlines() if line.strip()}
         r = requests.get("https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/refs/heads/main/iP.txt", timeout=10)
         ip_list = {line.strip() for line in r.text.splitlines() if line.strip() and not line.startswith('#')}
         print(f"✅ Загружено: {len(domain_list)} доменов + {len(ip_list)} IP")
-        return domain_list, ip_list
-    except:
-        print("⚠️ Не удалось загрузить белые списки")
-        return set(), set()
+    except Exception as e:
+        print(f"⚠️ Не удалось загрузить белые списки: {e}")
+    return domain_list, ip_list
 
 DOMAIN_WHITELIST, IP_WHITELIST = load_whitelist()
 
@@ -60,13 +60,11 @@ def check_server(link):
     if key is None or key in check_cache:
         return check_cache.get(key, False)
 
-    # Быстрая TCP + HTTP проверка
+    # TCP + SNI/IP
     try:
         p = urlparse(link)
         host = p.hostname
         port = p.port or 443
-
-        # TCP
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(CHECK_TIMEOUT)
         if sock.connect_ex((host, port)) != 0:
@@ -74,8 +72,12 @@ def check_server(link):
             check_cache[key] = False
             return False
         sock.close()
+    except:
+        check_cache[key] = False
+        return False
 
-        # HTTP-проверка
+    # HTTP-проверка
+    try:
         proxies = {"http": None, "https": f"http://{host}:{port}" if "socks" not in link.lower() else None}
         r = requests.get("https://www.gstatic.com/generate_204",
                          proxies=proxies,
@@ -87,6 +89,22 @@ def check_server(link):
     except:
         check_cache[key] = False
         return False
+
+def is_in_whitelist(link):
+    if not DOMAIN_WHITELIST and not IP_WHITELIST:
+        return True
+    try:
+        p = urlparse(link)
+        sni = parse_qs(p.query).get('sni', [''])[0] or parse_qs(p.query).get('host', [''])[0]
+        target = sni if sni else p.hostname
+
+        if re.match(r'^(\d{1,3}\.){3}\d{1,3}$', target):
+            return target in IP_WHITELIST
+        if DOMAIN_WHITELIST:
+            return target.lower() in DOMAIN_WHITELIST
+        return True
+    except:
+        return True
 
 # ==================== ОСТАЛЬНЫЕ ФУНКЦИИ ====================
 def config_hash(link):
@@ -144,7 +162,7 @@ def fetch(url):
         return None
 
 def main():
-    print("🚀 Kfg-analyzer Parser v6.2 (мягкая проверка + без жёсткого лимита) запущен")
+    print("🚀 Kfg-analyzer Parser v6.2 (мягкая проверка + без лимита Android) запущен")
 
     if not SOURCES_FILE.exists():
         print(f"❌ {SOURCES_FILE} не найден!")
@@ -175,7 +193,6 @@ def main():
 
     print(f"📦 Уникальных конфигов: {len(unique_raw)}")
 
-    # Проверка
     unique = {}
     for link in unique_raw.values():
         if check_server(link):
@@ -190,8 +207,8 @@ def main():
     ios_configs = valid[:50]
 
     if len(android_configs) < 300:
-        print(f"⚠️ После проверки осталось мало ({len(android_configs)}). Включаю супер-мягкий режим.")
-        fallback = list(unique_raw.values())[:1500]
+        print(f"⚠️ После фильтрации осталось мало ({len(android_configs)}). Включаю мягкий режим.")
+        fallback = list(unique_raw.values())[:1200]
         android_configs = [rename_config(link) for link in fallback]
         ios_configs = android_configs[:50]
 
