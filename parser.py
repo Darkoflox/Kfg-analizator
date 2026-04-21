@@ -22,10 +22,12 @@ SOURCES_DIR = Path("sources")
 SOURCES_DIR.mkdir(exist_ok=True)
 SOURCES_FILE = SOURCES_DIR / "sources.txt"
 
-REQUEST_DELAY = 1.5
+REQUEST_DELAY = 0.8
 FETCH_TIMEOUT = 10
 CHECK_TIMEOUT = 5
-MAX_WORKERS = 40          # ← сильно увеличил для скорости
+FETCH_WORKERS = 15
+CHECK_WORKERS = 50
+MAX_CONFIGS_PER_SOURCE = 2000   # ограничиваем огромные файлы
 
 SUPPORTED = ["vmess", "vless", "trojan", "ss", "ssr", "hysteria2", "tuic"]
 
@@ -70,10 +72,7 @@ def full_check(link):
         host = p.hostname
         port = p.port or 443
         proxies = {"http": None, "https": f"http://{host}:{port}" if "socks" not in link.lower() else None}
-        r = requests.get("https://www.gstatic.com/generate_204",
-                         proxies=proxies,
-                         timeout=CHECK_TIMEOUT,
-                         allow_redirects=False)
+        r = requests.get("https://www.gstatic.com/generate_204", proxies=proxies, timeout=CHECK_TIMEOUT, allow_redirects=False)
         return r.status_code in (204, 200)
     except:
         return False
@@ -139,37 +138,39 @@ def priority_key(link):
     return 20
 
 def main():
-    print("🚀 Kfg-analyzer Parser v7.2 (40 потоков + очень лёгкая проверка) запущен")
+    print("🚀 Kfg-analyzer Parser v7.3 (параллельное скачивание + 50 потоков) запущен")
 
     with open(SOURCES_FILE, 'r', encoding='utf-8') as f:
         sources = [line.strip() for line in f if line.strip() and not line.startswith('#')]
 
     print(f"📋 Всего источников: {len(sources)}")
 
+    # Параллельное скачивание источников
     all_configs = []
-    for src in sources:
-        print(f"📥 {src}")
-        content = fetch(src)
-        if content:
-            text = content.decode('utf-8', errors='ignore')
-            if 't.me' in src:
-                pat = r'(vmess://|vless://|trojan://|ss://|ssr://|hysteria2://|tuic://)[^\s<>"\']+'
-                found = re.findall(pat, text)
-                all_configs.extend(found)
-                print(f"   ↳ TG: найдено {len(found)}")
-            else:
-                lines = [l.strip() for l in text.splitlines() if any(l.startswith(p + "://") for p in SUPPORTED)]
-                all_configs.extend(lines)
-                print(f"   ↳ Загружено: {len(lines)}")
-        time.sleep(REQUEST_DELAY)
+    with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as executor:
+        future_to_src = {executor.submit(fetch, src): src for src in sources}
+        for future in as_completed(future_to_src):
+            src = future_to_src[future]
+            content = future.result()
+            if content:
+                text = content.decode('utf-8', errors='ignore')
+                if 't.me' in src:
+                    pat = r'(vmess://|vless://|trojan://|ss://|ssr://|hysteria2://|tuic://)[^\s<>"\']+'
+                    found = re.findall(pat, text)
+                    all_configs.extend(found[:MAX_CONFIGS_PER_SOURCE])
+                    print(f"   ↳ TG {src[-30:]}: {len(found)}")
+                else:
+                    lines = [l.strip() for l in text.splitlines() if any(l.startswith(p + "://") for p in SUPPORTED)]
+                    all_configs.extend(lines[:MAX_CONFIGS_PER_SOURCE])
+                    print(f"   ↳ File {src[-40:]}: {len(lines)}")
 
     unique_raw = {config_hash(link): link for link in all_configs if any(link.startswith(p + "://") for p in SUPPORTED)}
     print(f"📦 Уникальных конфигов: {len(unique_raw)}")
 
-    # Этап 1 — очень быстрая TCP
-    print("🔍 Этап 1: Быстрая TCP-проверка (параллельно)...")
+    # Этап 1 — TCP
+    print("🔍 Этап 1: Быстрая TCP-проверка...")
     candidates = []
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+    with ThreadPoolExecutor(max_workers=CHECK_WORKERS) as executor:
         future_to_link = {executor.submit(tcp_check, link): link for link in unique_raw.values()}
         for future in as_completed(future_to_link):
             if future.result():
@@ -177,11 +178,11 @@ def main():
 
     print(f"   Прошло TCP: {len(candidates)}")
 
-    # Этап 2 — лёгкая полная проверка только на лучших
-    print("🔍 Этап 2: Лёгкая полная проверка...")
+    # Этап 2 — лёгкая полная проверка
+    print("🔍 Этап 2: Полная проверка...")
     working = []
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_link = {executor.submit(full_check, link): link for link in candidates[:2500]}
+    with ThreadPoolExecutor(max_workers=CHECK_WORKERS) as executor:
+        future_to_link = {executor.submit(full_check, link): link for link in candidates[:3000]}
         for future in as_completed(future_to_link):
             if future.result():
                 working.append(future_to_link[future])
@@ -195,12 +196,11 @@ def main():
     ios_configs = valid[:50]
 
     if len(android_configs) < 400:
-        print(f"⚠️ Мало рабочих ({len(android_configs)}). Берём лучшие из TCP.")
-        fallback = [rename_config(link) for link in candidates[:1800]]
+        print(f"⚠️ Мало рабочих. Берём из TCP-кандидатов.")
+        fallback = [rename_config(link) for link in candidates[:2000]]
         android_configs = fallback
         ios_configs = fallback[:50]
 
-    # Сохранение
     MAIN_SUB.write_text(base64.b64encode('\n'.join(android_configs).encode()).decode())
     IOS_SUB.write_text(base64.b64encode('\n'.join(ios_configs).encode()).decode())
 
