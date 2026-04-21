@@ -8,6 +8,7 @@ import socket
 from urllib.parse import urlparse, parse_qs, urlunparse
 from datetime import datetime
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 OUTPUT_DIR = Path("public")
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -21,62 +22,72 @@ SOURCES_DIR = Path("sources")
 SOURCES_DIR.mkdir(exist_ok=True)
 SOURCES_FILE = SOURCES_DIR / "sources.txt"
 
-REQUEST_DELAY = 2.0          # уменьшено для скорости
+REQUEST_DELAY = 1.8
 FETCH_TIMEOUT = 12
-CHECK_TIMEOUT = 7
+CHECK_TIMEOUT = 6
+MAX_WORKERS = 20   # параллельных проверок
 
 SUPPORTED = ["vmess", "vless", "trojan", "ss", "ssr", "hysteria2", "tuic"]
 
 def load_whitelist():
-    domain_list = set()
-    ip_list = set()
     try:
         r = requests.get("https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/refs/heads/main/domain.txt", timeout=10)
         domain_list = {line.strip().lower() for line in r.text.splitlines() if line.strip()}
         r = requests.get("https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/refs/heads/main/iP.txt", timeout=10)
         ip_list = {line.strip() for line in r.text.splitlines() if line.strip() and not line.startswith('#')}
         print(f"✅ Загружено: {len(domain_list)} доменов + {len(ip_list)} IP")
-    except Exception as e:
-        print(f"⚠️ Не удалось загрузить белые списки: {e}")
-    return domain_list, ip_list
+        return domain_list, ip_list
+    except:
+        print("⚠️ Не удалось загрузить белые списки")
+        return set(), set()
 
 DOMAIN_WHITELIST, IP_WHITELIST = load_whitelist()
 
-check_cache = {}
-
-def get_cache_key(link):
+def is_valid_config_url(link):
+    if not any(link.startswith(p + "://") for p in SUPPORTED):
+        return False
     try:
         p = urlparse(link)
-        sni = parse_qs(p.query).get('sni', [''])[0] or parse_qs(p.query).get('host', [''])[0]
-        port = p.port or 443
-        return (p.hostname, port, sni)
+        if not p.hostname:
+            return False
+        if ':' in p.hostname and not p.hostname.startswith('['):
+            return False
+        return True
+    except:
+        return False
+
+def fetch(url):
+    try:
+        return requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=FETCH_TIMEOUT).content
     except:
         return None
 
-def check_server(link):
-    key = get_cache_key(link)
-    if key is None or key in check_cache:
-        return check_cache.get(key, False)
-
-    if not is_in_whitelist(link):
-        check_cache[key] = False
+def tcp_check(link):
+    try:
+        p = urlparse(link)
+        host = p.hostname
+        port = p.port or 443
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(CHECK_TIMEOUT)
+        result = sock.connect_ex((host, port))
+        sock.close()
+        return result == 0
+    except:
         return False
 
+def full_check(link):
+    if not tcp_check(link):
+        return False
+    if not is_in_whitelist(link):
+        return False
     try:
         p = urlparse(link)
         host = p.hostname
         port = p.port or 443
         proxies = {"http": None, "https": f"http://{host}:{port}" if "socks" not in link.lower() else None}
-
-        r = requests.get("https://www.gstatic.com/generate_204",
-                         proxies=proxies,
-                         timeout=CHECK_TIMEOUT,
-                         allow_redirects=False)
-        success = r.status_code in (204, 200)
-        check_cache[key] = success
-        return success
+        r = requests.get("https://www.gstatic.com/generate_204", proxies=proxies, timeout=CHECK_TIMEOUT, allow_redirects=False)
+        return r.status_code in (204, 200)
     except:
-        check_cache[key] = False
         return False
 
 def is_in_whitelist(link):
@@ -86,12 +97,9 @@ def is_in_whitelist(link):
         p = urlparse(link)
         sni = parse_qs(p.query).get('sni', [''])[0] or parse_qs(p.query).get('host', [''])[0]
         target = sni if sni else p.hostname
-
         if re.match(r'^(\d{1,3}\.){3}\d{1,3}$', target):
             return target in IP_WHITELIST
-        if DOMAIN_WHITELIST:
-            return target.lower() in DOMAIN_WHITELIST
-        return True
+        return target.lower() in DOMAIN_WHITELIST
     except:
         return True
 
@@ -105,7 +113,6 @@ def config_hash(link):
 def rename_config(link):
     protocol = link.split("://")[0].upper()
     transport = ""
-    sni = ""
     if "reality" in link.lower(): transport = "Reality"
     elif "ws" in link.lower(): transport = "WS"
     elif "grpc" in link.lower(): transport = "gRPC"
@@ -143,25 +150,16 @@ def priority_key(link):
     if 'trojan' in lower: return 40
     return 20
 
-def fetch(url):
-    try:
-        return requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=FETCH_TIMEOUT).content
-    except:
-        return None
-
 def main():
-    print("🚀 Kfg-analyzer Parser v6.5 (быстрая + мягкая версия) запущен")
-
-    if not SOURCES_FILE.exists():
-        print(f"❌ {SOURCES_FILE} не найден!")
-        return
+    print("🚀 Kfg-analyzer Parser v7.0 (двухэтапная + параллельная проверка) запущен")
 
     with open(SOURCES_FILE, 'r', encoding='utf-8') as f:
         sources = [line.strip() for line in f if line.strip() and not line.startswith('#')]
 
+    print(f"📋 Всего источников: {len(sources)}")
+
     all_configs = []
     for src in sources:
-        print(f"📥 {src}")
         content = fetch(src)
         if content:
             text = content.decode('utf-8', errors='ignore')
@@ -171,40 +169,49 @@ def main():
                 all_configs.extend(found)
                 print(f"   ↳ TG: найдено {len(found)}")
             else:
-                lines = text.splitlines()
-                from_file = [l.strip() for l in lines if any(l.startswith(p + "://") for p in SUPPORTED)]
-                all_configs.extend(from_file)
-                print(f"   ↳ Загружено: {len(from_file)}")
+                lines = [l.strip() for l in text.splitlines() if is_valid_config_url(l.strip())]
+                all_configs.extend(lines)
+                print(f"   ↳ Загружено: {len(lines)}")
         time.sleep(REQUEST_DELAY)
 
-    unique_raw = {}
-    for link in all_configs:
-        if any(link.startswith(p + "://") for p in SUPPORTED):
-            h = config_hash(link)
-            if h:
-                unique_raw[h] = link
-
+    unique_raw = {config_hash(link): link for link in all_configs if any(link.startswith(p + "://") for p in SUPPORTED)}
     print(f"📦 Уникальных конфигов: {len(unique_raw)}")
 
-    unique = {}
-    for link in unique_raw.values():
-        if check_server(link):
-            unique[config_hash(link)] = link
+    # === ДВУХЭТАПНАЯ ПРОВЕРКА ===
+    print("🔍 Этап 1: Быстрая TCP-проверка...")
+    candidates = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_link = {executor.submit(tcp_check, link): link for link in unique_raw.values()}
+        for future in as_completed(future_to_link):
+            link = future_to_link[future]
+            if future.result():
+                candidates.append(link)
 
-    print(f"✅ Прошло проверку: {len(unique)} конфигов")
+    print(f"   Прошло TCP: {len(candidates)}")
 
-    valid = [rename_config(link) for link in unique.values()]
+    print("🔍 Этап 2: Полная проверка (HTTP + белый список)...")
+    working = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_link = {executor.submit(full_check, link): link for link in candidates}
+        for future in as_completed(future_to_link):
+            if future.result():
+                working.append(future_to_link[future])
+
+    print(f"✅ Прошло полную проверку: {len(working)}")
+
+    valid = [rename_config(link) for link in working]
     valid.sort(key=priority_key, reverse=True)
 
-    android_configs = valid                    # БЕЗ ЛИМИТА
+    android_configs = valid
     ios_configs = valid[:50]
 
     if len(android_configs) < 300:
-        print(f"⚠️ После фильтрации осталось мало ({len(android_configs)}). Включаю мягкий режим.")
-        fallback = list(unique_raw.values())[:1500]
-        android_configs = [rename_config(link) for link in fallback]
-        ios_configs = android_configs[:50]
+        print(f"⚠️ Мало рабочих ({len(android_configs)}). Берём из TCP-кандидатов.")
+        fallback = [rename_config(link) for link in candidates[:1500]]
+        android_configs = fallback
+        ios_configs = fallback[:50]
 
+    # Сохранение
     MAIN_SUB.write_text(base64.b64encode('\n'.join(android_configs).encode()).decode())
     IOS_SUB.write_text(base64.b64encode('\n'.join(ios_configs).encode()).decode())
 
