@@ -3,7 +3,7 @@ name: Whitelist Parser
 on:
   workflow_dispatch: # Позволяет запускать вручную
   schedule:
-    - cron: '0 */6 * * *' # ИЗМЕНЕНО: Запуск каждые 6 часов
+    - cron: '0 */ * * *' # ИЗМЕНЕНО: Запуск каждые 6 часов
 
 jobs:
   build-whitelist:
