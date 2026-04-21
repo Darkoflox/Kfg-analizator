@@ -8,8 +8,6 @@ import socket
 from urllib.parse import urlparse, parse_qs, urlunparse
 from datetime import datetime
 from pathlib import Path
-from concurrent.futures import ThreadPoolExecutor, as_completed
-import sys
 
 OUTPUT_DIR = Path("public")
 OUTPUT_DIR.mkdir(exist_ok=True)
@@ -23,14 +21,12 @@ SOURCES_DIR = Path("sources")
 SOURCES_DIR.mkdir(exist_ok=True)
 SOURCES_FILE = SOURCES_DIR / "sources.txt"
 
-REQUEST_DELAY = 1.0          # сократил для скорости
-FETCH_TIMEOUT = 10
-TCP_TIMEOUT = 4              # 4 секунд достаточно
-MAX_WORKERS = 30             # потоков для проверки
+REQUEST_DELAY = 2.0          # уменьшено для скорости
+FETCH_TIMEOUT = 12
+CHECK_TIMEOUT = 7
 
 SUPPORTED = ["vmess", "vless", "trojan", "ss", "ssr", "hysteria2", "tuic"]
 
-# ==================== БЕЛЫЕ СПИСКИ ====================
 def load_whitelist():
     domain_list = set()
     ip_list = set()
@@ -39,14 +35,13 @@ def load_whitelist():
         domain_list = {line.strip().lower() for line in r.text.splitlines() if line.strip()}
         r = requests.get("https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/refs/heads/main/iP.txt", timeout=10)
         ip_list = {line.strip() for line in r.text.splitlines() if line.strip() and not line.startswith('#')}
-        print(f"✅ Загружено: {len(domain_list)} доменов + {len(ip_list)} IP", flush=True)
+        print(f"✅ Загружено: {len(domain_list)} доменов + {len(ip_list)} IP")
     except Exception as e:
-        print(f"⚠️ Не удалось загрузить белые списки: {e}", flush=True)
+        print(f"⚠️ Не удалось загрузить белые списки: {e}")
     return domain_list, ip_list
 
 DOMAIN_WHITELIST, IP_WHITELIST = load_whitelist()
 
-# ==================== КЭШ ПРОВЕРОК ====================
 check_cache = {}
 
 def get_cache_key(link):
@@ -59,36 +54,30 @@ def get_cache_key(link):
         return None
 
 def check_server(link):
-    """Проверяет TCP + белый список, с кэшем"""
     key = get_cache_key(link)
-    if key is None:
-        return False
-    if key in check_cache:
-        return check_cache[key]
+    if key is None or key in check_cache:
+        return check_cache.get(key, False)
 
-    # TCP-проверка
-    try:
-        p = urlparse(link)
-        host = p.hostname
-        port = p.port or 443
-        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(TCP_TIMEOUT)
-        result = sock.connect_ex((host, port))
-        sock.close()
-        if result != 0:
-            check_cache[key] = False
-            return False
-    except:
-        check_cache[key] = False
-        return False
-
-    # Проверка белого списка
     if not is_in_whitelist(link):
         check_cache[key] = False
         return False
 
-    check_cache[key] = True
-    return True
+    try:
+        p = urlparse(link)
+        host = p.hostname
+        port = p.port or 443
+        proxies = {"http": None, "https": f"http://{host}:{port}" if "socks" not in link.lower() else None}
+
+        r = requests.get("https://www.gstatic.com/generate_204",
+                         proxies=proxies,
+                         timeout=CHECK_TIMEOUT,
+                         allow_redirects=False)
+        success = r.status_code in (204, 200)
+        check_cache[key] = success
+        return success
+    except:
+        check_cache[key] = False
+        return False
 
 def is_in_whitelist(link):
     if not DOMAIN_WHITELIST and not IP_WHITELIST:
@@ -97,8 +86,6 @@ def is_in_whitelist(link):
         p = urlparse(link)
         sni = parse_qs(p.query).get('sni', [''])[0] or parse_qs(p.query).get('host', [''])[0]
         target = sni if sni else p.hostname
-        if not target:
-            return True
 
         if re.match(r'^(\d{1,3}\.){3}\d{1,3}$', target):
             return target in IP_WHITELIST
@@ -107,30 +94,6 @@ def is_in_whitelist(link):
         return True
     except:
         return True
-
-# ==================== ВАЛИДАЦИЯ URL (защита от IPv6 ошибок) ====================
-def is_valid_config_url(link):
-    if not any(link.startswith(p + "://") for p in SUPPORTED):
-        return False
-    try:
-        p = urlparse(link)
-        if not p.scheme or not p.hostname:
-            return False
-        # Защита от битых IPv6
-        if ':' in p.hostname and not p.hostname.startswith('['):
-            return False
-        return True
-    except:
-        return False
-
-# ==================== ОСТАЛЬНЫЕ ФУНКЦИИ ====================
-def fetch(url):
-    print(f"📥 {url}", flush=True)
-    try:
-        return requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=FETCH_TIMEOUT).content
-    except Exception as e:
-        print(f"❌ Ошибка скачивания {url}: {e}", flush=True)
-        return None
 
 def config_hash(link):
     try:
@@ -180,95 +143,68 @@ def priority_key(link):
     if 'trojan' in lower: return 40
     return 20
 
-# ==================== ОСНОВНАЯ ФУНКЦИЯ ====================
+def fetch(url):
+    try:
+        return requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=FETCH_TIMEOUT).content
+    except:
+        return None
+
 def main():
-    print("🚀 Kfg-analyzer Parser v6.4 (многопоточный, группировка по серверам) запущен", flush=True)
-    sys.stdout.reconfigure(line_buffering=True)
+    print("🚀 Kfg-analyzer Parser v6.5 (быстрая + мягкая версия) запущен")
 
     if not SOURCES_FILE.exists():
-        print(f"❌ {SOURCES_FILE} не найден!", flush=True)
+        print(f"❌ {SOURCES_FILE} не найден!")
         return
 
     with open(SOURCES_FILE, 'r', encoding='utf-8') as f:
         sources = [line.strip() for line in f if line.strip() and not line.startswith('#')]
 
-    # 1. Загрузка всех ссылок
     all_configs = []
     for src in sources:
+        print(f"📥 {src}")
         content = fetch(src)
         if content:
             text = content.decode('utf-8', errors='ignore')
             if 't.me' in src:
                 pat = r'(vmess://|vless://|trojan://|ss://|ssr://|hysteria2://|tuic://)[^\s<>"\']+'
                 found = re.findall(pat, text)
-                valid_found = [u for u in found if is_valid_config_url(u)]
-                print(f"   ↳ TG: найдено {len(found)} → валидных {len(valid_found)}", flush=True)
-                all_configs.extend(valid_found)
+                all_configs.extend(found)
+                print(f"   ↳ TG: найдено {len(found)}")
             else:
                 lines = text.splitlines()
-                from_file = [l.strip() for l in lines if is_valid_config_url(l.strip())]
-                print(f"   ↳ Загружено: {len(from_file)}", flush=True)
+                from_file = [l.strip() for l in lines if any(l.startswith(p + "://") for p in SUPPORTED)]
                 all_configs.extend(from_file)
+                print(f"   ↳ Загружено: {len(from_file)}")
         time.sleep(REQUEST_DELAY)
 
-    print(f"📦 Всего ссылок (до дедупликации): {len(all_configs)}", flush=True)
-
-    # 2. Группировка по серверам (хост:порт:сни) с выбором лучшего приоритета
-    server_best = {}
+    unique_raw = {}
     for link in all_configs:
-        if not any(link.startswith(p + "://") for p in SUPPORTED):
-            continue
-        try:
-            p = urlparse(link)
-            host = p.hostname
-            port = p.port or 443
-            sni = parse_qs(p.query).get('sni', [''])[0] or parse_qs(p.query).get('host', [''])[0]
-            key = (host, port, sni)
-            prio = priority_key(link)
-            if key not in server_best or prio > server_best[key][1]:
-                server_best[key] = (link, prio)
-        except:
-            continue
+        if any(link.startswith(p + "://") for p in SUPPORTED):
+            h = config_hash(link)
+            if h:
+                unique_raw[h] = link
 
-    print(f"📦 Уникальных серверов (до проверки): {len(server_best)}", flush=True)
+    print(f"📦 Уникальных конфигов: {len(unique_raw)}")
 
-    # 3. Многопоточная проверка уникальных серверов
     unique = {}
-    def check_one(item):
-        link, _ = item
+    for link in unique_raw.values():
         if check_server(link):
-            return link
-        return None
+            unique[config_hash(link)] = link
 
-    print("🔍 Запуск многопоточной проверки...", flush=True)
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        futures = {executor.submit(check_one, item): item for item in server_best.values()}
-        for i, future in enumerate(as_completed(futures), 1):
-            link = future.result()
-            if link:
-                h = config_hash(link)
-                if h:
-                    unique[h] = link
-            if i % 100 == 0:
-                print(f"   Проверено {i}/{len(server_best)} серверов, отобрано {len(unique)}", flush=True)
+    print(f"✅ Прошло проверку: {len(unique)} конфигов")
 
-    print(f"✅ Прошло проверку (TCP + белые списки): {len(unique)}", flush=True)
-
-    # 4. Переименование и сортировка
     valid = [rename_config(link) for link in unique.values()]
     valid.sort(key=priority_key, reverse=True)
 
-    android_configs = valid               # без лимита
+    android_configs = valid                    # БЕЗ ЛИМИТА
     ios_configs = valid[:50]
 
-    # Если после фильтрации очень мало – берём fallback (первые 1200 уникальных конфигов)
     if len(android_configs) < 300:
-        print(f"⚠️ После фильтрации осталось мало ({len(android_configs)}). Включаю мягкий режим (без проверок).", flush=True)
-        fallback = list({config_hash(l): l for l in all_configs if config_hash(l)}.values())[:1200]
+        print(f"⚠️ После фильтрации осталось мало ({len(android_configs)}). Включаю мягкий режим.")
+        fallback = list(unique_raw.values())[:1500]
         android_configs = [rename_config(link) for link in fallback]
         ios_configs = android_configs[:50]
 
-    # 5. Сохранение файлов
     MAIN_SUB.write_text(base64.b64encode('\n'.join(android_configs).encode()).decode())
     IOS_SUB.write_text(base64.b64encode('\n'.join(ios_configs).encode()).decode())
 
@@ -282,7 +218,7 @@ def main():
     }
     json.dump(stats, open(STATS, 'w'), indent=2)
 
-    print(f"✅ Готово! Android: {len(android_configs)} | iOS: {len(ios_configs)}", flush=True)
+    print(f"✅ Готово! Android: {len(android_configs)} | iOS: {len(ios_configs)}")
 
 if __name__ == "__main__":
     main()
