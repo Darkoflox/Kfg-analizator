@@ -1,38 +1,39 @@
-name: Kfg-analyzer Auto Update
+name: Whitelist Parser
 
 on:
+  workflow_dispatch: # Позволяет запускать вручную
   schedule:
-    - cron: '0 */6 * * *'   # каждые 2 часа
-  workflow_dispatch:
-
-permissions:
-  contents: write
+    - cron: '0 */6 * * *' # ИЗМЕНЕНО: Запуск каждые 6 часов
 
 jobs:
-  update:
+  build-whitelist:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.12'
+          python-version: '3.10'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
-
-      - name: Run parser
-        run: python parser.py
-
-      - name: Commit & Push
         run: |
-          git config --global user.name "Kfg Bot"
-          git config --global user.email "bot@kfg.dev"
-          git add public/ stats.json README.md sources/
-          if git diff --cached --quiet; then
-            echo "No changes"
-          else
-            git commit -m "🔄 Auto-update $(date -u +'%Y-%m-%d %H:%M UTC')"
+          python -m pip install --upgrade pip
+          pip install requests
+
+      - name: Run whitelist parser
+        run: python whitelist_parser.py
+
+      - name: Commit and push changes
+        run: |
+          git config --global user.name 'github-actions[bot]'
+          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
+          git add whitelist/ # Добавляем всю папку с результатами
+          # Проверяем, есть ли изменения для коммита
+          if ! git diff-index --quiet HEAD; then
+            git commit -m "Update whitelist subscriptions [$(date -u +'%Y-%m-%d %H:%M:%S UTC')]"
             git push
+          else
+            echo "No changes to commit."
           fi
