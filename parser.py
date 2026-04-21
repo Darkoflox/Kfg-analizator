@@ -10,33 +10,69 @@ from datetime import datetime, timezone
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# --- Новые импорты для надежных запросов ---
+# --- Импорты для надежных запросов ---
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
 # --- Основные настройки ---
 OUTPUT_DIR = Path("public")
-SOURCES_DIR = Path("sources")
 OUTPUT_DIR.mkdir(exist_ok=True)
-SOURCES_DIR.mkdir(exist_ok=True)
 
 # --- Названия файлов ---
 MAIN_SUB = OUTPUT_DIR / "sub.txt"
 IOS_SUB = OUTPUT_DIR / "sub_ios.txt"
-SINGBOX_SUB = OUTPUT_DIR / "sub_singbox.json"
 STATS = OUTPUT_DIR / "stats.json"
-SOURCES_FILE = SOURCES_DIR / "sources.json" # <--- ИЗМЕНЕНО
 
 # --- Настройки производительности и таймаутов ---
-REQUEST_DELAY = 0.5
 FETCH_TIMEOUT = 10
 CHECK_TIMEOUT = 5
-FETCH_WORKERS = 20
-CHECK_WORKERS = 100 # <--- УВЕЛИЧЕНО
+FETCH_WORKERS = 30
+CHECK_WORKERS = 150
 MAX_CONFIGS_PER_SOURCE = 2000
 
 # --- Поддерживаемые протоколы ---
 SUPPORTED = ["vmess", "vless", "trojan", "ss", "ssr", "hysteria2", "tuic"]
+
+# --- URL для получения источников с GitHub ---
+GITHUB_SOURCES_API_URL = "https://api.github.com/repos/Darkoflox/Kfg-analizator/contents/sources"
+
+
+def fetch_sources_from_github():
+    """
+    Динамически загружает все источники из указанной папки на GitHub.
+    """
+    print("📥 Загрузка списка источников из GitHub...")
+    all_sources = []
+    session = create_requests_session()
+    
+    try:
+        # 1. Получаем список файлов в директории
+        response = session.get(GITHUB_SOURCES_API_URL, timeout=15)
+        response.raise_for_status()
+        files = response.json()
+
+        # 2. Итерируемся по файлам и загружаем их содержимое
+        for file_info in files:
+            if file_info['type'] == 'file' and file_info['name'].endswith('.txt'):
+                download_url = file_info['download_url']
+                print(f"   - Чтение файла: {file_info['name']}")
+                try:
+                    # 3. Скачиваем содержимое файла со списком источников
+                    source_file_content = session.get(download_url, timeout=10).text
+                    urls = [line.strip() for line in source_file_content.splitlines() if line.strip() and not line.startswith('#')]
+
+                    # 4. Преобразуем URL в структурированный формат
+                    for url in urls:
+                        source_type = "telegram" if "t.me" in url else "base64"
+                        all_sources.append({"url": url, "type": source_type, "enabled": True})
+                except Exception as e:
+                    print(f"     ⚠️ Не удалось прочитать файл {file_info['name']}: {e}")
+
+        print(f"✅ Успешно загружено {len(all_sources)} источников из {len(files)} файлов.")
+        return all_sources
+    except Exception as e:
+        print(f"❌ Критическая ошибка при загрузке источников с GitHub: {e}")
+        return []
 
 def load_whitelist():
     """Загружает белые списки доменов и IP-адресов."""
@@ -58,24 +94,22 @@ DOMAIN_WHITELIST, IP_WHITELIST = load_whitelist()
 def create_requests_session():
     """Создает сессию requests с настроенными повторными попытками."""
     session = requests.Session()
-    retry = Retry(
-        total=3,          # 3 повторные попытки
-        backoff_factor=1, # Пауза между попытками (1с, 2с, 4с)
-        status_forcelist=[500, 502, 503, 504] # Коды, при которых повторять
-    )
+    retry = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
     adapter = HTTPAdapter(max_retries=retry)
     session.mount('http://', adapter)
     session.mount('https://', adapter)
+    session.headers.update({'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'})
     return session
 
 def fetch(url, session):
     """Скачивает содержимое по URL с использованием сессии."""
     try:
-        response = session.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=FETCH_TIMEOUT)
-        response.raise_for_status() # Вызовет ошибку для плохих статусов (4xx, 5xx)
+        response = session.get(url, timeout=FETCH_TIMEOUT)
+        response.raise_for_status()
         return response.content
     except requests.exceptions.RequestException as e:
-        print(f"   ⚠️ Не удалось скачать {url[-50:]}: {e}")
+        # Уменьшаем "шум" в логах, делая сообщение короче
+        # print(f"   ⚠️ Не удалось скачать {url[-50:]}: {e}")
         return None
 
 def tcp_check(link):
@@ -86,10 +120,9 @@ def tcp_check(link):
         port = p.port or 443
         with socket.create_connection((host, port), timeout=CHECK_TIMEOUT):
             return True
-    except (socket.timeout, socket.error, TypeError, AttributeError):
+    except (socket.timeout, socket.error, TypeError, AttributeError, OSError):
         return False
 
-# ... (остальные функции-помощники остаются без изменений) ...
 def full_check(link):
     if not tcp_check(link):
         return False
@@ -98,23 +131,10 @@ def full_check(link):
         host = p.hostname
         port = p.port or 443
         proxies = {"http": f"http://{host}:{port}", "https": f"http://{host}:{port}"}
-        r = requests.get("https://www.gstatic.com/generate_204", proxies=proxies, timeout=CHECK_TIMEOUT, allow_redirects=False)
+        r = requests.get("https://www.gstatic.com/generate_204", proxies=proxies, timeout=CHECK_TIMEOUT, allow_redirects=False, verify=False)
         return r.status_code in (204, 200)
     except:
         return False
-
-def is_in_whitelist(link):
-    if not DOMAIN_WHITELIST and not IP_WHITELIST:
-        return True
-    try:
-        p = urlparse(link)
-        sni = parse_qs(p.query).get('sni', [''])[0] or parse_qs(p.query).get('host', [''])[0]
-        target = sni if sni else p.hostname
-        if re.match(r'^(\d{1,3}\.){3}\d{1,3}$', target):
-            return target in IP_WHITELIST
-        return target.lower() in DOMAIN_WHITELIST
-    except:
-        return True
 
 def config_hash(link):
     try:
@@ -164,103 +184,80 @@ def priority_key(link):
     return 20
 
 def main():
-    print(f"🚀 Kfg-analyzer Parser v8.0 (JSON-источники, ретраи, {CHECK_WORKERS} потоков) запущен")
-
-    # --- Загрузка источников из JSON ---
-    if not SOURCES_FILE.exists():
-        print(f"❌ Файл источников {SOURCES_FILE} не найден. Создайте его.")
-        return
-        
-    with open(SOURCES_FILE, 'r', encoding='utf-8') as f:
-        all_sources = json.load(f)
+    print(f"🚀 Niyakwi-Parser v10 (Динамические источники с GitHub, {CHECK_WORKERS} потоков) запущен")
     
-    sources = [s for s in all_sources if s.get("enabled", True)]
-    print(f"📋 Всего источников: {len(sources)} (включено)")
+    requests.packages.urllib3.disable_warnings() # Отключаем предупреждения о небезопасных SSL
+    
+    sources = fetch_sources_from_github()
+    if not sources:
+        print("❌ Не удалось загрузить источники. Завершение работы.")
+        return
 
-    # --- Параллельное скачивание источников ---
     all_configs = []
     session = create_requests_session()
     with ThreadPoolExecutor(max_workers=FETCH_WORKERS) as executor:
         future_to_src = {executor.submit(fetch, src['url'], session): src for src in sources}
         
-        for future in as_completed(future_to_src):
+        for i, future in enumerate(as_completed(future_to_src), 1):
             src = future_to_src[future]
             content = future.result()
+            print(f"\r   Скачивание: {i}/{len(sources)}", end="")
             if content:
                 text = content.decode('utf-8', errors='ignore')
                 found_configs = []
                 
-                # Логика парсинга в зависимости от типа источника
                 if src.get("type") == "telegram":
                     pat = r'(vmess://|vless://|trojan://|ss://|ssr://|hysteria2://|tuic://)[^\\s<>"\'`]+'
                     found_configs = re.findall(pat, text)
-                else: # По умолчанию считаем, что это base64 или просто список
+                else:
                     found_configs = [l.strip() for l in text.splitlines() if any(l.startswith(p + "://") for p in SUPPORTED)]
 
-                limited_configs = found_configs[:MAX_CONFIGS_PER_SOURCE]
-                all_configs.extend(limited_configs)
-                print(f"   ↳ {src['type']} {src['url'][-40:]}: {len(limited_configs)}")
+                all_configs.extend(found_configs[:MAX_CONFIGS_PER_SOURCE])
 
-    unique_raw = {config_hash(link): link for link in all_configs if link and any(link.startswith(p + "://") for p in SUPPORTED)}
+    unique_raw = {config_hash(link): link for link in all_configs if link}
     print(f"\n📦 Собрано уникальных конфигов: {len(unique_raw)}")
 
-    # --- Этап 1: Быстрая TCP-проверка ---
-    print("🔍 Этап 1: Быстрая TCP-проверка...")
+    print("\n🔍 Этап 1: Быстрая TCP-проверка...")
     candidates = []
     with ThreadPoolExecutor(max_workers=CHECK_WORKERS) as executor:
         future_to_link = {executor.submit(tcp_check, link): link for link in unique_raw.values()}
-        for i, future in enumerate(as_completed(future_to_link)):
+        for i, future in enumerate(as_completed(future_to_link), 1):
             if future.result():
                 candidates.append(future_to_link[future])
-            print(f"\r   Проверено: {i+1}/{len(unique_raw)}", end="")
+            print(f"\r   Проверено: {i}/{len(unique_raw)} | Прошло: {len(candidates)}", end="")
     print(f"\n   TCP-проверку прошло: {len(candidates)}")
 
-    # --- Этап 2: Полная проверка (ограничим до 3000 лучших) ---
     print("\n🔍 Этап 2: Полная проверка...")
     working = []
-    # Сортируем кандидатов, чтобы сначала проверять самые "перспективные"
     candidates.sort(key=priority_key, reverse=True)
-    check_pool = candidates[:3000] # Проверяем не больше 3000
+    check_pool = candidates[:4000] # Увеличим пул для более тщательной проверки
 
-    with ThreadPoolExecutor(max_workers=CHECK_WORKERS) as executor:
-        future_to_link = {executor.submit(full_check, link): link for link in check_pool}
-        for i, future in enumerate(as_completed(future_to_link)):
-            if future.result():
-                working.append(future_to_link[future])
-            print(f"\r   Проверено: {i+1}/{len(check_pool)}", end="")
+    if not check_pool:
+         print("   Не найдено кандидатов для полной проверки.")
+    else:
+        with ThreadPoolExecutor(max_workers=CHECK_WORKERS) as executor:
+            future_to_link = {executor.submit(full_check, link): link for link in check_pool}
+            for i, future in enumerate(as_completed(future_to_link), 1):
+                if future.result():
+                    working.append(future_to_link[future])
+                print(f"\r   Проверено: {i}/{len(check_pool)} | Работает: {len(working)}", end="")
     print(f"\n✅ Прошло полную проверку: {len(working)}")
 
     valid = [rename_config(link) for link in working]
     valid.sort(key=priority_key, reverse=True)
 
     android_configs = valid
-    ios_configs = valid[:50]
-
-    # Если рабочих конфигов мало, берем из TCP-кандидатов
-    if len(android_configs) < 400:
-        print(f"⚠️ Мало рабочих конфигов ({len(android_configs)}). Добавляем из TCP-кандидатов.")
-        fallback = [rename_config(link) for link in candidates if link not in working][:2000]
+    if len(android_configs) < 500: # Порог для добавления из fallback
+        print(f"⚠️ Мало рабочих конфигов. Добавляем из TCP-кандидатов.")
+        fallback_candidates = [c for c in candidates if c not in working]
+        fallback = [rename_config(link) for link in fallback_candidates]
         android_configs.extend(fallback)
-        android_configs = android_configs[:2000] # Ограничим итоговое кол-во
-        ios_configs = android_configs[:50]
+        android_configs = android_configs[:2500] 
+
+    ios_configs = android_configs[:100] # iOS можно дать побольше
 
     MAIN_SUB.write_text(base64.b64encode('\n'.join(android_configs).encode()).decode(), encoding='utf-8')
     IOS_SUB.write_text(base64.b64encode('\n'.join(ios_configs).encode()).decode(), encoding='utf-8')
-
-    with open(SINGBOX_SUB, 'w', encoding='utf-8') as f:
-        singbox_json = {
-            "version": 1,
-            "outbounds": [
-                {"type": "selector", "tag": "proxy", "outbounds": ["auto", "direct"]},
-                {"type": "urltest", "tag": "auto", "outbounds": [urlparse(c).fragment for c in android_configs]},
-            ]
-        }
-        # Добавляем сами конфиги
-        for config_url in android_configs:
-            # Тут нужна будет более сложная логика для преобразования URL в формат Sing-box
-            # Для примера пока оставим заглушку
-            pass
-        # json.dump(singbox_json, f, indent=2) # Пока не реализуем парсинг в sing-box формат
 
     stats = {
         "total_android": len(android_configs),
