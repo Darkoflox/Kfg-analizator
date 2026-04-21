@@ -22,10 +22,10 @@ SOURCES_DIR = Path("sources")
 SOURCES_DIR.mkdir(exist_ok=True)
 SOURCES_FILE = SOURCES_DIR / "sources.txt"
 
-REQUEST_DELAY = 1.8
-FETCH_TIMEOUT = 12
-CHECK_TIMEOUT = 6
-MAX_WORKERS = 20   # параллельных проверок
+REQUEST_DELAY = 1.5
+FETCH_TIMEOUT = 10
+CHECK_TIMEOUT = 5
+MAX_WORKERS = 40          # ← сильно увеличил для скорости
 
 SUPPORTED = ["vmess", "vless", "trojan", "ss", "ssr", "hysteria2", "tuic"]
 
@@ -42,19 +42,6 @@ def load_whitelist():
         return set(), set()
 
 DOMAIN_WHITELIST, IP_WHITELIST = load_whitelist()
-
-def is_valid_config_url(link):
-    if not any(link.startswith(p + "://") for p in SUPPORTED):
-        return False
-    try:
-        p = urlparse(link)
-        if not p.hostname:
-            return False
-        if ':' in p.hostname and not p.hostname.startswith('['):
-            return False
-        return True
-    except:
-        return False
 
 def fetch(url):
     try:
@@ -78,14 +65,15 @@ def tcp_check(link):
 def full_check(link):
     if not tcp_check(link):
         return False
-    if not is_in_whitelist(link):
-        return False
     try:
         p = urlparse(link)
         host = p.hostname
         port = p.port or 443
         proxies = {"http": None, "https": f"http://{host}:{port}" if "socks" not in link.lower() else None}
-        r = requests.get("https://www.gstatic.com/generate_204", proxies=proxies, timeout=CHECK_TIMEOUT, allow_redirects=False)
+        r = requests.get("https://www.gstatic.com/generate_204",
+                         proxies=proxies,
+                         timeout=CHECK_TIMEOUT,
+                         allow_redirects=False)
         return r.status_code in (204, 200)
     except:
         return False
@@ -151,7 +139,7 @@ def priority_key(link):
     return 20
 
 def main():
-    print("🚀 Kfg-analyzer Parser v7.0 (двухэтапная + параллельная проверка) запущен")
+    print("🚀 Kfg-analyzer Parser v7.2 (40 потоков + очень лёгкая проверка) запущен")
 
     with open(SOURCES_FILE, 'r', encoding='utf-8') as f:
         sources = [line.strip() for line in f if line.strip() and not line.startswith('#')]
@@ -160,6 +148,7 @@ def main():
 
     all_configs = []
     for src in sources:
+        print(f"📥 {src}")
         content = fetch(src)
         if content:
             text = content.decode('utf-8', errors='ignore')
@@ -169,7 +158,7 @@ def main():
                 all_configs.extend(found)
                 print(f"   ↳ TG: найдено {len(found)}")
             else:
-                lines = [l.strip() for l in text.splitlines() if is_valid_config_url(l.strip())]
+                lines = [l.strip() for l in text.splitlines() if any(l.startswith(p + "://") for p in SUPPORTED)]
                 all_configs.extend(lines)
                 print(f"   ↳ Загружено: {len(lines)}")
         time.sleep(REQUEST_DELAY)
@@ -177,22 +166,22 @@ def main():
     unique_raw = {config_hash(link): link for link in all_configs if any(link.startswith(p + "://") for p in SUPPORTED)}
     print(f"📦 Уникальных конфигов: {len(unique_raw)}")
 
-    # === ДВУХЭТАПНАЯ ПРОВЕРКА ===
-    print("🔍 Этап 1: Быстрая TCP-проверка...")
+    # Этап 1 — очень быстрая TCP
+    print("🔍 Этап 1: Быстрая TCP-проверка (параллельно)...")
     candidates = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_link = {executor.submit(tcp_check, link): link for link in unique_raw.values()}
         for future in as_completed(future_to_link):
-            link = future_to_link[future]
             if future.result():
-                candidates.append(link)
+                candidates.append(future_to_link[future])
 
     print(f"   Прошло TCP: {len(candidates)}")
 
-    print("🔍 Этап 2: Полная проверка (HTTP + белый список)...")
+    # Этап 2 — лёгкая полная проверка только на лучших
+    print("🔍 Этап 2: Лёгкая полная проверка...")
     working = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        future_to_link = {executor.submit(full_check, link): link for link in candidates}
+        future_to_link = {executor.submit(full_check, link): link for link in candidates[:2500]}
         for future in as_completed(future_to_link):
             if future.result():
                 working.append(future_to_link[future])
@@ -205,9 +194,9 @@ def main():
     android_configs = valid
     ios_configs = valid[:50]
 
-    if len(android_configs) < 300:
-        print(f"⚠️ Мало рабочих ({len(android_configs)}). Берём из TCP-кандидатов.")
-        fallback = [rename_config(link) for link in candidates[:1500]]
+    if len(android_configs) < 400:
+        print(f"⚠️ Мало рабочих ({len(android_configs)}). Берём лучшие из TCP.")
+        fallback = [rename_config(link) for link in candidates[:1800]]
         android_configs = fallback
         ios_configs = fallback[:50]
 
