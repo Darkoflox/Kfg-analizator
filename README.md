@@ -32,7 +32,11 @@
 ## 🔗 Готовые подписки для импорта
 
 <!-- SUBSCRIPTION_LINKS_START -->
-*Ссылки будут обновлены после первого запуска парсера.*
+| Платформа / Назначение | Ссылка для импорта |
+| :--- | :--- |
+| **Android (все рабочие)** | `https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_android.txt` |
+| **iOS (топ-100 быстрых)** | `https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_ios.txt` |
+| **Все проверенные** | `https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_all_checked.txt` |
 <!-- SUBSCRIPTION_LINKS_END -->
 
 ---
