@@ -46,7 +46,7 @@ XRAY_DOWNLOAD_URLS = {
     'windows': 'https://github.com/XTLS/Xray-core/releases/latest/download/Xray-windows-64.zip',
 }
 
-# Сопоставление TLD с флагами
+# Сопоставление TLD с флагами (эмодзи)
 TLD_FLAGS = {
     'ru': '🇷🇺', 'us': '🇺🇸', 'de': '🇩🇪', 'nl': '🇳🇱', 'fr': '🇫🇷', 'gb': '🇬🇧', 'uk': '🇬🇧',
     'ca': '🇨🇦', 'jp': '🇯🇵', 'kr': '🇰🇷', 'sg': '🇸🇬', 'hk': '🇭🇰', 'tw': '🇹🇼',
@@ -116,6 +116,8 @@ class RussianFilter:
         self.ip_networks = []
         self.domains = set()
         self._load_lists(ip_file, domain_file)
+        # Кэш для резолвинга доменов (домен -> IP)
+        self._dns_cache: Dict[str, str] = {}
 
     def _ensure_file(self, path: str, example_content: str = ""):
         """Создаёт файл, если его нет."""
@@ -153,6 +155,18 @@ class RussianFilter:
 
         logger.info(f"🛡️ Загружено IP-сетей РФ: {len(self.ip_networks)}, доменов РФ: {len(self.domains)}")
 
+    def _resolve_host(self, host: str) -> Optional[str]:
+        """Резолвит домен в IP-адрес (с кэшированием)."""
+        if host in self._dns_cache:
+            return self._dns_cache[host]
+        try:
+            ip = socket.gethostbyname(host)
+            self._dns_cache[host] = ip
+            return ip
+        except socket.gaierror:
+            self._dns_cache[host] = None
+            return None
+
     def is_russian(self, host: str) -> bool:
         """
         Проверяет, принадлежит ли хост (домен или IP) российскому сегменту.
@@ -173,11 +187,19 @@ class RussianFilter:
             for network in self.ip_networks:
                 if ip_addr in network:
                     return True
+            return False
         except ValueError:
-            # host не является IP-адресом – возможно, домен, но мы уже проверили
-            pass
-
-        return False
+            # Это не IP-адрес, резолвим домен
+            ip = self._resolve_host(host)
+            if ip:
+                try:
+                    ip_addr = ipaddress.ip_address(ip)
+                    for network in self.ip_networks:
+                        if ip_addr in network:
+                            return True
+                except ValueError:
+                    pass
+            return False
 
 
 # ---------- Модель конфигурации ----------
@@ -285,7 +307,8 @@ class XrayChecker:
                 cfg.uuid = parsed.username
                 params = parse_qs(parsed.query)
                 cfg.transport = params.get('type', ['tcp'])[0]
-                cfg.tls = params.get('security', ['none'])[0]
+                security = params.get('security', ['none'])[0]
+                cfg.tls = security  # "none", "tls", "reality"
                 cfg.sni = params.get('sni', [None])[0]
                 cfg.path = params.get('path', [None])[0]
             elif proto == 'trojan':
@@ -308,9 +331,13 @@ class XrayChecker:
             "settings": {},
             "streamSettings": {
                 "network": cfg.transport,
-                "security": cfg.tls
+                "security": cfg.tls if cfg.tls != "none" else None
             }
         }
+        # Убираем None из security
+        if outbound["streamSettings"]["security"] is None:
+            del outbound["streamSettings"]["security"]
+
         if cfg.sni:
             outbound["streamSettings"]["sni"] = cfg.sni
         if cfg.transport == "ws" and cfg.path:
@@ -587,6 +614,25 @@ def save_subscriptions(configs: List[ProxyConfig], output_dir: str = "."):
                         uri = uri.split('#')[0]
                     f.write(f"{uri}#{cfg.format_name(include_latency=True)}\n")
             logger.info(f"💾 {proto.upper()} подписка: {proto_file} ({len(proto_configs)} конфигураций)")
+
+    # Генерация файла со ссылками для импорта
+    repo_user = "Darkoflox"
+    repo_name = "Kfg-analizator"
+    branch = "main"
+    base_url = f"https://raw.githubusercontent.com/{repo_user}/{repo_name}/{branch}"
+
+    urls_file = out_path / "subscription_urls.txt"
+    with open(urls_file, "w", encoding="utf-8") as f:
+        f.write("# Subscription URLs — скопируйте нужную ссылку и вставьте в VPN-клиент\n")
+        f.write(f"# Android (все рабочие)\n{base_url}/sub_android.txt\n\n")
+        f.write(f"# iOS (топ-100 быстрых)\n{base_url}/sub_ios.txt\n\n")
+        f.write(f"# Все проверенные\n{base_url}/sub_all_checked.txt\n\n")
+        f.write("# По протоколам:\n")
+        for proto in SUPPORTED_PROTOCOLS:
+            proto_file = out_path / f"sub_{proto}.txt"
+            if proto_file.exists():
+                f.write(f"# {proto.upper()}\n{base_url}/sub_{proto}.txt\n")
+    logger.info(f"🔗 Файл со ссылками для импорта: {urls_file}")
 
 
 # ---------- Точка входа ----------
