@@ -1,348 +1,207 @@
+import requests
 import base64
 import json
-import logging
-import os
-import random
 import re
-import socket
-import ssl
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from hashlib import md5
+import hashlib
+import socket
+from urllib.parse import urlparse, parse_qs, urlunparse
+from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
-from urllib.parse import urlparse, unquote
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import requests
+OUTPUT_DIR = Path("public")
+OUTPUT_DIR.mkdir(exist_ok=True)
 
-# --- КОНФИГУРАЦИЯ ---
+MAIN_SUB = OUTPUT_DIR / "sub_white.txt"
+IOS_SUB = OUTPUT_DIR / "sub_ios_white.txt"
+SINGBOX_SUB = OUTPUT_DIR / "sub_singbox_white.json"
+STATS = OUTPUT_DIR / "stats_white.json"
+
 SOURCES_FILE = Path("sources/sources.txt")
-OUTPUT_DIR = Path("whitelist")
 
-# Количество потоков
-DOWNLOAD_THREADS = 20
-TCP_CHECK_THREADS = 50
-HTTP_CHECK_THREADS = 40
+REQUEST_DELAY = 1.5
+FETCH_TIMEOUT = 10
+CHECK_TIMEOUT = 5
+MAX_WORKERS = 40
 
-# Таймауты
-DOWNLOAD_TIMEOUT = 10
-TCP_TIMEOUT = 3
-HTTP_TIMEOUT = 5
+SUPPORTED = ["vmess", "vless", "trojan", "ss", "ssr", "hysteria2", "tuic"]
 
-# Лимиты и приоритеты
-IOS_SUB_LIMIT = 50
-LOW_CONFIG_THRESHOLD = 100  # Если рабочих конфигов меньше, берем из TCP-проверенных
-TELEGRAM_POST_LIMIT = 25  # Сколько последних постов парсить из TG-каналов
-
-# Приоритет протоколов для iOS
-PROTOCOL_PRIORITY = {
-    "reality": 0,
-    "vless": 1,
-    "hysteria2": 2,
-    "trojan": 3,
-    "ss": 4,
-    "vmess": 5,
-}
-
-# URL для HTTP-проверки (generate_204)
-HTTP_CHECK_URL = "http://cp.cloudflare.com/generate_204"
-
-# --- НАСТРОЙКА ЛОГИРОВАНИЯ ---
-logging.basicConfig(
-    level=logging.INFO,
-    format="[%(asctime)s] [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger(__name__)
-
-# --- ОСНОВНЫЕ ФУНКЦИИ ---
-
-def setup_environment():
-    """Создает выходную директорию, если она не существует."""
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    logger.info(f"Выходная директория: {OUTPUT_DIR}")
-
-def get_sources() -> List[str]:
-    """Читает источники из файла sources.txt."""
-    if not SOURCES_FILE.exists():
-        logger.error(f"Файл с источниками не найден: {SOURCES_FILE}")
-        return []
+# Белые списки RKP
+def load_whitelist():
     try:
-        with open(SOURCES_FILE, "r", encoding="utf-8") as f:
-            return [line.strip() for line in f if line.strip() and not line.startswith("#")]
-    except Exception as e:
-        logger.error(f"Не удалось прочитать файл с источниками: {e}")
-        return []
+        r = requests.get("https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/refs/heads/main/domain.txt", timeout=10)
+        domain_list = {line.strip().lower() for line in r.text.splitlines() if line.strip()}
+        r = requests.get("https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/refs/heads/main/iP.txt", timeout=10)
+        ip_list = {line.strip() for line in r.text.splitlines() if line.strip() and not line.startswith('#')}
+        print(f"✅ Загружено: {len(domain_list)} доменов + {len(ip_list)} IP")
+        return domain_list, ip_list
+    except:
+        print("⚠️ Не удалось загрузить белые списки")
+        return set(), set()
 
-def fetch_content_from_url(url: str) -> Optional[str]:
-    """Скачивает содержимое по URL."""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/117.0.0.0 Safari/537.36"
-    }
+DOMAIN_WHITELIST, IP_WHITELIST = load_whitelist()
+
+def fetch(url):
     try:
-        if "/s/" in url:
-            channel_name = url.split("/s/")[-1].strip("/")
-            tg_url = f"https://tg.i-c-a.su/json/{channel_name}?limit={TELEGRAM_POST_LIMIT}"
-            response = requests.get(tg_url, headers=headers, timeout=DOWNLOAD_TIMEOUT)
-        else:
-            response = requests.get(url, headers=headers, timeout=DOWNLOAD_TIMEOUT)
-        
-        response.raise_for_status()
-        content = response.text
+        return requests.get(url, headers={'User-Agent': 'Mozilla/5.0'}, timeout=FETCH_TIMEOUT).content
+    except:
+        return None
 
-        # Попытка декодировать из base64, если контент выглядит закодированным
-        # Улучшенная проверка, чтобы избежать ложных срабатываний
+def tcp_check(link):
+    try:
+        p = urlparse(link)
+        host = p.hostname
+        port = p.port or 443
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(CHECK_TIMEOUT)
+        result = sock.connect_ex((host, port))
+        sock.close()
+        return result == 0
+    except:
+        return False
+
+def full_check(link):
+    if not tcp_check(link):
+        return False
+    try:
+        p = urlparse(link)
+        host = p.hostname
+        port = p.port or 443
+        proxies = {"http": None, "https": f"http://{host}:{port}" if "socks" not in link.lower() else None}
+        r = requests.get("https://www.gstatic.com/generate_204", proxies=proxies, timeout=CHECK_TIMEOUT, allow_redirects=False)
+        return r.status_code in (204, 200)
+    except:
+        return False
+
+def is_in_whitelist(link):
+    if not DOMAIN_WHITELIST and not IP_WHITELIST:
+        return True
+    try:
+        p = urlparse(link)
+        sni = parse_qs(p.query).get('sni', [''])[0] or parse_qs(p.query).get('host', [''])[0]
+        target = sni if sni else p.hostname
+        if re.match(r'^(\d{1,3}\.){3}\d{1,3}$', target):
+            return target in IP_WHITELIST
+        return target.lower() in DOMAIN_WHITELIST
+    except:
+        return True
+
+def config_hash(link):
+    try:
+        p = urlparse(link)
+        return hashlib.md5(p._replace(fragment="").geturl().encode()).hexdigest()
+    except:
+        return None
+
+def rename_config(link):
+    protocol = link.split("://")[0].upper()
+    transport = ""
+    if "reality" in link.lower(): transport = "Reality"
+    elif "ws" in link.lower(): transport = "WS"
+    elif "grpc" in link.lower(): transport = "gRPC"
+    elif "hysteria2" in link.lower(): transport = "Hysteria2"
+
+    try:
+        parsed = urlparse(link)
+        sni = parse_qs(parsed.query).get('sni', [''])[0] or parse_qs(parsed.query).get('host', [''])[0]
+    except:
+        sni = ""
+
+    name = f"{protocol}-{transport}-{sni}-White-#Kfg" if transport else f"{protocol}-White-#Kfg"
+    name = re.sub(r'-+', '-', name).strip('-')
+
+    if link.startswith("vmess://"):
         try:
-            # Проверяем, можно ли декодировать без ошибок
-            if len(content) % 4 == 0 and re.match(r'^[A-Za-z0-9+/=\s]+$', content):
-                 return base64.b64decode(content).decode("utf-8", errors='ignore')
-        except Exception:
-             pass # Если не base64, возвращаем как есть
-
-        return content
-    except requests.exceptions.RequestException as e:
-        logger.warning(f"Ошибка скачивания {url}: {e}")
-    except Exception as e:
-        logger.error(f"Неизвестная ошибка при скачивании {url}: {e}")
-    return None
-
-def parse_configs_from_content(content: str) -> List[str]:
-    """Извлекает все конфиги (vmess://, vless://, etc.) из текстового содержимого."""
-    # ИСПРАВЛЕНО: content может быть None, добавляем проверку
-    if not isinstance(content, str):
-        return []
-    
-    # ИСПРАВЛЕНО: Регулярное выражение теперь захватывает всю ссылку, а не только протокол
-    pattern = r"\b(vmess|vless|trojan|ss|hysteria2)://[^\s\"'<>]+"
-    return re.findall(pattern, content)
-
-def download_and_parse_sources(sources: List[str]) -> Set[str]:
-    """Параллельно скачивает и парсит все источники."""
-    unique_configs = set()
-    with ThreadPoolExecutor(max_workers=DOWNLOAD_THREADS) as executor:
-        future_to_url = {executor.submit(fetch_content_from_url, url): url for url in sources}
-        
-        for future in as_completed(future_to_url):
-            content = future.result()
-            # Усиленная проверка
-            if content and isinstance(content, str):
-                found_configs = parse_configs_from_content(content)
-                if found_configs:
-                    unique_configs.update(found_configs)
-                    logger.info(f"Найдено {len(found_configs)} конфигов в {future_to_url[future]}")
-    return unique_configs
-
-def get_config_details(config: str) -> Optional[Dict]:
-    """Извлекает детали из строки конфигурации (адрес, порт, SNI)."""
-    try:
-        # Убираем лишние символы, которые могли попасть в ссылку
-        config = config.strip()
-        parsed_url = urlparse(config)
-        
-        protocol = parsed_url.scheme
-        if not protocol:
-            return None
-
-        if protocol in ["vless", "trojan"]:
-            address = parsed_url.hostname
-            port = parsed_url.port
-            if not address or not port: return None
-            params = dict(p.split("=") for p in parsed_url.query.split("&") if "=" in p)
-            sni = params.get("sni", params.get("peer", address))
-            transport = params.get("type", "tcp")
-            return {"protocol": protocol, "address": address, "port": port, "sni": sni, "transport": transport, "config": config}
-
-        elif protocol == "vmess":
-            try:
-                # VMess строки часто не URL-кодированы, а просто base64
-                decoded_json = json.loads(base64.b64decode(parsed_url.netloc).decode('utf-8'))
-                address = decoded_json.get("add")
-                port = int(decoded_json.get("port", 443))
-                if not address: return None
-                sni = decoded_json.get("sni", decoded_json.get("host", address))
-                transport = decoded_json.get("net", "tcp")
-                return {"protocol": protocol, "address": address, "port": port, "sni": sni, "transport": transport, "config": config}
-            except Exception:
-                return None
-
-        elif protocol == "hysteria2":
-            address = parsed_url.hostname
-            port = parsed_url.port
-            if not address or not port: return None
-            params = dict(p.split("=") for p in parsed_url.query.split("&") if "=" in p)
-            sni = params.get("sni", address)
-            return {"protocol": protocol, "address": address, "port": port, "sni": sni, "transport": "hysteria2", "config": config}
-        
-        elif protocol == "ss":
-            userinfo, netloc = parsed_url.path.lstrip('/').split('@')
-            address, port_str = netloc.split(':')
-            if not address or not port_str: return None
-            return {"protocol": protocol, "address": address, "port": int(port_str), "sni": address, "transport": "tcp", "config": config}
-
-    except Exception as e:
-        logger.debug(f"Ошибка парсинга конфига {config[:40]}...: {e}")
-    return None
-
-def tcp_check(address: str, port: int) -> bool:
-    """Проверяет доступность TCP-порта, устойчива к IPv6."""
-    try:
-        addr_info = socket.getaddrinfo(address, port, socket.AF_UNSPEC, socket.SOCK_STREAM)
-        
-        for family, socktype, proto, _, sockaddr in addr_info:
-            try:
-                with socket.socket(family, socktype) as sock:
-                    sock.settimeout(TCP_TIMEOUT)
-                    sock.connect(sockaddr)
-                return True
-            except (socket.error, socket.timeout):
-                continue
-        return False
-    except socket.gaierror:
-        return False
-    except Exception:
-        return False
-
-def http_check(config_details: Dict) -> Optional[Dict]:
-    """Симулирует проверку."""
-    # В данной реализации мы доверяем TCP-проверке.
-    # Прямая HTTP-проверка через vless/trojan/hysteria2 требует спец. клиентов.
-    if config_details:
-        return config_details
-    return None
-
-def rename_config(details: Dict, index: int) -> str:
-    """Переименовывает конфиг в заданный формат."""
-    protocol = details.get("protocol", "UNK").upper()
-    transport = details.get("transport", "UNK").upper()
-    
-    # Более надежное извлечение SNI
-    sni = details.get("sni", "no-sni")
-    if sni:
-        sni_host = sni.split('.')
-        sni_display = sni_host[-2] if len(sni_host) > 1 else sni_host[0]
+            data = json.loads(base64.b64decode(link[8:] + "===").decode(errors='ignore'))
+            data["ps"] = name
+            return "vmess://" + base64.b64encode(json.dumps(data, ensure_ascii=False).encode()).decode().rstrip("=")
+        except:
+            pass
     else:
-        sni_display = "no-sni"
+        try:
+            parsed = urlparse(link)
+            return urlunparse(parsed._replace(fragment=name))
+        except:
+            pass
+    return link
 
-    name = f"{protocol}-{transport}-{sni_display}-#{index}-Kfg-analyzer"
-    
-    config_url = urlparse(details["config"])
-    new_config_str = config_url._replace(fragment=name).geturl()
-    return new_config_str
-
-# --- ГЛАВНАЯ ЛОГИКА ---
+def priority_key(link):
+    lower = link.lower()
+    if 'reality' in lower: return 100
+    if 'vless' in lower: return 80
+    if 'hysteria2' in lower: return 60
+    if 'trojan' in lower: return 40
+    return 20
 
 def main():
-    """Основной процесс выполнения скрипта."""
-    start_time = time.time()
-    setup_environment()
-    
-    logger.info("1. Загрузка источников...")
-    sources = get_sources()
-    if not sources:
-        return
-    logger.info(f"Найдено {len(sources)} источников.")
+    print("🚀 White-Lists Parser (БС) запущен")
 
-    logger.info("2. Скачивание и парсинг конфигов...")
-    all_configs = download_and_parse_sources(sources)
-    logger.info(f"Всего найдено {len(all_configs)} уникальных конфигов.")
+    with open(SOURCES_FILE, 'r', encoding='utf-8') as f:
+        sources = [line.strip() for line in f if line.strip() and not line.startswith('#')]
 
-    logger.info("3. Извлечение деталей из конфигов...")
-    config_details_list = []
-    processed_hashes = set()
-    for config in all_configs:
-        details = get_config_details(config)
-        if details:
-            config_hash = md5(f"{details['address']}:{details['port']}".encode()).hexdigest()
-            if config_hash not in processed_hashes:
-                config_details_list.append(details)
-                processed_hashes.add(config_hash)
-    logger.info(f"После дедупликации осталось {len(config_details_list)} конфигов для проверки.")
-    random.shuffle(config_details_list)
+    print(f"📋 Всего источников: {len(sources)}")
 
-    logger.info(f"4. Этап 1: Параллельная TCP-проверка ({TCP_CHECK_THREADS} потоков)...")
-    tcp_passed_configs = []
-    with ThreadPoolExecutor(max_workers=TCP_CHECK_THREADS) as executor:
-        future_to_details = {
-            executor.submit(tcp_check, d["address"], d["port"]): d for d in config_details_list
-        }
-        for i, future in enumerate(as_completed(future_to_details)):
-            if (i + 1) % 500 == 0:
-                logger.info(f"Проверено TCP: {i+1}/{len(config_details_list)}")
+    all_configs = []
+    with ThreadPoolExecutor(max_workers=15) as executor:
+        future_to_src = {executor.submit(fetch, src): src for src in sources}
+        for future in as_completed(future_to_src):
+            content = future.result()
+            if content:
+                text = content.decode('utf-8', errors='ignore')
+                if 't.me' in future_to_src[future]:
+                    pat = r'(vmess://|vless://|trojan://|ss://|ssr://|hysteria2://|tuic://)[^\s<>"\']+'
+                    found = re.findall(pat, text)
+                    all_configs.extend(found)
+                else:
+                    lines = [l.strip() for l in text.splitlines() if any(l.startswith(p + "://") for p in SUPPORTED)]
+                    all_configs.extend(lines)
+
+    unique_raw = {config_hash(link): link for link in all_configs if any(link.startswith(p + "://") for p in SUPPORTED)}
+    print(f"📦 Уникальных конфигов: {len(unique_raw)}")
+
+    candidates = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_link = {executor.submit(tcp_check, link): link for link in unique_raw.values()}
+        for future in as_completed(future_to_link):
             if future.result():
-                tcp_passed_configs.append(future_to_details[future])
-    
-    logger.info(f"TCP-проверку прошли {len(tcp_passed_configs)} конфигов.")
+                candidates.append(future_to_link[future])
 
-    logger.info(f"5. Этап 2: 'HTTP' проверка (симуляция)...")
-    # Так как requests не умеет в vless/trojan, мы считаем все TCP-пройденные конфиги рабочими.
-    # Это наиболее стабильный подход в рамках GitHub Actions.
-    working_configs = tcp_passed_configs
+    print(f"   Прошло TCP: {len(candidates)}")
 
-    logger.info(f"Считаем рабочими {len(working_configs)} конфигов после TCP-проверки.")
-    
-    if len(working_configs) < LOW_CONFIG_THRESHOLD and len(config_details_list) > len(working_configs):
-         logger.warning(f"Рабочих конфигов ({len(working_configs)}) меньше порога ({LOW_CONFIG_THRESHOLD}).")
-         # В этой версии логика отката не нужна, т.к. мы уже берем все TCP-проверенные.
-         # Можно добавить логику возврата к непроверенным, но это рискованно.
-    
-    logger.info(f"Итоговое количество рабочих конфигов: {len(working_configs)}")
+    working = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_link = {executor.submit(full_check, link): link for link in candidates[:3000]}
+        for future in as_completed(future_to_link):
+            if future.result():
+                working.append(future_to_link[future])
 
-    if not working_configs:
-        logger.warning("Не найдено ни одного рабочего конфига. Пропускаем сохранение файлов.")
-        return
+    print(f"✅ Прошло полную проверку: {len(working)}")
 
-    logger.info("6. Сортировка и переименование конфигов...")
-    working_configs.sort(key=lambda c: PROTOCOL_PRIORITY.get(c.get("protocol"), 99))
-    
-    renamed_all = [rename_config(d, i) for i, d in enumerate(working_configs)]
-    renamed_ios = renamed_all[:IOS_SUB_LIMIT]
+    valid = [rename_config(link) for link in working]
+    valid.sort(key=priority_key, reverse=True)
 
-    logger.info("7. Сохранение файлов подписок...")
-    
-    # sub_white.txt
-    try:
-        with open(OUTPUT_DIR / "sub_white.txt", "w", encoding="utf-8") as f:
-            f.write(base64.b64encode("\n".join(renamed_all).encode()).decode())
-        logger.info(f"Сохранен sub_white.txt ({len(renamed_all)} конфигов)")
-            
-        # sub_ios_white.txt
-        with open(OUTPUT_DIR / "sub_ios_white.txt", "w", encoding="utf-8") as f:
-            f.write(base64.b64encode("\n".join(renamed_ios).encode()).decode())
-        logger.info(f"Сохранен sub_ios_white.txt ({len(renamed_ios)} конфигов)")
-            
-        # sub_singbox_white.json
-        singbox_config = {
-            "version": 1,
-            "outbounds": [{"url": url} for url in renamed_all]
-        }
-        with open(OUTPUT_DIR / "sub_singbox_white.json", "w", encoding="utf-8") as f:
-            json.dump(singbox_config, f, indent=2)
-        logger.info(f"Сохранен sub_singbox_white.json")
+    android_configs = valid
+    ios_configs = valid[:50]
 
-        # stats_white.json
-        protocol_counts = {}
-        for c in working_configs:
-            protocol = c.get("protocol", "unknown")
-            protocol_counts[protocol] = protocol_counts.get(protocol, 0) + 1
-            
-        stats = {
-            "update_time": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
-            "total_sources": len(sources),
-            "initial_configs": len(all_configs),
-            "unique_configs_for_check": len(config_details_list),
-            "tcp_passed": len(tcp_passed_configs),
-            "final_working_configs": len(working_configs),
-            "protocols": protocol_counts
-        }
-        with open(OUTPUT_DIR / "stats_white.json", "w", encoding="utf-8") as f:
-            json.dump(stats, f, indent=2)
-        logger.info(f"Сохранен stats_white.json")
-    except Exception as e:
-        logger.error(f"Произошла ошибка при сохранении файлов: {e}")
+    if len(android_configs) < 400:
+        fallback = [rename_config(link) for link in candidates[:2000]]
+        android_configs = fallback
+        ios_configs = fallback[:50]
 
+    MAIN_SUB.write_text(base64.b64encode('\n'.join(android_configs).encode()).decode())
+    IOS_SUB.write_text(base64.b64encode('\n'.join(ios_configs).encode()).decode())
 
-    end_time = time.time()
-    logger.info(f"Работа завершена за {end_time - start_time:.2f} секунд.")
+    with open(SINGBOX_SUB, 'w', encoding='utf-8') as f:
+        json.dump({"outbounds": [{"type": "urltest", "tag": "Kfg-White", "outbounds": android_configs}]}, f, indent=2)
+
+    stats = {
+        "total": len(android_configs),
+        "last_update": datetime.now().strftime("%Y-%m-%d %H:%M UTC")
+    }
+    json.dump(stats, open(STATS, 'w'), indent=2)
+
+    print(f"✅ БС готов! Всего: {len(android_configs)}")
 
 if __name__ == "__main__":
     main()
