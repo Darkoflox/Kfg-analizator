@@ -1,9 +1,9 @@
 name: Whitelist Parser
 
 on:
-  workflow_dispatch: # Позволяет запускать вручную
+  workflow_dispatch:
   schedule:
-    - cron: '0 */6 * * *' # ИЗМЕНЕНО: Запуск каждые 6 часов
+    - cron: '0 */6 * * *'
 
 jobs:
   build-whitelist:
@@ -29,8 +29,7 @@ jobs:
         run: |
           git config --global user.name 'github-actions[bot]'
           git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-          git add whitelist/ # Добавляем всю папку с результатами
-          # Проверяем, есть ли изменения для коммита
+          git add public/   # <-- ИСПРАВЛЕНО здесь
           if ! git diff-index --quiet HEAD; then
             git commit -m "Update whitelist subscriptions [$(date -u +'%Y-%m-%d %H:%M:%S UTC')]"
             git push
