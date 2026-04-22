@@ -1,0 +1,25 @@
+# Код для добавления в конец функции save_subscriptions
+# ...
+
+    # 5. Генерация файла со ссылками для импорта (Subscription URLs)
+    # Укажи здесь имя своего пользователя и репозитория на GitHub
+    repo_user = "Darkoflox"
+    repo_name = "Kfg-analyzer"
+    branch = "main"  # или "master"
+
+    base_url = f"https://raw.githubusercontent.com/{repo_user}/{repo_name}/{branch}"
+    
+    urls_file = out_path / "subscription_urls.txt"
+    with open(urls_file, "w", encoding="utf-8") as f:
+        f.write("# Subscription URLs — скопируйте нужную ссылку и вставьте в VPN-клиент\n")
+        f.write(f"# Android (все рабочие конфигурации)\n{base_url}/sub_android.txt\n\n")
+        f.write(f"# iOS (топ-100 самых быстрых, пинг < 300мс)\n{base_url}/sub_ios.txt\n\n")
+        f.write(f"# Все проверенные\n{base_url}/sub_all_checked.txt\n\n")
+        f.write("# По протоколам:\n")
+        for proto in SUPPORTED_PROTOCOLS:
+            proto_file = out_path / f"sub_{proto}.txt"
+            if proto_file.exists():
+                f.write(f"# {proto.upper()}\n{base_url}/sub_{proto}.txt\n")
+    logger.info(f"🔗 Файл со ссылками для импорта: {urls_file}")
+
+# ...
