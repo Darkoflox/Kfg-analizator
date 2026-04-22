@@ -1,11 +1,4 @@
-# Subscription URLs — скопируйте нужную ссылку и вставьте в VPN-клиент
-# Android (все рабочие)
+# Subscription URLs
 https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_android.txt
-
-# iOS (топ-100 быстрых)
 https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_ios.txt
-
-# Все проверенные
 https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_all_checked.txt
-
-# По протоколам:
