@@ -33,8 +33,11 @@ jobs:
       - name: Run parser
         run: python advanced_parser.py
 
+      - name: Update README with subscription links
+        run: python update_readme.py
+
       - name: Commit and push changes
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "Автообновление подписок и списков"
-          file_pattern: '*.txt'
+          commit_message: "Автообновление подписок и README"
+          file_pattern: '*.txt README.md'
