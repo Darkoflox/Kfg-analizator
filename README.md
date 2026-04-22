@@ -29,24 +29,15 @@
 
 ---
 
-## 📦 Требования
+## 🔗 Готовые подписки для импорта
 
-- **Python** 3.7 или выше
-- Установленные зависимости из `requirements.txt`:
-  - `aiohttp` – асинхронные HTTP-запросы
-  - `pyyaml` – работа с Clash YAML
-- (Автоматически скачивается) **Xray-core** – для проверки соединений
+<!-- SUBSCRIPTION_LINKS_START -->
+*Ссылки будут обновлены после первого запуска парсера.*
+<!-- SUBSCRIPTION_LINKS_END -->
 
 ---
 
-## 🛠️ Установка и первый запуск
-
-1. **Клонируйте репозиторий:**
-   ```bash
-   git clone https://github.com/yourusername/yourrepo.git
-   cd yourrepo
-   
-## 📱 Рекомендуемые  UMI-клиенты
+## 📱 Рекомендуемые VPN-клиенты
 
 Собранные конфигурации можно использовать с любым клиентом, поддерживающим протоколы VLESS, VMess, Trojan и Shadowsocks (Xray/Sing-box). Ниже приведён список проверенных приложений для разных платформ.
 
@@ -77,3 +68,22 @@
     *   [Скачать из App Store](https://apps.apple.com/app/shadowrocket/id932747118)
 *   **Stash**: Современная альтернатива Shadowrocket с поддержкой правил в стиле Clash и актуальных протоколов.
     *   [Скачать из App Store](https://apps.apple.com/app/stash/id1596063349)
+
+---
+
+## 📦 Требования
+
+- **Python** 3.7 или выше
+- Установленные зависимости из `requirements.txt`:
+  - `aiohttp` – асинхронные HTTP-запросы
+  - `pyyaml` – работа с Clash YAML
+- (Автоматически скачивается) **Xray-core** – для проверки соединений
+
+---
+
+## 🛠️ Установка и первый запуск
+
+1. **Клонируйте репозиторий:**
+   ```bash
+   git clone https://github.com/Darkoflox/Kfg-analizator.git
+   cd Kfg-analizator
