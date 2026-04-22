@@ -25,30 +25,24 @@ from urllib.parse import parse_qs, urlparse, unquote
 import aiohttp
 import yaml
 
-# Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
 
-# Поддерживаемые протоколы
 SUPPORTED_PROTOCOLS = {'vmess', 'vless', 'trojan', 'ss', 'ssr', 'hysteria2', 'tuic'}
-
-# Улучшенное регулярное выражение: ищет ссылки протоколов даже слипшиеся
 PROXY_LINK_PATTERN = re.compile(
     r'(vmess|vless|trojan|ss|ssr|hysteria2|tuic)://[^\s#]+',
     re.IGNORECASE
 )
 
-# URL для загрузки Xray-core
 XRAY_DOWNLOAD_URLS = {
     'linux': 'https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip',
     'darwin': 'https://github.com/XTLS/Xray-core/releases/latest/download/Xray-macos-64.zip',
     'windows': 'https://github.com/XTLS/Xray-core/releases/latest/download/Xray-windows-64.zip',
 }
 
-# Сопоставление TLD с флагами (эмодзи)
 TLD_FLAGS = {
     'ru': '🇷🇺', 'us': '🇺🇸', 'de': '🇩🇪', 'nl': '🇳🇱', 'fr': '🇫🇷', 'gb': '🇬🇧', 'uk': '🇬🇧',
     'ca': '🇨🇦', 'jp': '🇯🇵', 'kr': '🇰🇷', 'sg': '🇸🇬', 'hk': '🇭🇰', 'tw': '🇹🇼',
@@ -61,77 +55,68 @@ TLD_FLAGS = {
     'lu': '🇱🇺', 'mt': '🇲🇹', 'cy': '🇨🇾', 'is': '🇮🇸', 'ie': '🇮🇪', 'be': '🇧🇪',
 }
 
-# Источники по умолчанию
 DEFAULT_SOURCES = [
     "https://raw.githubusercontent.com/vfarid/v2ray-share/main/all_links.txt",
     "https://raw.githubusercontent.com/mahdibland/V2RayAggregator/master/sub/sub_merge.txt",
     "https://raw.githubusercontent.com/yebekhe/TVIP/main/all",
-    "https://raw.githubusercontent.com/LalatinaHub/Mineralhe/main/all.txt",
-    "https://raw.githubusercontent.com/alien-v2ray/alien-v2ray.github.io/main/all.txt",
-    "https://raw.githubusercontent.com/Lonelystar/v2ray-configs/main/all.txt",
-    "https://raw.githubusercontent.com/SamanGoli66/v2ray-configs/main/v2ray-clients",
-    "https://raw.githubusercontent.com/Pawel-S-K/free-v2ray-config/main/sub",
-    "https://raw.githubusercontent.com/Emsis/v2ray-configs/main/configs.txt",
-    "https://raw.githubusercontent.com/Bypass-LAN/V2ray/main/Sub.txt",
 ]
 
+# ---------- Управление источниками (с исключением проблемных) ----------
+class SourceManager:
+    def __init__(self, sources_file="sources.txt", failed_file="failed_sources.txt"):
+        self.sources_file = sources_file
+        self.failed_file = failed_file
 
-# ---------- Вспомогательные функции ----------
-def load_sources(filename: str = "sources.txt") -> List[str]:
-    """Загружает список источников из файла, при необходимости создаёт файл."""
-    try:
-        with open(filename, 'r', encoding='utf-8') as f:
-            sources = [
-                line.strip()
-                for line in f
-                if line.strip() and not line.startswith('#')
-            ]
-        if sources:
-            logger.info(f"✅ Загружено {len(sources)} источников из {filename}")
-            return sources
-        logger.warning(f"⚠️ Файл {filename} пуст, использую список по умолчанию")
-        return DEFAULT_SOURCES
-    except FileNotFoundError:
-        logger.warning(f"⚠️ Файл {filename} не найден, создаю пример и использую список по умолчанию")
-        with open(filename, 'w', encoding='utf-8') as f:
-            f.write("# Список источников подписок (по одному URL на строку)\n")
-            for url in DEFAULT_SOURCES:
+    def load_sources(self) -> List[str]:
+        """Загружает активные источники, исключая ранее проваленные."""
+        # Загружаем все из sources.txt
+        try:
+            with open(self.sources_file, 'r', encoding='utf-8') as f:
+                all_sources = [line.strip() for line in f if line.strip() and not line.startswith('#')]
+        except FileNotFoundError:
+            logger.warning(f"Файл {self.sources_file} не найден, создаю пример")
+            all_sources = DEFAULT_SOURCES
+            with open(self.sources_file, 'w', encoding='utf-8') as f:
+                f.write("# Список источников подписок\n")
+                for url in all_sources:
+                    f.write(f"{url}\n")
+
+        # Загружаем список проваленных
+        failed = set()
+        if Path(self.failed_file).exists():
+            with open(self.failed_file, 'r', encoding='utf-8') as f:
+                failed = {line.strip() for line in f if line.strip()}
+
+        active = [url for url in all_sources if url not in failed]
+        logger.info(f"Активных источников: {len(active)} (пропущено проблемных: {len(failed)})")
+        return active
+
+    def mark_failed(self, url: str):
+        """Добавляет источник в список проваленных."""
+        try:
+            with open(self.failed_file, 'a', encoding='utf-8') as f:
                 f.write(f"{url}\n")
-        return DEFAULT_SOURCES
+            logger.warning(f"Источник {url} добавлен в список проблемных")
+        except Exception as e:
+            logger.error(f"Не удалось записать {self.failed_file}: {e}")
 
 
-def get_flag_from_host(host: str) -> str:
-    """Возвращает эмодзи флага по TLD домена."""
-    if not host:
-        return '🏳️'
-    parts = host.split('.')
-    if len(parts) >= 2:
-        tld = parts[-1].lower()
-        return TLD_FLAGS.get(tld, '🌐')
-    return '🌐'
-
-
+# ---------- Фильтр РФ (двусторонний) ----------
 class RussianFilter:
-    """Фильтр по российским IP и доменам."""
-
-    def __init__(self, ip_file: str = "russia_ip.txt", domain_file: str = "russia_domains.txt"):
+    def __init__(self, ip_file="russia_ip.txt", domain_file="russia_domains.txt"):
         self.ip_networks = []
         self.domains = set()
         self._load_lists(ip_file, domain_file)
-        self._dns_cache: Dict[str, str] = {}
+        self._dns_cache = {}
 
-    def _ensure_file(self, path: str, example_content: str = ""):
-        """Создаёт файл, если его нет."""
+    def _ensure_file(self, path: str, example: str):
         if not Path(path).exists():
-            Path(path).write_text(example_content, encoding='utf-8')
+            Path(path).write_text(example, encoding='utf-8')
             logger.info(f"📄 Создан файл {path}")
 
     def _load_lists(self, ip_file: str, domain_file: str):
-        ip_example = "# IP-адреса и CIDR диапазоны РФ (по одному на строку)\n# Например:\n# 195.208.1.1\n# 92.63.96.0/20\n"
-        domain_example = "# Домены РФ (по одному на строку)\n# Например:\n# mail.ru\n# yandex.ru\n"
-
-        self._ensure_file(ip_file, ip_example)
-        self._ensure_file(domain_file, domain_example)
+        self._ensure_file(ip_file, "# IP-адреса и CIDR РФ\n")
+        self._ensure_file(domain_file, "# Домены РФ\n")
 
         with open(ip_file, 'r', encoding='utf-8') as f:
             for line in f:
@@ -139,8 +124,7 @@ class RussianFilter:
                 if not line or line.startswith('#'):
                     continue
                 try:
-                    network = ipaddress.ip_network(line, strict=False)
-                    self.ip_networks.append(network)
+                    self.ip_networks.append(ipaddress.ip_network(line, strict=False))
                 except ValueError:
                     pass
 
@@ -151,10 +135,33 @@ class RussianFilter:
                     continue
                 self.domains.add(line)
 
-        logger.info(f"🛡️ Загружено IP-сетей РФ: {len(self.ip_networks)}, доменов РФ: {len(self.domains)}")
+        logger.info(f"🛡️ РФ: IP-сетей {len(self.ip_networks)}, доменов {len(self.domains)}")
+
+    def is_russian(self, host: str) -> bool:
+        if not host:
+            return False
+        host_lower = host.lower()
+        for d in self.domains:
+            if host_lower == d or host_lower.endswith('.' + d):
+                return True
+        try:
+            ip = ipaddress.ip_address(host)
+            for net in self.ip_networks:
+                if ip in net:
+                    return True
+        except ValueError:
+            resolved = self._resolve_host(host)
+            if resolved:
+                try:
+                    ip = ipaddress.ip_address(resolved)
+                    for net in self.ip_networks:
+                        if ip in net:
+                            return True
+                except ValueError:
+                    pass
+        return False
 
     def _resolve_host(self, host: str) -> Optional[str]:
-        """Резолвит домен в IP-адрес (с кэшированием)."""
         if host in self._dns_cache:
             return self._dns_cache[host]
         try:
@@ -165,38 +172,9 @@ class RussianFilter:
             self._dns_cache[host] = None
             return None
 
-    def is_russian(self, host: str) -> bool:
-        """Проверяет, принадлежит ли хост (домен или IP) российскому сегменту."""
-        if not host:
-            return False
-
-        host_lower = host.lower()
-        for domain in self.domains:
-            if host_lower == domain or host_lower.endswith('.' + domain):
-                return True
-
-        try:
-            ip_addr = ipaddress.ip_address(host)
-            for network in self.ip_networks:
-                if ip_addr in network:
-                    return True
-            return False
-        except ValueError:
-            ip = self._resolve_host(host)
-            if ip:
-                try:
-                    ip_addr = ipaddress.ip_address(ip)
-                    for network in self.ip_networks:
-                        if ip_addr in network:
-                            return True
-                except ValueError:
-                    pass
-            return False
-
 
 # ---------- Модель конфигурации ----------
 from dataclasses import dataclass, field
-
 
 @dataclass
 class ProxyConfig:
@@ -224,53 +202,56 @@ class ProxyConfig:
         return self.raw
 
     def format_name(self, include_latency: bool = True) -> str:
-        flag = get_flag_from_host(self.host)
-        proto_icon = {
-            'vmess': '📦', 'vless': '🔒', 'trojan': '🐴', 'ss': '🕶️', 'hysteria2': '⚡'
-        }.get(self.protocol, '🔗')
-        base = f"{flag} {self.host} | {proto_icon} {self.protocol.upper()}"
+        flag = TLD_FLAGS.get(self.host.split('.')[-1].lower(), '🌐') if '.' in self.host else '🏳️'
+        icon = {'vmess':'📦','vless':'🔒','trojan':'🐴','ss':'🕶️','hysteria2':'⚡'}.get(self.protocol,'🔗')
+        base = f"{flag} {self.host} | {icon} {self.protocol.upper()}"
         if include_latency and self.latency is not None:
             base += f" | {self.latency:.0f}ms"
         return base
 
 
-# ---------- Чекер через Xray ----------
+# ---------- Чекер (двухэтапный: TCP + Xray) ----------
 class XrayChecker:
     def __init__(self, max_concurrent: int = 20, timeout: int = 8):
         self.max_concurrent = max_concurrent
         self.timeout = timeout
-        self.xray_path = None
-        self._ensure_xray()
+        self.xray_path = self._ensure_xray()
 
-    def _ensure_xray(self):
+    def _ensure_xray(self) -> str:
         system = sys.platform
-        xray_bin = 'xray'
-        if system == 'win32':
-            xray_bin += '.exe'
+        xray_bin = 'xray' if system != 'win32' else 'xray.exe'
         if Path(xray_bin).exists():
-            self.xray_path = str(Path(xray_bin).absolute())
-            logger.info(f"✅ Найден Xray: {self.xray_path}")
-            return
-        logger.info("📥 Xray не найден, скачиваем...")
-        import urllib.request
-        import zipfile
-        platform_key = 'windows' if system == 'win32' else ('darwin' if system == 'darwin' else 'linux')
-        url = XRAY_DOWNLOAD_URLS.get(platform_key)
+            logger.info(f"✅ Xray найден: {xray_bin}")
+            return str(Path(xray_bin).absolute())
+        logger.info("📥 Скачиваем Xray...")
+        import urllib.request, zipfile
+        key = 'windows' if system == 'win32' else ('darwin' if system == 'darwin' else 'linux')
+        url = XRAY_DOWNLOAD_URLS.get(key)
         if not url:
-            raise RuntimeError(f"Нет URL для платформы {platform_key}")
+            raise RuntimeError(f"Нет URL для {key}")
         zip_path = 'xray.zip'
         urllib.request.urlretrieve(url, zip_path)
         with zipfile.ZipFile(zip_path, 'r') as zf:
-            for member in zf.namelist():
-                if member.endswith(xray_bin):
-                    source = zf.open(member)
+            for m in zf.namelist():
+                if m.endswith(xray_bin):
                     with open(xray_bin, 'wb') as f:
-                        f.write(source.read())
+                        f.write(zf.read(m))
                     os.chmod(xray_bin, 0o755)
                     break
         Path(zip_path).unlink()
-        self.xray_path = str(Path(xray_bin).absolute())
-        logger.info(f"✅ Xray установлен: {self.xray_path}")
+        logger.info(f"✅ Xray установлен: {xray_bin}")
+        return str(Path(xray_bin).absolute())
+
+    def _tcp_check(self, host: str, port: int, timeout: float = 3.0) -> bool:
+        """Быстрая проверка TCP-подключения."""
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(timeout)
+            result = sock.connect_ex((host, port))
+            sock.close()
+            return result == 0
+        except Exception:
+            return False
 
     def _parse_uri(self, uri: str) -> Optional[ProxyConfig]:
         try:
@@ -285,9 +266,7 @@ class XrayChecker:
             cfg = ProxyConfig(raw=uri, protocol=proto, host=host, port=port)
             if proto == 'vmess':
                 b64 = uri[8:]
-                padding = 4 - (len(b64) % 4)
-                if padding != 4:
-                    b64 += '=' * padding
+                b64 += '=' * ((4 - len(b64) % 4) % 4)
                 data = json.loads(base64.b64decode(b64).decode('utf-8'))
                 cfg.uuid = data.get('id')
                 cfg.transport = data.get('net', 'tcp')
@@ -299,8 +278,7 @@ class XrayChecker:
                 cfg.uuid = parsed.username
                 params = parse_qs(parsed.query)
                 cfg.transport = params.get('type', ['tcp'])[0]
-                security = params.get('security', ['none'])[0]
-                cfg.tls = security
+                cfg.tls = params.get('security', ['none'])[0]
                 cfg.sni = params.get('sni', [None])[0]
                 cfg.path = params.get('path', [None])[0]
             elif proto == 'trojan':
@@ -328,70 +306,43 @@ class XrayChecker:
         }
         if outbound["streamSettings"]["security"] is None:
             del outbound["streamSettings"]["security"]
-
         if cfg.sni:
             outbound["streamSettings"]["sni"] = cfg.sni
         if cfg.transport == "ws" and cfg.path:
             outbound["streamSettings"]["wsSettings"] = {"path": cfg.path}
-
         if cfg.protocol == "vmess":
-            outbound["settings"]["vnext"] = [{
-                "address": cfg.host,
-                "port": cfg.port,
-                "users": [{"id": cfg.uuid, "alterId": 0}]
-            }]
+            outbound["settings"]["vnext"] = [{"address": cfg.host, "port": cfg.port, "users": [{"id": cfg.uuid, "alterId": 0}]}]
         elif cfg.protocol == "vless":
-            outbound["settings"]["vnext"] = [{
-                "address": cfg.host,
-                "port": cfg.port,
-                "users": [{"id": cfg.uuid, "encryption": "none"}]
-            }]
+            outbound["settings"]["vnext"] = [{"address": cfg.host, "port": cfg.port, "users": [{"id": cfg.uuid, "encryption": "none"}]}]
         elif cfg.protocol == "trojan":
-            outbound["settings"]["servers"] = [{
-                "address": cfg.host,
-                "port": cfg.port,
-                "password": cfg.password
-            }]
+            outbound["settings"]["servers"] = [{"address": cfg.host, "port": cfg.port, "password": cfg.password}]
         elif cfg.protocol == "ss":
-            outbound["settings"]["servers"] = [{
-                "address": cfg.host,
-                "port": cfg.port,
-                "method": cfg.method,
-                "password": cfg.password
-            }]
+            outbound["settings"]["servers"] = [{"address": cfg.host, "port": cfg.port, "method": cfg.method, "password": cfg.password}]
+        return {"log": {"loglevel": "warning"}, "inbounds": [{"listen": "127.0.0.1", "port": port, "protocol": "socks"}], "outbounds": [outbound]}
 
-        return {
-            "log": {"loglevel": "warning"},
-            "inbounds": [{
-                "listen": "127.0.0.1",
-                "port": port,
-                "protocol": "socks"
-            }],
-            "outbounds": [outbound]
-        }
-
-    @staticmethod
-    def _find_free_port() -> int:
+    def _find_free_port(self) -> int:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
             s.bind(('127.0.0.1', 0))
             return s.getsockname()[1]
 
     def test_config(self, cfg: ProxyConfig) -> Tuple[bool, float]:
+        # Этап 1: TCP-проверка
+        if not self._tcp_check(cfg.host, cfg.port, timeout=3):
+            return False, 0.0
+
+        # Этап 2: Проверка через Xray
         port = self._find_free_port()
         xray_config = self._build_xray_config(cfg, port)
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
             json.dump(xray_config, f)
             config_path = f.name
-
         process = None
         try:
             process = subprocess.Popen(
                 [self.xray_path, 'run', '-c', config_path],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
             time.sleep(1.5)
-
             import urllib.request
             proxy_handler = urllib.request.ProxyHandler({
                 'http': f'socks5://127.0.0.1:{port}',
@@ -399,10 +350,7 @@ class XrayChecker:
             })
             opener = urllib.request.build_opener(proxy_handler)
             start = time.time()
-            req = urllib.request.Request(
-                'http://cp.cloudflare.com/',
-                headers={'User-Agent': 'Mozilla/5.0'}
-            )
+            req = urllib.request.Request('http://cp.cloudflare.com/', headers={'User-Agent': 'Mozilla/5.0'})
             with opener.open(req, timeout=self.timeout) as resp:
                 if resp.status in (200, 204):
                     return True, (time.time() - start) * 1000
@@ -423,7 +371,6 @@ class XrayChecker:
 
     async def check_batch(self, configs: List[ProxyConfig]) -> List[ProxyConfig]:
         semaphore = asyncio.Semaphore(self.max_concurrent)
-
         async def check_one(cfg: ProxyConfig):
             async with semaphore:
                 loop = asyncio.get_event_loop()
@@ -433,7 +380,6 @@ class XrayChecker:
                     cfg.working = True
                     cfg.latency = latency
                 return cfg
-
         tasks = [check_one(cfg) for cfg in configs]
         return await asyncio.gather(*tasks)
 
@@ -446,13 +392,11 @@ class SubscriptionParser:
         self.session: Optional[aiohttp.ClientSession] = None
         self.checker = XrayChecker()
         self.russian_filter = RussianFilter()
+        self.source_manager = SourceManager()
 
     async def __aenter__(self):
         connector = aiohttp.TCPConnector(limit=0, ssl=False)
-        self.session = aiohttp.ClientSession(
-            connector=connector,
-            timeout=aiohttp.ClientTimeout(total=self.timeout)
-        )
+        self.session = aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=self.timeout))
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -470,8 +414,6 @@ class SubscriptionParser:
             return None
 
     def decode_subscription(self, content: str) -> List[str]:
-        """Декодирует содержимое подписки в список строк-ссылок."""
-        # 1. Попытка распарсить Clash YAML
         if content.strip().startswith(('proxies:', 'Proxy:')):
             try:
                 data = yaml.safe_load(content)
@@ -483,15 +425,12 @@ class SubscriptionParser:
                         b64 = base64.b64encode(json.dumps({
                             "v": "2", "ps": p.get('name', ''),
                             "add": p['server'], "port": str(p['port']),
-                            "id": p['uuid'], "aid": 0,
-                            "net": p.get('network', 'tcp')
+                            "id": p['uuid'], "aid": 0, "net": p.get('network', 'tcp')
                         }).encode()).decode()
                         links.append(f"vmess://{b64}")
                     elif t == 'ss':
-                        userinfo = base64.b64encode(
-                            f"{p['cipher']}:{p['password']}".encode()
-                        ).decode().rstrip('=')
-                        links.append(f"ss://{userinfo}@{p['server']}:{p['port']}#{p.get('name', '')}")
+                        userinfo = base64.b64encode(f"{p['cipher']}:{p['password']}".encode()).decode().rstrip('=')
+                        links.append(f"ss://{userinfo}@{p['server']}:{p['port']}#{p.get('name','')}")
                     elif t == 'trojan':
                         links.append(f"trojan://{p['password']}@{p['server']}:{p['port']}?sni={p.get('sni','')}#{p.get('name','')}")
                     elif t == 'vless':
@@ -500,37 +439,27 @@ class SubscriptionParser:
                     return links
             except Exception:
                 pass
-
-        # 2. Попытка декодировать как Base64
         try:
             decoded = base64.b64decode(content, validate=True).decode('utf-8', errors='ignore')
             if any(p in decoded for p in SUPPORTED_PROTOCOLS):
                 return decoded.splitlines()
         except Exception:
             pass
-
-        # 3. Возвращаем как plain text (разбиваем по строкам)
         return content.splitlines()
 
     def extract_links(self, text: str) -> List[str]:
-        """Извлекает все прокси-ссылки из текста."""
-        # Удаляем URL-кодирование из текста для лучшего совпадения
         try:
             decoded_text = unquote(text)
         except Exception:
             decoded_text = text
-
         links = []
         for match in PROXY_LINK_PATTERN.finditer(decoded_text):
             link = match.group(0)
-            # Очищаем возможный мусор в начале (если ссылка слиплась с текстом)
-            proto_pos = link.find('://')
-            if proto_pos > 10:  # Если протокол далеко от начала, обрезаем
-                for proto in SUPPORTED_PROTOCOLS:
-                    idx = link.find(f"{proto}://")
-                    if idx != -1:
-                        link = link[idx:]
-                        break
+            for proto in SUPPORTED_PROTOCOLS:
+                idx = link.find(f"{proto}://")
+                if idx != -1:
+                    link = link[idx:]
+                    break
             links.append(link)
         return links
 
@@ -538,10 +467,8 @@ class SubscriptionParser:
         content = await self.fetch_content(url)
         if not content:
             return []
-
         configs = []
         lines = self.decode_subscription(content)
-
         for line in lines:
             line = line.strip()
             if not line:
@@ -550,15 +477,15 @@ class SubscriptionParser:
                 cfg = self.checker._parse_uri(link)
                 if cfg:
                     configs.append(cfg)
-
         logger.info(f"Из {url} извлечено {len(configs)} конфигураций")
         if len(configs) == 0 and len(content) > 0:
             preview = content[:200].replace('\n', ' ').replace('\r', '')
             logger.warning(f"Не удалось извлечь конфигурации из {url}. Превью: {preview}")
-
+            self.source_manager.mark_failed(url)
         return configs
 
-    async def collect_all(self, sources: List[str]) -> List[ProxyConfig]:
+    async def collect_all(self) -> List[ProxyConfig]:
+        sources = self.source_manager.load_sources()
         tasks = [self.parse_subscription(url) for url in sources]
         results = await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -569,7 +496,7 @@ class SubscriptionParser:
             elif isinstance(result, list):
                 all_configs.extend(result)
 
-        # Дедупликация по хосту:порту:идентификатору
+        # Дедупликация
         seen = set()
         unique = []
         for cfg in all_configs:
@@ -578,115 +505,74 @@ class SubscriptionParser:
                 seen.add(key)
                 unique.append(cfg)
 
-        # Фильтрация РФ
-        filtered = []
-        for cfg in unique:
-            if self.russian_filter.is_russian(cfg.host):
-                logger.debug(f"🇷🇺 Отфильтрован российский хост: {cfg.host}")
-                continue
-            filtered.append(cfg)
-
-        logger.info(f"Всего собрано {len(unique)} уникальных конфигураций, после фильтра РФ: {len(filtered)}")
-        return filtered
+        logger.info(f"Всего собрано {len(unique)} уникальных конфигураций")
+        return unique
 
 
-# ---------- Сохранение подписок ----------
-def save_subscriptions(configs: List[ProxyConfig], output_dir: str = "."):
+# ---------- Сохранение ----------
+def save_subscriptions(configs: List[ProxyConfig], russian_filter: RussianFilter, output_dir: str = "."):
     out_path = Path(output_dir)
     out_path.mkdir(exist_ok=True)
 
     working = [c for c in configs if c.working]
     working.sort(key=lambda x: x.latency if x.latency else 999999)
 
-    logger.info(f"Рабочих конфигураций: {len(working)} из {len(configs)}")
+    # Отделяем российские
+    russia_configs = [c for c in working if russian_filter.is_russian(c.host)]
+    non_russia_configs = [c for c in working if not russian_filter.is_russian(c.host)]
 
-    # Android: все рабочие
-    android_file = out_path / "sub_android.txt"
-    with open(android_file, "w", encoding="utf-8") as f:
-        for cfg in working:
-            name = cfg.format_name(include_latency=True)
-            uri = cfg.to_uri()
-            if '#' in uri:
-                uri = uri.split('#')[0]
-            f.write(f"{uri}#{name}\n")
-    logger.info(f"💾 Android подписка: {android_file} ({len(working)} конфигураций)")
+    logger.info(f"Рабочих: {len(working)} (из них РФ: {len(russia_configs)})")
 
-    # iOS: топ-100 быстрых (пинг < 300 мс)
-    ios_candidates = [c for c in working if c.latency and c.latency < 300]
+    # --- Стандартные подписки (без РФ) ---
+    # Android
+    (out_path / "sub_android.txt").write_text(
+        "\n".join([f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in non_russia_configs]),
+        encoding='utf-8'
+    )
+    # iOS
+    ios_candidates = [c for c in non_russia_configs if c.latency and c.latency < 300]
     ios_candidates.sort(key=lambda x: x.latency)
-    ios_top = ios_candidates[:100]
-    ios_file = out_path / "sub_ios.txt"
-    with open(ios_file, "w", encoding="utf-8") as f:
-        for cfg in ios_top:
-            name = cfg.format_name(include_latency=True)
-            uri = cfg.to_uri()
-            if '#' in uri:
-                uri = uri.split('#')[0]
-            f.write(f"{uri}#{name}\n")
-    logger.info(f"💾 iOS подписка: {ios_file} ({len(ios_top)} конфигураций, пинг < 300мс)")
-
+    (out_path / "sub_ios.txt").write_text(
+        "\n".join([f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in ios_candidates[:100]]),
+        encoding='utf-8'
+    )
     # Все проверенные
-    all_checked = out_path / "sub_all_checked.txt"
-    with open(all_checked, "w", encoding="utf-8") as f:
-        for cfg in working:
-            uri = cfg.to_uri()
-            if '#' in uri:
-                uri = uri.split('#')[0]
-            f.write(f"{uri}#{cfg.format_name(include_latency=True)}\n")
-    logger.info(f"💾 Общая подписка: {all_checked}")
-
+    (out_path / "sub_all_checked.txt").write_text(
+        "\n".join([f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in non_russia_configs]),
+        encoding='utf-8'
+    )
     # По протоколам
     for proto in SUPPORTED_PROTOCOLS:
-        proto_configs = [c for c in working if c.protocol == proto]
-        if proto_configs:
-            proto_file = out_path / f"sub_{proto}.txt"
-            with open(proto_file, "w", encoding="utf-8") as f:
-                for cfg in proto_configs:
-                    uri = cfg.to_uri()
-                    if '#' in uri:
-                        uri = uri.split('#')[0]
-                    f.write(f"{uri}#{cfg.format_name(include_latency=True)}\n")
-            logger.info(f"💾 {proto.upper()} подписка: {proto_file} ({len(proto_configs)} конфигураций)")
+        proto_list = [c for c in non_russia_configs if c.protocol == proto]
+        if proto_list:
+            (out_path / f"sub_{proto}.txt").write_text(
+                "\n".join([f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in proto_list]),
+                encoding='utf-8'
+            )
 
-    # Генерация файла со ссылками для импорта
+    # --- Российская подписка ---
+    if russia_configs:
+        (out_path / "sub_russia.txt").write_text(
+            "\n".join([f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in russia_configs]),
+            encoding='utf-8'
+        )
+        logger.info(f"🇷🇺 Российская подписка: sub_russia.txt ({len(russia_configs)} шт.)")
+
+    # Файл со ссылками
     repo_user = "Darkoflox"
     repo_name = "Kfg-analizator"
     branch = "main"
-    base_url = f"https://raw.githubusercontent.com/{repo_user}/{repo_name}/{branch}"
-
-    urls_file = out_path / "subscription_urls.txt"
-    with open(urls_file, "w", encoding="utf-8") as f:
-        f.write("# Subscription URLs — скопируйте нужную ссылку и вставьте в VPN-клиент\n")
-        f.write(f"# Android (все рабочие)\n{base_url}/sub_android.txt\n\n")
-        f.write(f"# iOS (топ-100 быстрых)\n{base_url}/sub_ios.txt\n\n")
-        f.write(f"# Все проверенные\n{base_url}/sub_all_checked.txt\n\n")
-        f.write("# По протоколам:\n")
-        for proto in SUPPORTED_PROTOCOLS:
-            proto_file = out_path / f"sub_{proto}.txt"
-            if proto_file.exists():
-                f.write(f"# {proto.upper()}\n{base_url}/sub_{proto}.txt\n")
-    logger.info(f"🔗 Файл со ссылками для импорта: {urls_file}")
+    base = f"https://raw.githubusercontent.com/{repo_user}/{repo_name}/{branch}"
+    with open(out_path / "subscription_urls.txt", "w", encoding='utf-8') as f:
+        f.write(f"{base}/sub_android.txt\n{base}/sub_ios.txt\n{base}/sub_all_checked.txt\n{base}/sub_russia.txt\n")
 
 
-# ---------- Точка входа ----------
 async def main():
-    sources = load_sources()
-    logger.info(f"🚀 Начинаем сбор с {len(sources)} источников...")
-
     async with SubscriptionParser(timeout=60, max_concurrent=5) as parser:
-        logger.info("📥 Сбор конфигураций...")
-        configs = await parser.collect_all(sources)
-
+        configs = await parser.collect_all()
         if configs:
-            logger.info(f"🔍 Проверка {len(configs)} конфигураций...")
             configs = await parser.checker.check_batch(configs)
-            working = [c for c in configs if c.working]
-            logger.info(f"✅ Проверка завершена. Рабочих: {len(working)} из {len(configs)}")
-        else:
-            logger.warning("Нет конфигураций для проверки")
-
-        save_subscriptions(configs)
-
+        save_subscriptions(configs, parser.russian_filter)
 
 if __name__ == "__main__":
     asyncio.run(main())
