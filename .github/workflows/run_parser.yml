@@ -12,20 +12,28 @@ jobs:
       contents: write
     steps:
       - uses: actions/checkout@v4
-      
+
+      # Шаг 1: Скачиваем свежий список IP
+      - name: Download RKP IP list
+        run: curl -sL https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/main/iP.txt -o russia_ip.txt
+
+      # Шаг 2: Скачиваем свежий список доменов
+      - name: Download RKP domain list
+        run: curl -sL https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/main/domain.txt -o russia_domains.txt
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          
+
       - name: Install dependencies
         run: pip install -r requirements.txt
-        
+
       - name: Run parser
         run: python advanced_parser.py
-        
+
       - name: Commit and push changes
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "🔄 Автообновление подписок"
+          commit_message: "🔄 Автообновление подписок и списков"
           file_pattern: '*.txt'
