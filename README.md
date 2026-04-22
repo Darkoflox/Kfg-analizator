@@ -1,7 +1,5 @@
 # 🔧 Config Collector & Validator
 
-[![Update Subscriptions](https://github.com/yourusername/yourrepo/actions/workflows/run_parser.yml/badge.svg)](https://github.com/yourusername/yourrepo/actions/workflows/run_parser.yml)
-
 **Автоматический сбор, проверка и фильтрация сетевых конфигураций из публичных источников.**  
 Проект создан **исключительно в образовательных и исследовательских целях** для изучения языков программирования, сетевых протоколов и принципов автоматизации.
 
