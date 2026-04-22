@@ -8,16 +8,17 @@ on:
 jobs:
   update:
     runs-on: ubuntu-latest
+    timeout-minutes: 30      # ограничение времени выполнения
     permissions:
       contents: write
     steps:
       - uses: actions/checkout@v4
 
-      # Шаг 1: Скачиваем свежий список IP
+      # Скачиваем свежий список IP РФ из RKPchannel
       - name: Download RKP IP list
         run: curl -sL https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/main/iP.txt -o russia_ip.txt
 
-      # Шаг 2: Скачиваем свежий список доменов
+      # Скачиваем свежий список доменов РФ из RKPchannel
       - name: Download RKP domain list
         run: curl -sL https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/main/domain.txt -o russia_domains.txt
 
@@ -35,5 +36,5 @@ jobs:
       - name: Commit and push changes
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "🔄 Автообновление подписок и списков"
+          commit_message: "Автообновление подписок и списков"
           file_pattern: '*.txt'
