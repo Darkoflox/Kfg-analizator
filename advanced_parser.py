@@ -2,6 +2,8 @@
 """
 Универсальный асинхронный парсер подписок с проверкой через Xray-core,
 фильтрацией по IP/доменам РФ и генерацией подписок для Android и iOS.
+Использование:
+    python advanced_parser.py [--max-check N] [--threads M]
 """
 import asyncio
 import base64
@@ -17,6 +19,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from argparse import ArgumentParser
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -61,15 +64,13 @@ DEFAULT_SOURCES = [
     "https://raw.githubusercontent.com/yebekhe/TVIP/main/all",
 ]
 
-# ---------- Управление источниками (с исключением проблемных) ----------
+# ---------- Управление источниками ----------
 class SourceManager:
     def __init__(self, sources_file="sources.txt", failed_file="failed_sources.txt"):
         self.sources_file = sources_file
         self.failed_file = failed_file
 
     def load_sources(self) -> List[str]:
-        """Загружает активные источники, исключая ранее проваленные."""
-        # Загружаем все из sources.txt
         try:
             with open(self.sources_file, 'r', encoding='utf-8') as f:
                 all_sources = [line.strip() for line in f if line.strip() and not line.startswith('#')]
@@ -81,7 +82,6 @@ class SourceManager:
                 for url in all_sources:
                     f.write(f"{url}\n")
 
-        # Загружаем список проваленных
         failed = set()
         if Path(self.failed_file).exists():
             with open(self.failed_file, 'r', encoding='utf-8') as f:
@@ -92,7 +92,6 @@ class SourceManager:
         return active
 
     def mark_failed(self, url: str):
-        """Добавляет источник в список проваленных."""
         try:
             with open(self.failed_file, 'a', encoding='utf-8') as f:
                 f.write(f"{url}\n")
@@ -101,7 +100,7 @@ class SourceManager:
             logger.error(f"Не удалось записать {self.failed_file}: {e}")
 
 
-# ---------- Фильтр РФ (двусторонний) ----------
+# ---------- Фильтр РФ ----------
 class RussianFilter:
     def __init__(self, ip_file="russia_ip.txt", domain_file="russia_domains.txt"):
         self.ip_networks = []
@@ -210,11 +209,12 @@ class ProxyConfig:
         return base
 
 
-# ---------- Чекер (двухэтапный: TCP + Xray) ----------
+# ---------- Чекер (двухэтапный + прогресс + heartbeat) ----------
 class XrayChecker:
-    def __init__(self, max_concurrent: int = 20, timeout: int = 8):
+    def __init__(self, max_concurrent: int = 20, timeout: int = 5, max_check: Optional[int] = None):
         self.max_concurrent = max_concurrent
         self.timeout = timeout
+        self.max_check = max_check
         self.xray_path = self._ensure_xray()
 
     def _ensure_xray(self) -> str:
@@ -243,7 +243,6 @@ class XrayChecker:
         return str(Path(xray_bin).absolute())
 
     def _tcp_check(self, host: str, port: int, timeout: float = 3.0) -> bool:
-        """Быстрая проверка TCP-подключения."""
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(timeout)
@@ -326,11 +325,11 @@ class XrayChecker:
             return s.getsockname()[1]
 
     def test_config(self, cfg: ProxyConfig) -> Tuple[bool, float]:
-        # Этап 1: TCP-проверка
-        if not self._tcp_check(cfg.host, cfg.port, timeout=3):
+        # Этап 1: TCP
+        if not self._tcp_check(cfg.host, cfg.port, timeout=2.5):
             return False, 0.0
 
-        # Этап 2: Проверка через Xray
+        # Этап 2: Xray
         port = self._find_free_port()
         xray_config = self._build_xray_config(cfg, port)
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
@@ -370,8 +369,28 @@ class XrayChecker:
                 pass
 
     async def check_batch(self, configs: List[ProxyConfig]) -> List[ProxyConfig]:
+        if self.max_check and len(configs) > self.max_check:
+            logger.warning(f"Ограничение проверки: {self.max_check} из {len(configs)} конфигураций")
+            # Сортировка: сначала те, что потенциально быстрее (например, по портам или случайно)
+            random.shuffle(configs)
+            configs = configs[:self.max_check]
+
+        total = len(configs)
+        checked = 0
+        working_count = 0
+        start_time = time.time()
+
         semaphore = asyncio.Semaphore(self.max_concurrent)
+        lock = asyncio.Lock()
+        heartbeat_task = None
+
+        async def heartbeat():
+            while True:
+                await asyncio.sleep(30)
+                logger.info("⏳ Проверка продолжается...")
+
         async def check_one(cfg: ProxyConfig):
+            nonlocal checked, working_count
             async with semaphore:
                 loop = asyncio.get_event_loop()
                 with ThreadPoolExecutor() as executor:
@@ -379,9 +398,28 @@ class XrayChecker:
                 if success:
                     cfg.working = True
                     cfg.latency = latency
+                async with lock:
+                    checked += 1
+                    if success:
+                        working_count += 1
+                    if checked % 500 == 0 or checked == total:
+                        elapsed = time.time() - start_time
+                        rate = checked / elapsed if elapsed > 0 else 0
+                        logger.info(f"📊 Прогресс: {checked}/{total} (рабочих: {working_count}) | {rate:.1f} конф/сек")
                 return cfg
+
+        if total > 1000:
+            heartbeat_task = asyncio.create_task(heartbeat())
+
         tasks = [check_one(cfg) for cfg in configs]
-        return await asyncio.gather(*tasks)
+        results = await asyncio.gather(*tasks)
+
+        if heartbeat_task:
+            heartbeat_task.cancel()
+
+        elapsed_total = time.time() - start_time
+        logger.info(f"✅ Проверка завершена за {elapsed_total/60:.1f} мин. Рабочих: {working_count} из {total}")
+        return results
 
 
 # ---------- Парсер подписок ----------
@@ -496,7 +534,6 @@ class SubscriptionParser:
             elif isinstance(result, list):
                 all_configs.extend(result)
 
-        # Дедупликация
         seen = set()
         unique = []
         for cfg in all_configs:
@@ -517,13 +554,11 @@ def save_subscriptions(configs: List[ProxyConfig], russian_filter: RussianFilter
     working = [c for c in configs if c.working]
     working.sort(key=lambda x: x.latency if x.latency else 999999)
 
-    # Отделяем российские
     russia_configs = [c for c in working if russian_filter.is_russian(c.host)]
     non_russia_configs = [c for c in working if not russian_filter.is_russian(c.host)]
 
     logger.info(f"Рабочих: {len(working)} (из них РФ: {len(russia_configs)})")
 
-    # --- Стандартные подписки (без РФ) ---
     # Android
     (out_path / "sub_android.txt").write_text(
         "\n".join([f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in non_russia_configs]),
@@ -550,7 +585,7 @@ def save_subscriptions(configs: List[ProxyConfig], russian_filter: RussianFilter
                 encoding='utf-8'
             )
 
-    # --- Российская подписка ---
+    # Российская подписка
     if russia_configs:
         (out_path / "sub_russia.txt").write_text(
             "\n".join([f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in russia_configs]),
@@ -568,7 +603,16 @@ def save_subscriptions(configs: List[ProxyConfig], russian_filter: RussianFilter
 
 
 async def main():
+    parser_arg = ArgumentParser()
+    parser_arg.add_argument('--max-check', type=int, default=None, help='Ограничить число проверяемых конфигураций')
+    parser_arg.add_argument('--threads', type=int, default=20, help='Число потоков проверки')
+    args = parser_arg.parse_args()
+
     async with SubscriptionParser(timeout=60, max_concurrent=5) as parser:
+        # Применяем настройки
+        parser.checker.max_check = args.max_check
+        parser.checker.max_concurrent = args.threads
+
         configs = await parser.collect_all()
         if configs:
             configs = await parser.checker.check_batch(configs)
