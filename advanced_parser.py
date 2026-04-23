@@ -546,24 +546,21 @@ def save_subscriptions(configs: List[ProxyConfig], russian_filter: RussianFilter
     if not working:
         logger.warning("Нет рабочих конфигураций. Выходные файлы будут пустыми.")
     else:
-        # Android
         (out_path / "sub_android.txt").write_text(
             "\n".join([f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in non_russia_configs]),
             encoding='utf-8'
         )
-        # iOS (исправлено: убрана проверка `if c.latency`)
+        # iOS (исправлено: берём все рабочие, latency может быть 0)
         ios_candidates = [c for c in non_russia_configs if c.latency is not None]
         ios_candidates.sort(key=lambda x: x.latency if x.latency else 999999)
         (out_path / "sub_ios.txt").write_text(
             "\n".join([f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in ios_candidates[:100]]),
             encoding='utf-8'
         )
-        # Все проверенные
         (out_path / "sub_all_checked.txt").write_text(
             "\n".join([f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in non_russia_configs]),
             encoding='utf-8'
         )
-        # По протоколам
         for proto in SUPPORTED_PROTOCOLS:
             proto_list = [c for c in non_russia_configs if c.protocol == proto]
             if proto_list:
@@ -571,7 +568,6 @@ def save_subscriptions(configs: List[ProxyConfig], russian_filter: RussianFilter
                     "\n".join([f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in proto_list]),
                     encoding='utf-8'
                 )
-        # Российская подписка
         if russia_configs:
             (out_path / "sub_russia.txt").write_text(
                 "\n".join([f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in russia_configs]),
@@ -579,7 +575,7 @@ def save_subscriptions(configs: List[ProxyConfig], russian_filter: RussianFilter
             )
             logger.info(f"🇷🇺 Российская подписка: sub_russia.txt ({len(russia_configs)} шт.)")
 
-    # Ссылки для импорта
+    # Ссылки для импорта (включая зеркала)
     repo_user = "Darkoflox"
     repo_name = "Kfg-analizator"
     branch = "main"
