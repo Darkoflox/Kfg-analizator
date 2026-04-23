@@ -2,8 +2,9 @@
 """
 Универсальный асинхронный парсер подписок с проверкой через Xray-core,
 фильтрацией по IP/доменам РФ и генерацией подписок для Android и iOS.
+
 Использование:
-    python advanced_parser.py [--max-check N] [--threads M]
+    python advanced_parser.py [--max-check N] [--threads M] [--strategy {diverse,fastest,random}]
 """
 import asyncio
 import base64
@@ -62,7 +63,14 @@ DEFAULT_SOURCES = [
     "https://raw.githubusercontent.com/vfarid/v2ray-share/main/all_links.txt",
     "https://raw.githubusercontent.com/mahdibland/V2RayAggregator/master/sub/sub_merge.txt",
     "https://raw.githubusercontent.com/yebekhe/TVIP/main/all",
+    "https://raw.githubusercontent.com/LalatinaHub/Mineralhe/main/all.txt",
+    "https://raw.githubusercontent.com/Lonelystar/v2ray-configs/main/all.txt",
+    "https://raw.githubusercontent.com/SamanGoli66/v2ray-configs/main/v2ray-clients",
+    "https://raw.githubusercontent.com/Pawel-S-K/free-v2ray-config/main/sub",
+    "https://raw.githubusercontent.com/Emsis/v2ray-configs/main/configs.txt",
+    "https://raw.githubusercontent.com/Bypass-LAN/V2ray/main/Sub.txt",
 ]
+
 
 # ---------- Управление источниками ----------
 class SourceManager:
@@ -175,6 +183,7 @@ class RussianFilter:
 # ---------- Модель конфигурации ----------
 from dataclasses import dataclass, field
 
+
 @dataclass
 class ProxyConfig:
     raw: str
@@ -202,14 +211,54 @@ class ProxyConfig:
 
     def format_name(self, include_latency: bool = True) -> str:
         flag = TLD_FLAGS.get(self.host.split('.')[-1].lower(), '🌐') if '.' in self.host else '🏳️'
-        icon = {'vmess':'📦','vless':'🔒','trojan':'🐴','ss':'🕶️','hysteria2':'⚡'}.get(self.protocol,'🔗')
+        icon = {'vmess': '📦', 'vless': '🔒', 'trojan': '🐴', 'ss': '🕶️', 'hysteria2': '⚡'}.get(self.protocol, '🔗')
         base = f"{flag} {self.host} | {icon} {self.protocol.upper()}"
         if include_latency and self.latency is not None:
             base += f" | {self.latency:.0f}ms"
         return base
 
 
-# ---------- Чекер (двухэтапный + прогресс + heartbeat) ----------
+# ---------- Умный отбор конфигураций ----------
+class ConfigSelector:
+    @staticmethod
+    def select(configs: List[ProxyConfig], max_count: int, strategy: str = "diverse") -> List[ProxyConfig]:
+        if len(configs) <= max_count:
+            return configs
+
+        if strategy == "fastest":
+            def score(cfg: ProxyConfig) -> int:
+                proto_score = {'vless': 100, 'trojan': 90, 'vmess': 70, 'ss': 50}.get(cfg.protocol, 0)
+                port_score = 50 if cfg.port in (443, 8443) else (30 if cfg.port == 80 else 0)
+                tls_score = 30 if cfg.tls != 'none' else 0
+                return proto_score + port_score + tls_score
+            sorted_configs = sorted(configs, key=score, reverse=True)
+            return sorted_configs[:max_count]
+
+        elif strategy == "diverse":
+            seen_hosts = set()
+            selected = []
+            for proto in SUPPORTED_PROTOCOLS:
+                for cfg in configs:
+                    if cfg.protocol != proto:
+                        continue
+                    key = f"{cfg.host}:{cfg.port}"
+                    if key not in seen_hosts:
+                        seen_hosts.add(key)
+                        selected.append(cfg)
+                        if len(selected) >= max_count:
+                            return selected[:max_count]
+            remaining = [c for c in configs if c not in selected]
+            random.shuffle(remaining)
+            selected.extend(remaining[:max_count - len(selected)])
+            return selected
+
+        else:  # random
+            shuffled = configs.copy()
+            random.shuffle(shuffled)
+            return shuffled[:max_count]
+
+
+# ---------- Чекер (двухэтапный + прогресс) ----------
 class XrayChecker:
     def __init__(self, max_concurrent: int = 20, timeout: int = 5, max_check: Optional[int] = None):
         self.max_concurrent = max_concurrent
@@ -242,7 +291,7 @@ class XrayChecker:
         logger.info(f"✅ Xray установлен: {xray_bin}")
         return str(Path(xray_bin).absolute())
 
-    def _tcp_check(self, host: str, port: int, timeout: float = 3.0) -> bool:
+    def _tcp_check(self, host: str, port: int, timeout: float = 2.5) -> bool:
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(timeout)
@@ -290,6 +339,21 @@ class XrayChecker:
                 if userinfo:
                     decoded = base64.b64decode(userinfo).decode('utf-8')
                     cfg.method, cfg.password = decoded.split(':', 1)
+            elif proto == 'hysteria2':
+                cfg.password = parsed.username
+                params = parse_qs(parsed.query)
+                cfg.sni = params.get('sni', [None])[0]
+                cfg.tls = 'tls'
+                cfg.transport = 'udp'
+            elif proto == 'tuic':
+                parts = parsed.username.split(':') if parsed.username else []
+                if len(parts) >= 2:
+                    cfg.uuid = parts[0]
+                    cfg.password = parts[1]
+                params = parse_qs(parsed.query)
+                cfg.sni = params.get('sni', [None])[0]
+                cfg.tls = 'tls'
+                cfg.transport = 'udp'
             return cfg
         except Exception:
             return None
@@ -317,6 +381,10 @@ class XrayChecker:
             outbound["settings"]["servers"] = [{"address": cfg.host, "port": cfg.port, "password": cfg.password}]
         elif cfg.protocol == "ss":
             outbound["settings"]["servers"] = [{"address": cfg.host, "port": cfg.port, "method": cfg.method, "password": cfg.password}]
+        elif cfg.protocol == "hysteria2":
+            outbound["settings"]["servers"] = [{"address": cfg.host, "port": cfg.port, "password": cfg.password}]
+        elif cfg.protocol == "tuic":
+            outbound["settings"]["servers"] = [{"address": cfg.host, "port": cfg.port, "uuid": cfg.uuid, "password": cfg.password}]
         return {"log": {"loglevel": "warning"}, "inbounds": [{"listen": "127.0.0.1", "port": port, "protocol": "socks"}], "outbounds": [outbound]}
 
     def _find_free_port(self) -> int:
@@ -325,11 +393,9 @@ class XrayChecker:
             return s.getsockname()[1]
 
     def test_config(self, cfg: ProxyConfig) -> Tuple[bool, float]:
-        # Этап 1: TCP
         if not self._tcp_check(cfg.host, cfg.port, timeout=2.5):
             return False, 0.0
 
-        # Этап 2: Xray
         port = self._find_free_port()
         xray_config = self._build_xray_config(cfg, port)
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
@@ -371,9 +437,7 @@ class XrayChecker:
     async def check_batch(self, configs: List[ProxyConfig]) -> List[ProxyConfig]:
         if self.max_check and len(configs) > self.max_check:
             logger.warning(f"Ограничение проверки: {self.max_check} из {len(configs)} конфигураций")
-            # Сортировка: сначала те, что потенциально быстрее (например, по портам или случайно)
-            random.shuffle(configs)
-            configs = configs[:self.max_check]
+            configs = ConfigSelector.select(configs, self.max_check, "diverse")
 
         total = len(configs)
         checked = 0
@@ -424,13 +488,14 @@ class XrayChecker:
 
 # ---------- Парсер подписок ----------
 class SubscriptionParser:
-    def __init__(self, timeout: int = 30, max_concurrent: int = 10):
+    def __init__(self, timeout: int = 30, max_concurrent: int = 10, strategy: str = "diverse"):
         self.timeout = timeout
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.session: Optional[aiohttp.ClientSession] = None
         self.checker = XrayChecker()
         self.russian_filter = RussianFilter()
         self.source_manager = SourceManager()
+        self.strategy = strategy
 
     async def __aenter__(self):
         connector = aiohttp.TCPConnector(limit=0, ssl=False)
@@ -543,6 +608,11 @@ class SubscriptionParser:
                 unique.append(cfg)
 
         logger.info(f"Всего собрано {len(unique)} уникальных конфигураций")
+
+        if self.checker.max_check and len(unique) > self.checker.max_check:
+            unique = ConfigSelector.select(unique, self.checker.max_check, self.strategy)
+            logger.info(f"После отбора по стратегии '{self.strategy}' осталось {len(unique)} конфигураций")
+
         return unique
 
 
@@ -593,23 +663,38 @@ def save_subscriptions(configs: List[ProxyConfig], russian_filter: RussianFilter
         )
         logger.info(f"🇷🇺 Российская подписка: sub_russia.txt ({len(russia_configs)} шт.)")
 
-    # Файл со ссылками
+    # Файл со ссылками (включая зеркала для обхода блокировок)
     repo_user = "Darkoflox"
     repo_name = "Kfg-analizator"
     branch = "main"
     base = f"https://raw.githubusercontent.com/{repo_user}/{repo_name}/{branch}"
+    cdn_statically = f"https://cdn.statically.io/gh/{repo_user}/{repo_name}/{branch}"
+    cdn_jsdelivr = f"https://cdn.jsdelivr.net/gh/{repo_user}/{repo_name}@{branch}"
+
+    sub_files = ["sub_android.txt", "sub_ios.txt", "sub_all_checked.txt", "sub_russia.txt"] + \
+                [f"sub_{proto}.txt" for proto in SUPPORTED_PROTOCOLS if (out_path / f"sub_{proto}.txt").exists()]
+
     with open(out_path / "subscription_urls.txt", "w", encoding='utf-8') as f:
-        f.write(f"{base}/sub_android.txt\n{base}/sub_ios.txt\n{base}/sub_all_checked.txt\n{base}/sub_russia.txt\n")
+        f.write("# Прямые ссылки (основные)\n")
+        for sf in sub_files:
+            f.write(f"{base}/{sf}\n")
+        f.write("\n# Обходные ссылки (для регионов с блокировкой raw.githubusercontent.com)\n")
+        for sf in sub_files:
+            f.write(f"# {sf}\n")
+            f.write(f"{cdn_statically}/{sf}\n")
+            f.write(f"{cdn_jsdelivr}/{sf}\n")
+    logger.info(f"🔗 Файл со ссылками (включая зеркала): {out_path / 'subscription_urls.txt'}")
 
 
 async def main():
     parser_arg = ArgumentParser()
     parser_arg.add_argument('--max-check', type=int, default=None, help='Ограничить число проверяемых конфигураций')
     parser_arg.add_argument('--threads', type=int, default=20, help='Число потоков проверки')
+    parser_arg.add_argument('--strategy', choices=['diverse', 'fastest', 'random'], default='diverse',
+                            help='Стратегия отбора конфигураций при ограничении')
     args = parser_arg.parse_args()
 
-    async with SubscriptionParser(timeout=60, max_concurrent=5) as parser:
-        # Применяем настройки
+    async with SubscriptionParser(timeout=60, max_concurrent=5, strategy=args.strategy) as parser:
         parser.checker.max_check = args.max_check
         parser.checker.max_concurrent = args.threads
 
@@ -617,6 +702,7 @@ async def main():
         if configs:
             configs = await parser.checker.check_batch(configs)
         save_subscriptions(configs, parser.russian_filter)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
