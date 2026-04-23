@@ -1,4 +1,19 @@
-# Subscription URLs
+# Прямые ссылки (основные)
 https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_android.txt
 https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_ios.txt
 https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_all_checked.txt
+https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_russia.txt
+
+# Обходные ссылки (для регионов с блокировкой raw.githubusercontent.com)
+# sub_android.txt
+https://cdn.statically.io/gh/Darkoflox/Kfg-analizator/main/sub_android.txt
+https://cdn.jsdelivr.net/gh/Darkoflox/Kfg-analizator@main/sub_android.txt
+# sub_ios.txt
+https://cdn.statically.io/gh/Darkoflox/Kfg-analizator/main/sub_ios.txt
+https://cdn.jsdelivr.net/gh/Darkoflox/Kfg-analizator@main/sub_ios.txt
+# sub_all_checked.txt
+https://cdn.statically.io/gh/Darkoflox/Kfg-analizator/main/sub_all_checked.txt
+https://cdn.jsdelivr.net/gh/Darkoflox/Kfg-analizator@main/sub_all_checked.txt
+# sub_russia.txt
+https://cdn.statically.io/gh/Darkoflox/Kfg-analizator/main/sub_russia.txt
+https://cdn.jsdelivr.net/gh/Darkoflox/Kfg-analizator@main/sub_russia.txt
