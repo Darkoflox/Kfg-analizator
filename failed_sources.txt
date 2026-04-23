@@ -40,3 +40,7 @@ https://obwl.vercel.app/sub.txt
 https://raw.githubusercontent.com/LimeHi/LimeVPN/refs/heads/main/LimeVPN.txt?v=1
 https://raw.githubcontent.com/Hidashimora/free-vpn-anti-rkn/main/configs/9.1.txt
 https://gitverse.ru/api/repos/bywarm/rser/raw/branch/master/selected.txt
+https://raw.githubusercontent.com/barry-far/V2ray-config/main/Sub5.txt
+https://raw.githubusercontent.com/Hidashimora/free-vpn-anti-rkn/main/configs/34.txt
+https://raw.ithubusercontent.com/Hidashimora/free-vpn-anti-rkn/main/configs/28.1.txt
+https://gbr.mydan.online/configs
