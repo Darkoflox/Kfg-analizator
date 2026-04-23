@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-Обновляет блок со ссылками на подписки в README.md,
-включая зеркала Statically и jsDelivr.
+Обновляет блок со ссылками на подписки в README.md, включая зеркала Statically и jsDelivr.
 """
 import re
 from pathlib import Path
@@ -39,7 +38,6 @@ def generate_links_block():
             url = f"{BASE_URL}/{filename}"
             lines.append(f"| **{name}** | `{url}` |")
 
-    # Добавляем таблицу с зеркалами
     lines.append("")
     lines.append("### 🔁 Зеркала (для обхода блокировок)")
     lines.append("| Платформа | Statically | jsDelivr |")
