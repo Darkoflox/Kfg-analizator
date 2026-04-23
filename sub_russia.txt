@@ -1,0 +1,1 @@
+vless://tel-Channel-ViPv2rayngVip2@194.76.18.1:2087?path=/&amp;security=tls&amp;encryption=none&amp;insecure=0&amp;fp=chrome&amp;type=ws&amp;allowInsecure=0&amp;sni=newger1.aattaash.com#🌐 194.76.18.1 | 🔒 VLESS | 0ms

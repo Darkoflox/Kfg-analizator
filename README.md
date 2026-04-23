@@ -38,6 +38,9 @@
 | **iOS (топ-100 быстрых)** | `https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_ios.txt` |
 | **Все проверенные** | `https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_all_checked.txt` |
 | **VLESS** | `https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_vless.txt` |
+| **Trojan** | `https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_trojan.txt` |
+| **Shadowsocks** | `https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_ss.txt` |
+| **Российские серверы** | `https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_russia.txt` |
 
 ### 🔁 Зеркала (для обхода блокировок)
 | Платформа | Statically | jsDelivr |
@@ -46,6 +49,9 @@
 | **iOS (топ-100 быстрых)** | `https://cdn.statically.io/gh/Darkoflox/Kfg-analizator/main/sub_ios.txt` | `https://cdn.jsdelivr.net/gh/Darkoflox/Kfg-analizator@main/sub_ios.txt` |
 | **Все проверенные** | `https://cdn.statically.io/gh/Darkoflox/Kfg-analizator/main/sub_all_checked.txt` | `https://cdn.jsdelivr.net/gh/Darkoflox/Kfg-analizator@main/sub_all_checked.txt` |
 | **VLESS** | `https://cdn.statically.io/gh/Darkoflox/Kfg-analizator/main/sub_vless.txt` | `https://cdn.jsdelivr.net/gh/Darkoflox/Kfg-analizator@main/sub_vless.txt` |
+| **Trojan** | `https://cdn.statically.io/gh/Darkoflox/Kfg-analizator/main/sub_trojan.txt` | `https://cdn.jsdelivr.net/gh/Darkoflox/Kfg-analizator@main/sub_trojan.txt` |
+| **Shadowsocks** | `https://cdn.statically.io/gh/Darkoflox/Kfg-analizator/main/sub_ss.txt` | `https://cdn.jsdelivr.net/gh/Darkoflox/Kfg-analizator@main/sub_ss.txt` |
+| **Российские серверы** | `https://cdn.statically.io/gh/Darkoflox/Kfg-analizator/main/sub_russia.txt` | `https://cdn.jsdelivr.net/gh/Darkoflox/Kfg-analizator@main/sub_russia.txt` |
 <!-- SUBSCRIPTION_LINKS_END -->
 
 ---
