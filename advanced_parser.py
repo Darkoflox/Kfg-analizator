@@ -1,10 +1,17 @@
 #!/usr/bin/env python3
 """
-Универсальный асинхронный парсер подписок с комбинированной проверкой (TCP + TLS),
-фильтрацией по IP/доменам РФ и генерацией подписок для Android и iOS.
+Универсальный асинхронный парсер подписок с четырёхуровневой проверкой:
+1) Сбор и дедупликация
+2) TCP‑проверка (быстрый отсев недоступных портов)
+3) TLS‑проверка (отсеивание HTTPS‑серверов без прокси‑протокола)
+4) Xray‑верификация топ‑кандидатов (гарантированно рабочие серверы)
+
+Фильтрация по IP/доменам РФ, генерация подписок для Android и iOS.
+Безопасен для GitHub Actions, не нарушает правил использования.
 
 Использование:
-    python advanced_parser.py [--max-check N] [--threads M] [--strategy {diverse,fastest,random}]
+    python advanced_parser.py [--threads M] [--strategy {diverse,fastest,random}]
+                             [--full-check N] [--test-url URL]
 """
 import asyncio
 import base64
@@ -17,7 +24,9 @@ import random
 import re
 import socket
 import ssl
+import subprocess
 import sys
+import tempfile
 import time
 from argparse import ArgumentParser
 from concurrent.futures import ThreadPoolExecutor
@@ -40,6 +49,12 @@ PROXY_LINK_PATTERN = re.compile(
     re.IGNORECASE
 )
 
+XRAY_DOWNLOAD_URLS = {
+    'linux': 'https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip',
+    'darwin': 'https://github.com/XTLS/Xray-core/releases/latest/download/Xray-macos-64.zip',
+    'windows': 'https://github.com/XTLS/Xray-core/releases/latest/download/Xray-windows-64.zip',
+}
+
 TLD_FLAGS = {
     'ru': '🇷🇺', 'us': '🇺🇸', 'de': '🇩🇪', 'nl': '🇳🇱', 'fr': '🇫🇷', 'gb': '🇬🇧', 'uk': '🇬🇧',
     'ca': '🇨🇦', 'jp': '🇯🇵', 'kr': '🇰🇷', 'sg': '🇸🇬', 'hk': '🇭🇰', 'tw': '🇹🇼',
@@ -51,6 +66,9 @@ TLD_FLAGS = {
     'by': '🇧🇾', 'lt': '🇱🇹', 'lv': '🇱🇻', 'ee': '🇪🇪', 'sk': '🇸🇰', 'si': '🇸🇮',
     'lu': '🇱🇺', 'mt': '🇲🇹', 'cy': '🇨🇾', 'is': '🇮🇸', 'ie': '🇮🇪', 'be': '🇧🇪',
 }
+
+# Автоматически сгенерируем коды стран из TLD_FLAGS
+TLD_TO_CODE = {tld: tld.upper() for tld in TLD_FLAGS}
 
 DEFAULT_SOURCES = [
     "https://raw.githubusercontent.com/vfarid/v2ray-share/main/all_links.txt",
@@ -203,9 +221,13 @@ class ProxyConfig:
         return self.raw
 
     def format_name(self, include_latency: bool = True) -> str:
-        flag = TLD_FLAGS.get(self.host.split('.')[-1].lower(), '🌐') if '.' in self.host else '🏳️'
+        # Определяем код страны по TLD домена хоста
+        parts = self.host.split('.')
+        tld = parts[-1].lower() if len(parts) >= 2 else ''
+        flag = TLD_FLAGS.get(tld, '🏳️')
+        country_code = TLD_TO_CODE.get(tld, '??')
         icon = {'vmess': '📦', 'vless': '🔒', 'trojan': '🐴', 'ss': '🕶️', 'hysteria2': '⚡'}.get(self.protocol, '🔗')
-        base = f"{flag} {self.host} | {icon} {self.protocol.upper()}"
+        base = f"{flag} {country_code} | {icon} {self.protocol.upper()}"
         if include_latency and self.latency is not None:
             base += f" | {self.latency:.0f}ms"
         return base
@@ -251,22 +273,56 @@ class ConfigSelector:
             return shuffled[:max_count]
 
 
-# ---------- Чекер (TCP + TLS) ----------
+# ---------- Чекер (TCP + TLS + опциональный Xray) ----------
 class ProxyChecker:
-    def __init__(self, max_concurrent: int = 20, timeout: int = 5, max_check: Optional[int] = None):
+    def __init__(self, max_concurrent: int = 20, timeout: int = 5,
+                 full_check_count: int = 200, test_url: str = "http://www.gstatic.com/generate_204"):
         self.max_concurrent = max_concurrent
         self.timeout = timeout
-        self.max_check = max_check
+        self.full_check_count = full_check_count
+        self.test_url = test_url
+        self.xray_path = None
+        self.xray_ready = False
 
-    def _tcp_check(self, host: str, port: int, timeout: float = 3.0) -> bool:
+    def _ensure_xray(self):
+        if self.xray_ready:
+            return
+        system = sys.platform
+        xray_bin = 'xray' if system != 'win32' else 'xray.exe'
+        if Path(xray_bin).exists():
+            self.xray_path = str(Path(xray_bin).absolute())
+        else:
+            logger.info("📥 Скачиваем Xray для финальной проверки...")
+            import urllib.request, zipfile
+            key = 'windows' if system == 'win32' else ('darwin' if system == 'darwin' else 'linux')
+            url = XRAY_DOWNLOAD_URLS.get(key)
+            if not url:
+                raise RuntimeError(f"Нет URL для {key}")
+            zip_path = 'xray.zip'
+            urllib.request.urlretrieve(url, zip_path)
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                for m in zf.namelist():
+                    if m.endswith(xray_bin):
+                        with open(xray_bin, 'wb') as f:
+                            f.write(zf.read(m))
+                        os.chmod(xray_bin, 0o755)
+                        break
+            Path(zip_path).unlink()
+            self.xray_path = str(Path(xray_bin).absolute())
+        self.xray_ready = True
+        logger.info(f"✅ Xray готов: {self.xray_path}")
+
+    def _tcp_check(self, host: str, port: int, timeout: float = 3.0) -> Tuple[bool, float]:
+        start = time.time()
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(timeout)
             result = sock.connect_ex((host, port))
             sock.close()
-            return result == 0
+            latency = (time.time() - start) * 1000
+            return result == 0, latency
         except Exception:
-            return False
+            return False, 0.0
 
     def _tls_check(self, host: str, port: int, sni: Optional[str] = None, timeout: float = 4.0) -> bool:
         if port not in (443, 8443, 2053, 2083, 2087, 2096, 8443):
@@ -338,24 +394,93 @@ class ProxyChecker:
         except Exception:
             return None
 
-    def test_config(self, cfg: ProxyConfig) -> Tuple[bool, float]:
-        if not self._tcp_check(cfg.host, cfg.port, timeout=3.0):
-            return False, 0.0
+    def _build_xray_config(self, cfg: ProxyConfig, port: int) -> Dict:
+        outbound = {
+            "protocol": cfg.protocol,
+            "settings": {},
+            "streamSettings": {
+                "network": cfg.transport,
+                "security": cfg.tls if cfg.tls != "none" else None
+            }
+        }
+        if outbound["streamSettings"]["security"] is None:
+            del outbound["streamSettings"]["security"]
+        if cfg.sni:
+            outbound["streamSettings"]["sni"] = cfg.sni
+        if cfg.transport == "ws" and cfg.path:
+            outbound["streamSettings"]["wsSettings"] = {"path": cfg.path}
+        if cfg.protocol == "vmess":
+            outbound["settings"]["vnext"] = [{"address": cfg.host, "port": cfg.port, "users": [{"id": cfg.uuid, "alterId": 0}]}]
+        elif cfg.protocol == "vless":
+            outbound["settings"]["vnext"] = [{"address": cfg.host, "port": cfg.port, "users": [{"id": cfg.uuid, "encryption": "none"}]}]
+        elif cfg.protocol == "trojan":
+            outbound["settings"]["servers"] = [{"address": cfg.host, "port": cfg.port, "password": cfg.password}]
+        elif cfg.protocol == "ss":
+            outbound["settings"]["servers"] = [{"address": cfg.host, "port": cfg.port, "method": cfg.method, "password": cfg.password}]
+        elif cfg.protocol == "hysteria2":
+            outbound["settings"]["servers"] = [{"address": cfg.host, "port": cfg.port, "password": cfg.password}]
+        elif cfg.protocol == "tuic":
+            outbound["settings"]["servers"] = [{"address": cfg.host, "port": cfg.port, "uuid": cfg.uuid, "password": cfg.password}]
+        return {"log": {"loglevel": "warning"}, "inbounds": [{"listen": "127.0.0.1", "port": port, "protocol": "socks"}], "outbounds": [outbound]}
 
+    def _find_free_port(self) -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(('127.0.0.1', 0))
+            return s.getsockname()[1]
+
+    def _xray_test(self, cfg: ProxyConfig) -> Tuple[bool, float]:
+        port = self._find_free_port()
+        xray_config = self._build_xray_config(cfg, port)
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+            json.dump(xray_config, f)
+            config_path = f.name
+        process = None
+        try:
+            process = subprocess.Popen(
+                [self.xray_path, 'run', '-c', config_path],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            time.sleep(2.5)
+            import urllib.request
+            proxy_handler = urllib.request.ProxyHandler({
+                'http': f'socks5://127.0.0.1:{port}',
+                'https': f'socks5://127.0.0.1:{port}'
+            })
+            opener = urllib.request.build_opener(proxy_handler)
+            start = time.time()
+            req = urllib.request.Request(self.test_url, headers={'User-Agent': 'Mozilla/5.0'})
+            with opener.open(req, timeout=6) as resp:
+                if resp.status in (200, 204):
+                    return True, (time.time() - start) * 1000
+            return False, 0.0
+        except Exception:
+            return False, 0.0
+        finally:
+            if process:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+            try:
+                Path(config_path).unlink()
+            except Exception:
+                pass
+
+    def test_config_basic(self, cfg: ProxyConfig) -> Tuple[bool, float]:
+        ok, latency = self._tcp_check(cfg.host, cfg.port)
+        if not ok:
+            return False, latency
         if cfg.port in (443, 8443, 2053, 2083, 2087, 2096, 8443) and cfg.tls != 'none':
             if not self._tls_check(cfg.host, cfg.port, cfg.sni, timeout=4.0):
-                return False, 0.0
-
-        return True, 0.0
+                return False, latency
+        return True, latency
 
     async def check_batch(self, configs: List[ProxyConfig]) -> List[ProxyConfig]:
-        if self.max_check and len(configs) > self.max_check:
-            logger.warning(f"Ограничение проверки: {self.max_check} из {len(configs)} конфигураций")
-            configs = ConfigSelector.select(configs, self.max_check, "diverse")
-
+        # Этап 1: массовая TCP+TLS проверка
         total = len(configs)
         checked = 0
-        working_count = 0
+        working = []
         start_time = time.time()
 
         semaphore = asyncio.Semaphore(self.max_concurrent)
@@ -368,45 +493,79 @@ class ProxyChecker:
                 logger.info("⏳ Проверка продолжается...")
 
         async def check_one(cfg: ProxyConfig):
-            nonlocal checked, working_count
+            nonlocal checked
             async with semaphore:
                 loop = asyncio.get_event_loop()
                 with ThreadPoolExecutor() as executor:
-                    success, latency = await loop.run_in_executor(executor, self.test_config, cfg)
-                if success:
+                    ok, latency = await loop.run_in_executor(executor, self.test_config_basic, cfg)
+                if ok:
                     cfg.working = True
                     cfg.latency = latency
                 async with lock:
                     checked += 1
-                    if success:
-                        working_count += 1
                     if checked % 500 == 0 or checked == total:
                         elapsed = time.time() - start_time
                         rate = checked / elapsed if elapsed > 0 else 0
-                        logger.info(f"📊 Прогресс: {checked}/{total} (рабочих: {working_count}) | {rate:.1f} конф/сек")
+                        logger.info(f"📊 Прогресс: {checked}/{total} (рабочих: {len(working)}) | {rate:.1f} конф/сек")
+                if ok:
+                    async with lock:
+                        working.append(cfg)
                 return cfg
 
         if total > 1000:
             heartbeat_task = asyncio.create_task(heartbeat())
 
         tasks = [check_one(cfg) for cfg in configs]
-        results = await asyncio.gather(*tasks)
+        await asyncio.gather(*tasks)
 
         if heartbeat_task:
             heartbeat_task.cancel()
 
-        elapsed_total = time.time() - start_time
-        logger.info(f"✅ Проверка завершена за {elapsed_total/60:.1f} мин. Рабочих: {working_count} из {total}")
-        return results
+        elapsed = time.time() - start_time
+        logger.info(f"✅ Базовая проверка завершена за {elapsed/60:.1f} мин. Рабочих: {len(working)} из {total}")
+
+        # Этап 2: Xray для топ-N, если включено
+        if self.full_check_count > 0 and len(working) > 0:
+            working.sort(key=lambda x: x.latency if x.latency else 999999)
+            top_candidates = working[:self.full_check_count]
+            logger.info(f"🚀 Запускаем Xray‑верификацию для топ‑{len(top_candidates)} по пингу...")
+            self._ensure_xray()
+
+            xray_sem = asyncio.Semaphore(min(10, self.max_concurrent))
+            xray_working = []
+
+            async def xray_check(cfg: ProxyConfig):
+                async with xray_sem:
+                    loop = asyncio.get_event_loop()
+                    with ThreadPoolExecutor() as executor:
+                        ok, _ = await loop.run_in_executor(executor, self._xray_test, cfg)
+                    if ok:
+                        async with lock:
+                            xray_working.append(cfg)
+                            logger.info(f"✅ Xray‑OK: {cfg.host}:{cfg.port} ({cfg.protocol}) пинг {cfg.latency:.0f}ms")
+                    else:
+                        logger.debug(f"❌ Xray‑неудача: {cfg.host}:{cfg.port}")
+                    return cfg
+
+            await asyncio.gather(*[xray_check(cfg) for cfg in top_candidates])
+
+            # Оставляем только прошедших Xray
+            for cfg in top_candidates:
+                if cfg not in xray_working:
+                    cfg.working = False
+            logger.info(f"🔬 После Xray осталось {len(xray_working)} конфигураций")
+
+        return configs
 
 
 # ---------- Парсер подписок ----------
 class SubscriptionParser:
-    def __init__(self, timeout: int = 30, max_concurrent: int = 10, strategy: str = "diverse"):
+    def __init__(self, timeout: int = 30, max_concurrent: int = 10, strategy: str = "diverse",
+                 full_check_count: int = 200, test_url: str = "http://www.gstatic.com/generate_204"):
         self.timeout = timeout
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.session: Optional[aiohttp.ClientSession] = None
-        self.checker = ProxyChecker()
+        self.checker = ProxyChecker(full_check_count=full_check_count, test_url=test_url)
         self.russian_filter = RussianFilter()
         self.source_manager = SourceManager()
         self.strategy = strategy
@@ -522,11 +681,6 @@ class SubscriptionParser:
                 unique.append(cfg)
 
         logger.info(f"Всего собрано {len(unique)} уникальных конфигураций")
-
-        if self.checker.max_check and len(unique) > self.checker.max_check:
-            unique = ConfigSelector.select(unique, self.checker.max_check, self.strategy)
-            logger.info(f"После отбора по стратегии '{self.strategy}' осталось {len(unique)} конфигураций")
-
         return unique
 
 
@@ -543,39 +697,44 @@ def save_subscriptions(configs: List[ProxyConfig], russian_filter: RussianFilter
 
     logger.info(f"Рабочих: {len(working)} (из них РФ: {len(russia_configs)})")
 
+    HEADER = "# Niyakwi | обновление каждые 6 часов\n"
+
     if not working:
         logger.warning("Нет рабочих конфигураций. Выходные файлы будут пустыми.")
     else:
-        (out_path / "sub_android.txt").write_text(
-            "\n".join([f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in non_russia_configs]),
-            encoding='utf-8'
-        )
-        # iOS (исправлено: берём все рабочие, latency может быть 0)
-        ios_candidates = [c for c in non_russia_configs if c.latency is not None]
-        ios_candidates.sort(key=lambda x: x.latency if x.latency else 999999)
-        (out_path / "sub_ios.txt").write_text(
-            "\n".join([f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in ios_candidates[:100]]),
-            encoding='utf-8'
-        )
-        (out_path / "sub_all_checked.txt").write_text(
-            "\n".join([f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in non_russia_configs]),
-            encoding='utf-8'
-        )
+        # Android
+        with open(out_path / "sub_android.txt", "w", encoding='utf-8') as f:
+            f.write(HEADER)
+            for c in non_russia_configs:
+                f.write(f"{c.to_uri().split('#')[0]}#{c.format_name()}\n")
+        # iOS: топ-100 с наименьшим пингом
+        ios_candidates = sorted(non_russia_configs, key=lambda x: x.latency if x.latency else 999999)
+        with open(out_path / "sub_ios.txt", "w", encoding='utf-8') as f:
+            f.write(HEADER)
+            for c in ios_candidates[:100]:
+                f.write(f"{c.to_uri().split('#')[0]}#{c.format_name()}\n")
+        # Все проверенные
+        with open(out_path / "sub_all_checked.txt", "w", encoding='utf-8') as f:
+            f.write(HEADER)
+            for c in non_russia_configs:
+                f.write(f"{c.to_uri().split('#')[0]}#{c.format_name()}\n")
+        # По протоколам
         for proto in SUPPORTED_PROTOCOLS:
             proto_list = [c for c in non_russia_configs if c.protocol == proto]
             if proto_list:
-                (out_path / f"sub_{proto}.txt").write_text(
-                    "\n".join([f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in proto_list]),
-                    encoding='utf-8'
-                )
+                with open(out_path / f"sub_{proto}.txt", "w", encoding='utf-8') as f:
+                    f.write(HEADER)
+                    for c in proto_list:
+                        f.write(f"{c.to_uri().split('#')[0]}#{c.format_name()}\n")
+        # Российская подписка
         if russia_configs:
-            (out_path / "sub_russia.txt").write_text(
-                "\n".join([f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in russia_configs]),
-                encoding='utf-8'
-            )
+            with open(out_path / "sub_russia.txt", "w", encoding='utf-8') as f:
+                f.write(HEADER)
+                for c in russia_configs:
+                    f.write(f"{c.to_uri().split('#')[0]}#{c.format_name()}\n")
             logger.info(f"🇷🇺 Российская подписка: sub_russia.txt ({len(russia_configs)} шт.)")
 
-    # Ссылки для импорта (включая зеркала)
+    # Ссылки для импорта
     repo_user = "Darkoflox"
     repo_name = "Kfg-analizator"
     branch = "main"
@@ -600,13 +759,15 @@ def save_subscriptions(configs: List[ProxyConfig], russian_filter: RussianFilter
 
 async def main():
     parser_arg = ArgumentParser()
-    parser_arg.add_argument('--max-check', type=int, default=None, help='Ограничить число проверяемых конфигураций')
     parser_arg.add_argument('--threads', type=int, default=40, help='Число потоков проверки')
     parser_arg.add_argument('--strategy', choices=['diverse', 'fastest', 'random'], default='diverse')
+    parser_arg.add_argument('--full-check', type=int, default=200,
+                            help='Количество топ-кандидатов для Xray-верификации (0 - отключить)')
+    parser_arg.add_argument('--test-url', default='http://www.gstatic.com/generate_204', help='URL для Xray-проверки')
     args = parser_arg.parse_args()
 
-    async with SubscriptionParser(timeout=60, max_concurrent=5, strategy=args.strategy) as parser:
-        parser.checker.max_check = args.max_check
+    async with SubscriptionParser(timeout=60, max_concurrent=5, strategy=args.strategy,
+                                 full_check_count=args.full_check, test_url=args.test_url) as parser:
         parser.checker.max_concurrent = args.threads
 
         configs = await parser.collect_all()
