@@ -14,11 +14,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Скачиваем свежий список IP РФ из RKPchannel
       - name: Download RKP IP list
         run: curl -sL https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/main/iP.txt -o russia_ip.txt
 
-      # Скачиваем свежий список доменов РФ из RKPchannel
       - name: Download RKP domain list
         run: curl -sL https://raw.githubusercontent.com/RKPchannel/RKP_bypass_configs/main/domain.txt -o russia_domains.txt
 
@@ -31,7 +29,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run parser
-        run: python advanced_parser.py
+        run: python advanced_parser.py --max-check 5000 --threads 40 --strategy diverse
 
       - name: Update README with subscription links
         run: python update_readme.py
