@@ -8,7 +8,7 @@ on:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 45          # чуть больше времени на Xray-проверку
+    timeout-minutes: 15
     permissions:
       contents: write
     steps:
@@ -23,7 +23,7 @@ jobs:
         run: pip install -r requirements.txt
 
       - name: Run parser
-        run: python advanced_parser.py --threads 40 --strategy diverse --full-check 500 --full-check-retries 1
+        run: python advanced_parser.py --threads 40 --strategy diverse
 
       - name: Update README with subscription links
         run: python update_readme.py
