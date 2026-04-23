@@ -37,6 +37,7 @@
 | **Android (все рабочие)** | `https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_android.txt` |
 | **iOS (топ-100 быстрых)** | `https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_ios.txt` |
 | **Все проверенные** | `https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_all_checked.txt` |
+| **VLESS** | `https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_vless.txt` |
 
 ### 🔁 Зеркала (для обхода блокировок)
 | Платформа | Statically | jsDelivr |
@@ -44,6 +45,7 @@
 | **Android (все рабочие)** | `https://cdn.statically.io/gh/Darkoflox/Kfg-analizator/main/sub_android.txt` | `https://cdn.jsdelivr.net/gh/Darkoflox/Kfg-analizator@main/sub_android.txt` |
 | **iOS (топ-100 быстрых)** | `https://cdn.statically.io/gh/Darkoflox/Kfg-analizator/main/sub_ios.txt` | `https://cdn.jsdelivr.net/gh/Darkoflox/Kfg-analizator@main/sub_ios.txt` |
 | **Все проверенные** | `https://cdn.statically.io/gh/Darkoflox/Kfg-analizator/main/sub_all_checked.txt` | `https://cdn.jsdelivr.net/gh/Darkoflox/Kfg-analizator@main/sub_all_checked.txt` |
+| **VLESS** | `https://cdn.statically.io/gh/Darkoflox/Kfg-analizator/main/sub_vless.txt` | `https://cdn.jsdelivr.net/gh/Darkoflox/Kfg-analizator@main/sub_vless.txt` |
 <!-- SUBSCRIPTION_LINKS_END -->
 
 ---
