@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
-Универсальный асинхронный парсер подписок с четырёхуровневой проверкой (TCP + TLS + Xray),
-без фильтрации по РФ (отключено). Генерация подписок для Android и iOS.
+Универсальный асинхронный парсер подписок с комбинированной проверкой (TCP + TLS) по умолчанию.
+Опциональная Xray‑верификация включается флагом --force-xray.
+Генерация подписок для Android и iOS.
 
 Использование:
     python advanced_parser.py [--threads M] [--strategy {diverse,fastest,random}]
-                             [--full-check N] [--test-url URL]
-                             [--full-check-retries R]
+                             [--force-xray] [--full-check N] [--test-url URL]
 """
 import asyncio
 import base64
@@ -193,13 +193,15 @@ class ConfigSelector:
             return shuffled[:max_count]
 
 
-# ---------- Чекер (TCP + TLS + Xray с повторами) ----------
+# ---------- Чекер (TCP + TLS, Xray опционально) ----------
 class ProxyChecker:
     def __init__(self, max_concurrent: int = 20, timeout: int = 5,
-                 full_check_count: int = 500, test_url: str = "http://www.gstatic.com/generate_204",
+                 force_xray: bool = False, full_check_count: int = 500,
+                 test_url: str = "http://www.gstatic.com/generate_204",
                  full_check_retries: int = 1):
         self.max_concurrent = max_concurrent
         self.timeout = timeout
+        self.force_xray = force_xray
         self.full_check_count = full_check_count
         self.test_url = test_url
         self.full_check_retries = full_check_retries
@@ -214,7 +216,7 @@ class ProxyChecker:
         if Path(xray_bin).exists():
             self.xray_path = str(Path(xray_bin).absolute())
         else:
-            logger.info("📥 Скачиваем Xray для финальной проверки...")
+            logger.info("📥 Скачиваем Xray...")
             import urllib.request, zipfile
             key = 'windows' if system == 'win32' else ('darwin' if system == 'darwin' else 'linux')
             url = XRAY_DOWNLOAD_URLS.get(key)
@@ -350,7 +352,7 @@ class ProxyChecker:
             s.bind(('127.0.0.1', 0))
             return s.getsockname()[1]
 
-    def _xray_test(self, cfg: ProxyConfig) -> Tuple[bool, float]:
+    def _xray_test(self, cfg: ProxyConfig) -> bool:
         port = self._find_free_port()
         xray_config = self._build_xray_config(cfg, port)
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
@@ -362,21 +364,20 @@ class ProxyChecker:
                 [self.xray_path, 'run', '-c', config_path],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
-            time.sleep(3.0)  # немного увеличено
+            time.sleep(3.0)
             import urllib.request
             proxy_handler = urllib.request.ProxyHandler({
                 'http': f'socks5://127.0.0.1:{port}',
                 'https': f'socks5://127.0.0.1:{port}'
             })
             opener = urllib.request.build_opener(proxy_handler)
-            start = time.time()
             req = urllib.request.Request(self.test_url, headers={'User-Agent': 'Mozilla/5.0'})
             with opener.open(req, timeout=8) as resp:
                 if resp.status in (200, 204):
-                    return True, (time.time() - start) * 1000
-            return False, 0.0
+                    return True
+            return False
         except Exception:
-            return False, 0.0
+            return False
         finally:
             if process:
                 process.terminate()
@@ -388,17 +389,6 @@ class ProxyChecker:
                 Path(config_path).unlink()
             except Exception:
                 pass
-
-    def _xray_test_with_retries(self, cfg: ProxyConfig) -> bool:
-        if not self.xray_ready:
-            self._ensure_xray()
-        for attempt in range(self.full_check_retries + 1):
-            ok, _ = self._xray_test(cfg)
-            if ok:
-                return True
-            if attempt < self.full_check_retries:
-                time.sleep(1.5)  # задержка перед повтором
-        return False
 
     def test_config_basic(self, cfg: ProxyConfig) -> Tuple[bool, float]:
         ok, latency = self._tcp_check(cfg.host, cfg.port)
@@ -456,11 +446,11 @@ class ProxyChecker:
         elapsed = time.time() - start_time
         logger.info(f"✅ Базовая проверка завершена за {elapsed/60:.1f} мин. Рабочих: {len(working)} из {total}")
 
-        # Этап Xray для топ-N
-        if self.full_check_count > 0 and len(working) > 0:
+        # Xray-верификация только если включена принудительно
+        if self.force_xray and self.full_check_count > 0 and len(working) > 0:
             working.sort(key=lambda x: x.latency if x.latency else 999999)
             top_candidates = working[:self.full_check_count]
-            logger.info(f"🚀 Запускаем Xray‑верификацию для топ‑{len(top_candidates)} по пингу (повторов: {self.full_check_retries})...")
+            logger.info(f"🚀 Xray‑верификация для топ‑{len(top_candidates)}...")
             self._ensure_xray()
 
             xray_sem = asyncio.Semaphore(min(10, self.max_concurrent))
@@ -469,17 +459,20 @@ class ProxyChecker:
             async def xray_check(cfg: ProxyConfig):
                 async with xray_sem:
                     loop = asyncio.get_event_loop()
-                    with ThreadPoolExecutor() as executor:
-                        ok = await loop.run_in_executor(executor, self._xray_test_with_retries, cfg)
+                    for _ in range(self.full_check_retries + 1):
+                        ok = await loop.run_in_executor(executor, self._xray_test, cfg)
+                        if ok:
+                            break
+                        await asyncio.sleep(1)
                     if ok:
                         async with lock:
                             xray_working.append(cfg)
-                            logger.info(f"✅ Xray‑OK: {cfg.host}:{cfg.port} ({cfg.protocol}) пинг {cfg.latency:.0f}ms")
-                    else:
-                        logger.debug(f"❌ Xray‑неудача: {cfg.host}:{cfg.port}")
+                            logger.info(f"✅ Xray‑OK: {cfg.host}:{cfg.port}")
                     return cfg
 
-            await asyncio.gather(*[xray_check(cfg) for cfg in top_candidates])
+            executor = None
+            with ThreadPoolExecutor() as executor:
+                await asyncio.gather(*[xray_check(cfg) for cfg in top_candidates])
 
             for cfg in top_candidates:
                 if cfg not in xray_working:
@@ -492,34 +485,80 @@ class ProxyChecker:
 # ---------- Парсер подписок ----------
 class SubscriptionParser:
     def __init__(self, timeout: int = 30, max_concurrent: int = 10, strategy: str = "diverse",
-                 full_check_count: int = 500, test_url: str = "http://www.gstatic.com/generate_204",
+                 force_xray: bool = False, full_check_count: int = 500,
+                 test_url: str = "http://www.gstatic.com/generate_204",
                  full_check_retries: int = 1):
         self.timeout = timeout
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.session: Optional[aiohttp.ClientSession] = None
-        self.checker = ProxyChecker(full_check_count=full_check_count, test_url=test_url,
-                                   full_check_retries=full_check_retries)
+        self.checker = ProxyChecker(force_xray=force_xray, full_check_count=full_check_count,
+                                   test_url=test_url, full_check_retries=full_check_retries)
         self.source_manager = SourceManager()
         self.strategy = strategy
 
-    async def __aenter__(self):
-        connector = aiohttp.TCPConnector(limit=0, ssl=False)
-        self.session = aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=self.timeout))
-        return self
+    # ... остальные методы без изменений (collect_all, parse_subscription, extract_links, decode_subscription, fetch_content)
+    # они идентичны предыдущей версии, поэтому здесь опущены для краткости, но в реальном файле они должны быть.
+    # Вставьте их сюда из предыдущего полного кода.
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.session:
-            await self.session.close()
+    async def collect_all(self) -> List[ProxyConfig]:
+        sources = self.source_manager.load_sources()
+        tasks = [self.parse_subscription(url) for url in sources]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    async def fetch_content(self, url: str) -> Optional[str]:
+        all_configs = []
+        for url, result in zip(sources, results):
+            if isinstance(result, Exception):
+                logger.error(f"Ошибка обработки {url}: {result}")
+            elif isinstance(result, list):
+                all_configs.extend(result)
+
+        seen = set()
+        unique = []
+        for cfg in all_configs:
+            key = f"{cfg.host}:{cfg.port}:{cfg.uuid or cfg.password or cfg.method}"
+            if key not in seen:
+                seen.add(key)
+                unique.append(cfg)
+
+        logger.info(f"Всего собрано {len(unique)} уникальных конфигураций")
+        return unique
+
+    async def parse_subscription(self, url: str) -> List[ProxyConfig]:
+        content = await self.fetch_content(url)
+        if not content:
+            return []
+        configs = []
+        lines = self.decode_subscription(content)
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            for link in self.extract_links(line):
+                cfg = self.checker._parse_uri(link)
+                if cfg:
+                    configs.append(cfg)
+        logger.info(f"Из {url} извлечено {len(configs)} конфигураций")
+        if len(configs) == 0 and len(content) > 0:
+            preview = content[:200].replace('\n', ' ').replace('\r', '')
+            logger.warning(f"Не удалось извлечь конфигурации из {url}. Превью: {preview}")
+            self.source_manager.mark_failed(url)
+        return configs
+
+    def extract_links(self, text: str) -> List[str]:
         try:
-            async with self.semaphore:
-                async with self.session.get(url) as response:
-                    response.raise_for_status()
-                    return await response.text()
-        except Exception as e:
-            logger.warning(f"Ошибка загрузки {url}: {e}")
-            return None
+            decoded_text = unquote(text)
+        except Exception:
+            decoded_text = text
+        links = []
+        for match in PROXY_LINK_PATTERN.finditer(decoded_text):
+            link = match.group(0)
+            for proto in SUPPORTED_PROTOCOLS:
+                idx = link.find(f"{proto}://")
+                if idx != -1:
+                    link = link[idx:]
+                    break
+            links.append(link)
+        return links
 
     def decode_subscription(self, content: str) -> List[str]:
         if content.strip().startswith(('proxies:', 'Proxy:')):
@@ -555,65 +594,24 @@ class SubscriptionParser:
             pass
         return content.splitlines()
 
-    def extract_links(self, text: str) -> List[str]:
+    async def fetch_content(self, url: str) -> Optional[str]:
         try:
-            decoded_text = unquote(text)
-        except Exception:
-            decoded_text = text
-        links = []
-        for match in PROXY_LINK_PATTERN.finditer(decoded_text):
-            link = match.group(0)
-            for proto in SUPPORTED_PROTOCOLS:
-                idx = link.find(f"{proto}://")
-                if idx != -1:
-                    link = link[idx:]
-                    break
-            links.append(link)
-        return links
+            async with self.semaphore:
+                async with self.session.get(url) as response:
+                    response.raise_for_status()
+                    return await response.text()
+        except Exception as e:
+            logger.warning(f"Ошибка загрузки {url}: {e}")
+            return None
 
-    async def parse_subscription(self, url: str) -> List[ProxyConfig]:
-        content = await self.fetch_content(url)
-        if not content:
-            return []
-        configs = []
-        lines = self.decode_subscription(content)
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            for link in self.extract_links(line):
-                cfg = self.checker._parse_uri(link)
-                if cfg:
-                    configs.append(cfg)
-        logger.info(f"Из {url} извлечено {len(configs)} конфигураций")
-        if len(configs) == 0 and len(content) > 0:
-            preview = content[:200].replace('\n', ' ').replace('\r', '')
-            logger.warning(f"Не удалось извлечь конфигурации из {url}. Превью: {preview}")
-            self.source_manager.mark_failed(url)
-        return configs
+    async def __aenter__(self):
+        connector = aiohttp.TCPConnector(limit=0, ssl=False)
+        self.session = aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=self.timeout))
+        return self
 
-    async def collect_all(self) -> List[ProxyConfig]:
-        sources = self.source_manager.load_sources()
-        tasks = [self.parse_subscription(url) for url in sources]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        all_configs = []
-        for url, result in zip(sources, results):
-            if isinstance(result, Exception):
-                logger.error(f"Ошибка обработки {url}: {result}")
-            elif isinstance(result, list):
-                all_configs.extend(result)
-
-        seen = set()
-        unique = []
-        for cfg in all_configs:
-            key = f"{cfg.host}:{cfg.port}:{cfg.uuid or cfg.password or cfg.method}"
-            if key not in seen:
-                seen.add(key)
-                unique.append(cfg)
-
-        logger.info(f"Всего собрано {len(unique)} уникальных конфигураций")
-        return unique
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.session:
+            await self.session.close()
 
 
 # ---------- Сохранение ----------
@@ -683,16 +681,15 @@ async def main():
     parser_arg = ArgumentParser()
     parser_arg.add_argument('--threads', type=int, default=40, help='Число потоков проверки')
     parser_arg.add_argument('--strategy', choices=['diverse', 'fastest', 'random'], default='diverse')
-    parser_arg.add_argument('--full-check', type=int, default=500,
-                            help='Количество топ-кандидатов для Xray-верификации (0 - отключить)')
+    parser_arg.add_argument('--force-xray', action='store_true', help='Принудительно включить Xray‑верификацию')
+    parser_arg.add_argument('--full-check', type=int, default=500, help='Количество кандидатов для Xray (при --force-xray)')
     parser_arg.add_argument('--test-url', default='http://www.gstatic.com/generate_204', help='URL для Xray-проверки')
-    parser_arg.add_argument('--full-check-retries', type=int, default=1,
-                            help='Количество повторных попыток для Xray-теста')
+    parser_arg.add_argument('--full-check-retries', type=int, default=1, help='Повторы Xray-теста')
     args = parser_arg.parse_args()
 
     async with SubscriptionParser(timeout=60, max_concurrent=5, strategy=args.strategy,
-                                 full_check_count=args.full_check, test_url=args.test_url,
-                                 full_check_retries=args.full_check_retries) as parser:
+                                 force_xray=args.force_xray, full_check_count=args.full_check,
+                                 test_url=args.test_url, full_check_retries=args.full_check_retries) as parser:
         parser.checker.max_concurrent = args.threads
 
         configs = await parser.collect_all()
