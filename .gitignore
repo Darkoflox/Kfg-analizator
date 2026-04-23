@@ -1,7 +1,6 @@
 xray
 xray.exe
 xray.zip
-GeoLite2-Country.mmdb
-*.pyc
 __pycache__/
+*.pyc
 .DS_Store
