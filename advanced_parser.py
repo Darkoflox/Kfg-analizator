@@ -1,22 +1,16 @@
 #!/usr/bin/env python3
 """
-Универсальный асинхронный парсер подписок с четырёхуровневой проверкой:
-1) Сбор и дедупликация
-2) TCP‑проверка (быстрый отсев недоступных портов)
-3) TLS‑проверка (отсеивание HTTPS‑серверов без прокси‑протокола)
-4) Xray‑верификация топ‑кандидатов (гарантированно рабочие серверы)
-
-Фильтрация по IP/доменам РФ, генерация подписок для Android и iOS.
-Безопасен для GitHub Actions, не нарушает правил использования.
+Универсальный асинхронный парсер подписок с четырёхуровневой проверкой (TCP + TLS + Xray),
+без фильтрации по РФ (отключено). Генерация подписок для Android и iOS.
 
 Использование:
     python advanced_parser.py [--threads M] [--strategy {diverse,fastest,random}]
                              [--full-check N] [--test-url URL]
+                             [--full-check-retries R]
 """
 import asyncio
 import base64
 import hashlib
-import ipaddress
 import json
 import logging
 import os
@@ -67,7 +61,6 @@ TLD_FLAGS = {
     'lu': '🇱🇺', 'mt': '🇲🇹', 'cy': '🇨🇾', 'is': '🇮🇸', 'ie': '🇮🇪', 'be': '🇧🇪',
 }
 
-# Автоматически сгенерируем коды стран из TLD_FLAGS
 TLD_TO_CODE = {tld: tld.upper() for tld in TLD_FLAGS}
 
 DEFAULT_SOURCES = [
@@ -119,78 +112,6 @@ class SourceManager:
             logger.error(f"Не удалось записать {self.failed_file}: {e}")
 
 
-# ---------- Фильтр РФ ----------
-class RussianFilter:
-    def __init__(self, ip_file="russia_ip.txt", domain_file="russia_domains.txt"):
-        self.ip_networks = []
-        self.domains = set()
-        self._load_lists(ip_file, domain_file)
-        self._dns_cache = {}
-
-    def _ensure_file(self, path: str, example: str):
-        if not Path(path).exists():
-            Path(path).write_text(example, encoding='utf-8')
-            logger.info(f"📄 Создан файл {path}")
-
-    def _load_lists(self, ip_file: str, domain_file: str):
-        self._ensure_file(ip_file, "# IP-адреса и CIDR РФ\n")
-        self._ensure_file(domain_file, "# Домены РФ\n")
-
-        with open(ip_file, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
-                try:
-                    self.ip_networks.append(ipaddress.ip_network(line, strict=False))
-                except ValueError:
-                    pass
-
-        with open(domain_file, 'r', encoding='utf-8') as f:
-            for line in f:
-                line = line.strip().lower()
-                if not line or line.startswith('#'):
-                    continue
-                self.domains.add(line)
-
-        logger.info(f"🛡️ РФ: IP-сетей {len(self.ip_networks)}, доменов {len(self.domains)}")
-
-    def is_russian(self, host: str) -> bool:
-        if not host:
-            return False
-        host_lower = host.lower()
-        for d in self.domains:
-            if host_lower == d or host_lower.endswith('.' + d):
-                return True
-        try:
-            ip = ipaddress.ip_address(host)
-            for net in self.ip_networks:
-                if ip in net:
-                    return True
-        except ValueError:
-            resolved = self._resolve_host(host)
-            if resolved:
-                try:
-                    ip = ipaddress.ip_address(resolved)
-                    for net in self.ip_networks:
-                        if ip in net:
-                            return True
-                except ValueError:
-                    pass
-        return False
-
-    def _resolve_host(self, host: str) -> Optional[str]:
-        if host in self._dns_cache:
-            return self._dns_cache[host]
-        try:
-            ip = socket.gethostbyname(host)
-            self._dns_cache[host] = ip
-            return ip
-        except socket.gaierror:
-            self._dns_cache[host] = None
-            return None
-
-
 # ---------- Модель конфигурации ----------
 from dataclasses import dataclass, field
 
@@ -221,7 +142,6 @@ class ProxyConfig:
         return self.raw
 
     def format_name(self, include_latency: bool = True) -> str:
-        # Определяем код страны по TLD домена хоста
         parts = self.host.split('.')
         tld = parts[-1].lower() if len(parts) >= 2 else ''
         flag = TLD_FLAGS.get(tld, '🏳️')
@@ -273,14 +193,16 @@ class ConfigSelector:
             return shuffled[:max_count]
 
 
-# ---------- Чекер (TCP + TLS + опциональный Xray) ----------
+# ---------- Чекер (TCP + TLS + Xray с повторами) ----------
 class ProxyChecker:
     def __init__(self, max_concurrent: int = 20, timeout: int = 5,
-                 full_check_count: int = 200, test_url: str = "http://www.gstatic.com/generate_204"):
+                 full_check_count: int = 500, test_url: str = "http://www.gstatic.com/generate_204",
+                 full_check_retries: int = 1):
         self.max_concurrent = max_concurrent
         self.timeout = timeout
         self.full_check_count = full_check_count
         self.test_url = test_url
+        self.full_check_retries = full_check_retries
         self.xray_path = None
         self.xray_ready = False
 
@@ -440,7 +362,7 @@ class ProxyChecker:
                 [self.xray_path, 'run', '-c', config_path],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
-            time.sleep(2.5)
+            time.sleep(3.0)  # немного увеличено
             import urllib.request
             proxy_handler = urllib.request.ProxyHandler({
                 'http': f'socks5://127.0.0.1:{port}',
@@ -449,7 +371,7 @@ class ProxyChecker:
             opener = urllib.request.build_opener(proxy_handler)
             start = time.time()
             req = urllib.request.Request(self.test_url, headers={'User-Agent': 'Mozilla/5.0'})
-            with opener.open(req, timeout=6) as resp:
+            with opener.open(req, timeout=8) as resp:
                 if resp.status in (200, 204):
                     return True, (time.time() - start) * 1000
             return False, 0.0
@@ -467,6 +389,17 @@ class ProxyChecker:
             except Exception:
                 pass
 
+    def _xray_test_with_retries(self, cfg: ProxyConfig) -> bool:
+        if not self.xray_ready:
+            self._ensure_xray()
+        for attempt in range(self.full_check_retries + 1):
+            ok, _ = self._xray_test(cfg)
+            if ok:
+                return True
+            if attempt < self.full_check_retries:
+                time.sleep(1.5)  # задержка перед повтором
+        return False
+
     def test_config_basic(self, cfg: ProxyConfig) -> Tuple[bool, float]:
         ok, latency = self._tcp_check(cfg.host, cfg.port)
         if not ok:
@@ -477,7 +410,6 @@ class ProxyChecker:
         return True, latency
 
     async def check_batch(self, configs: List[ProxyConfig]) -> List[ProxyConfig]:
-        # Этап 1: массовая TCP+TLS проверка
         total = len(configs)
         checked = 0
         working = []
@@ -524,11 +456,11 @@ class ProxyChecker:
         elapsed = time.time() - start_time
         logger.info(f"✅ Базовая проверка завершена за {elapsed/60:.1f} мин. Рабочих: {len(working)} из {total}")
 
-        # Этап 2: Xray для топ-N, если включено
+        # Этап Xray для топ-N
         if self.full_check_count > 0 and len(working) > 0:
             working.sort(key=lambda x: x.latency if x.latency else 999999)
             top_candidates = working[:self.full_check_count]
-            logger.info(f"🚀 Запускаем Xray‑верификацию для топ‑{len(top_candidates)} по пингу...")
+            logger.info(f"🚀 Запускаем Xray‑верификацию для топ‑{len(top_candidates)} по пингу (повторов: {self.full_check_retries})...")
             self._ensure_xray()
 
             xray_sem = asyncio.Semaphore(min(10, self.max_concurrent))
@@ -538,7 +470,7 @@ class ProxyChecker:
                 async with xray_sem:
                     loop = asyncio.get_event_loop()
                     with ThreadPoolExecutor() as executor:
-                        ok, _ = await loop.run_in_executor(executor, self._xray_test, cfg)
+                        ok = await loop.run_in_executor(executor, self._xray_test_with_retries, cfg)
                     if ok:
                         async with lock:
                             xray_working.append(cfg)
@@ -549,7 +481,6 @@ class ProxyChecker:
 
             await asyncio.gather(*[xray_check(cfg) for cfg in top_candidates])
 
-            # Оставляем только прошедших Xray
             for cfg in top_candidates:
                 if cfg not in xray_working:
                     cfg.working = False
@@ -561,12 +492,13 @@ class ProxyChecker:
 # ---------- Парсер подписок ----------
 class SubscriptionParser:
     def __init__(self, timeout: int = 30, max_concurrent: int = 10, strategy: str = "diverse",
-                 full_check_count: int = 200, test_url: str = "http://www.gstatic.com/generate_204"):
+                 full_check_count: int = 500, test_url: str = "http://www.gstatic.com/generate_204",
+                 full_check_retries: int = 1):
         self.timeout = timeout
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.session: Optional[aiohttp.ClientSession] = None
-        self.checker = ProxyChecker(full_check_count=full_check_count, test_url=test_url)
-        self.russian_filter = RussianFilter()
+        self.checker = ProxyChecker(full_check_count=full_check_count, test_url=test_url,
+                                   full_check_retries=full_check_retries)
         self.source_manager = SourceManager()
         self.strategy = strategy
 
@@ -685,17 +617,14 @@ class SubscriptionParser:
 
 
 # ---------- Сохранение ----------
-def save_subscriptions(configs: List[ProxyConfig], russian_filter: RussianFilter, output_dir: str = "."):
+def save_subscriptions(configs: List[ProxyConfig], output_dir: str = "."):
     out_path = Path(output_dir)
     out_path.mkdir(exist_ok=True)
 
     working = [c for c in configs if c.working]
     working.sort(key=lambda x: x.latency if x.latency else 999999)
 
-    russia_configs = [c for c in working if russian_filter.is_russian(c.host)]
-    non_russia_configs = [c for c in working if not russian_filter.is_russian(c.host)]
-
-    logger.info(f"Рабочих: {len(working)} (из них РФ: {len(russia_configs)})")
+    logger.info(f"Рабочих: {len(working)}")
 
     HEADER = "# Niyakwi | обновление каждые 6 часов\n"
 
@@ -705,10 +634,10 @@ def save_subscriptions(configs: List[ProxyConfig], russian_filter: RussianFilter
         # Android
         with open(out_path / "sub_android.txt", "w", encoding='utf-8') as f:
             f.write(HEADER)
-            for c in non_russia_configs:
+            for c in working:
                 f.write(f"{c.to_uri().split('#')[0]}#{c.format_name()}\n")
         # iOS: топ-100 с наименьшим пингом
-        ios_candidates = sorted(non_russia_configs, key=lambda x: x.latency if x.latency else 999999)
+        ios_candidates = sorted(working, key=lambda x: x.latency if x.latency else 999999)
         with open(out_path / "sub_ios.txt", "w", encoding='utf-8') as f:
             f.write(HEADER)
             for c in ios_candidates[:100]:
@@ -716,23 +645,16 @@ def save_subscriptions(configs: List[ProxyConfig], russian_filter: RussianFilter
         # Все проверенные
         with open(out_path / "sub_all_checked.txt", "w", encoding='utf-8') as f:
             f.write(HEADER)
-            for c in non_russia_configs:
+            for c in working:
                 f.write(f"{c.to_uri().split('#')[0]}#{c.format_name()}\n")
         # По протоколам
         for proto in SUPPORTED_PROTOCOLS:
-            proto_list = [c for c in non_russia_configs if c.protocol == proto]
+            proto_list = [c for c in working if c.protocol == proto]
             if proto_list:
                 with open(out_path / f"sub_{proto}.txt", "w", encoding='utf-8') as f:
                     f.write(HEADER)
                     for c in proto_list:
                         f.write(f"{c.to_uri().split('#')[0]}#{c.format_name()}\n")
-        # Российская подписка
-        if russia_configs:
-            with open(out_path / "sub_russia.txt", "w", encoding='utf-8') as f:
-                f.write(HEADER)
-                for c in russia_configs:
-                    f.write(f"{c.to_uri().split('#')[0]}#{c.format_name()}\n")
-            logger.info(f"🇷🇺 Российская подписка: sub_russia.txt ({len(russia_configs)} шт.)")
 
     # Ссылки для импорта
     repo_user = "Darkoflox"
@@ -742,7 +664,7 @@ def save_subscriptions(configs: List[ProxyConfig], russian_filter: RussianFilter
     cdn_statically = f"https://cdn.statically.io/gh/{repo_user}/{repo_name}/{branch}"
     cdn_jsdelivr = f"https://cdn.jsdelivr.net/gh/{repo_user}/{repo_name}@{branch}"
 
-    sub_files = ["sub_android.txt", "sub_ios.txt", "sub_all_checked.txt", "sub_russia.txt"] + \
+    sub_files = ["sub_android.txt", "sub_ios.txt", "sub_all_checked.txt"] + \
                 [f"sub_{proto}.txt" for proto in SUPPORTED_PROTOCOLS if (out_path / f"sub_{proto}.txt").exists()]
 
     with open(out_path / "subscription_urls.txt", "w", encoding='utf-8') as f:
@@ -761,19 +683,22 @@ async def main():
     parser_arg = ArgumentParser()
     parser_arg.add_argument('--threads', type=int, default=40, help='Число потоков проверки')
     parser_arg.add_argument('--strategy', choices=['diverse', 'fastest', 'random'], default='diverse')
-    parser_arg.add_argument('--full-check', type=int, default=200,
+    parser_arg.add_argument('--full-check', type=int, default=500,
                             help='Количество топ-кандидатов для Xray-верификации (0 - отключить)')
     parser_arg.add_argument('--test-url', default='http://www.gstatic.com/generate_204', help='URL для Xray-проверки')
+    parser_arg.add_argument('--full-check-retries', type=int, default=1,
+                            help='Количество повторных попыток для Xray-теста')
     args = parser_arg.parse_args()
 
     async with SubscriptionParser(timeout=60, max_concurrent=5, strategy=args.strategy,
-                                 full_check_count=args.full_check, test_url=args.test_url) as parser:
+                                 full_check_count=args.full_check, test_url=args.test_url,
+                                 full_check_retries=args.full_check_retries) as parser:
         parser.checker.max_concurrent = args.threads
 
         configs = await parser.collect_all()
         if configs:
             configs = await parser.checker.check_batch(configs)
-        save_subscriptions(configs, parser.russian_filter)
+        save_subscriptions(configs)
 
 
 if __name__ == "__main__":
