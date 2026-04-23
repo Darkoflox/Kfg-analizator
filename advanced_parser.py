@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Универсальный асинхронный парсер подписок с полной проверкой через Xray-core,
+Универсальный асинхронный парсер подписок с комбинированной проверкой (TCP + TLS),
 фильтрацией по IP/доменам РФ и генерацией подписок для Android и iOS.
 
 Использование:
     python advanced_parser.py [--max-check N] [--threads M] [--strategy {diverse,fastest,random}]
-                              [--tcp-only] [--test-url URL]
 """
 import asyncio
 import base64
@@ -17,9 +16,8 @@ import os
 import random
 import re
 import socket
-import subprocess
+import ssl
 import sys
-import tempfile
 import time
 from argparse import ArgumentParser
 from concurrent.futures import ThreadPoolExecutor
@@ -41,12 +39,6 @@ PROXY_LINK_PATTERN = re.compile(
     r'(vmess|vless|trojan|ss|ssr|hysteria2|tuic)://[^\s#]+',
     re.IGNORECASE
 )
-
-XRAY_DOWNLOAD_URLS = {
-    'linux': 'https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip',
-    'darwin': 'https://github.com/XTLS/Xray-core/releases/latest/download/Xray-macos-64.zip',
-    'windows': 'https://github.com/XTLS/Xray-core/releases/latest/download/Xray-windows-64.zip',
-}
 
 TLD_FLAGS = {
     'ru': '🇷🇺', 'us': '🇺🇸', 'de': '🇩🇪', 'nl': '🇳🇱', 'fr': '🇫🇷', 'gb': '🇬🇧', 'uk': '🇬🇧',
@@ -253,47 +245,18 @@ class ConfigSelector:
             selected.extend(remaining[:max_count - len(selected)])
             return selected
 
-        else:  # random
+        else:
             shuffled = configs.copy()
             random.shuffle(shuffled)
             return shuffled[:max_count]
 
 
-# ---------- Чекер (двухэтапный: TCP + Xray) ----------
-class XrayChecker:
-    def __init__(self, max_concurrent: int = 20, timeout: int = 8, max_check: Optional[int] = None,
-                 tcp_only: bool = False, test_url: str = "http://www.gstatic.com/generate_204"):
+# ---------- Чекер (TCP + TLS) ----------
+class ProxyChecker:
+    def __init__(self, max_concurrent: int = 20, timeout: int = 5, max_check: Optional[int] = None):
         self.max_concurrent = max_concurrent
         self.timeout = timeout
         self.max_check = max_check
-        self.tcp_only = tcp_only
-        self.test_url = test_url
-        self.xray_path = None if tcp_only else self._ensure_xray()
-
-    def _ensure_xray(self) -> str:
-        system = sys.platform
-        xray_bin = 'xray' if system != 'win32' else 'xray.exe'
-        if Path(xray_bin).exists():
-            logger.info(f"✅ Xray найден: {xray_bin}")
-            return str(Path(xray_bin).absolute())
-        logger.info("📥 Скачиваем Xray...")
-        import urllib.request, zipfile
-        key = 'windows' if system == 'win32' else ('darwin' if system == 'darwin' else 'linux')
-        url = XRAY_DOWNLOAD_URLS.get(key)
-        if not url:
-            raise RuntimeError(f"Нет URL для {key}")
-        zip_path = 'xray.zip'
-        urllib.request.urlretrieve(url, zip_path)
-        with zipfile.ZipFile(zip_path, 'r') as zf:
-            for m in zf.namelist():
-                if m.endswith(xray_bin):
-                    with open(xray_bin, 'wb') as f:
-                        f.write(zf.read(m))
-                    os.chmod(xray_bin, 0o755)
-                    break
-        Path(zip_path).unlink()
-        logger.info(f"✅ Xray установлен: {xray_bin}")
-        return str(Path(xray_bin).absolute())
 
     def _tcp_check(self, host: str, port: int, timeout: float = 3.0) -> bool:
         try:
@@ -302,6 +265,19 @@ class XrayChecker:
             result = sock.connect_ex((host, port))
             sock.close()
             return result == 0
+        except Exception:
+            return False
+
+    def _tls_check(self, host: str, port: int, sni: Optional[str] = None, timeout: float = 4.0) -> bool:
+        if port not in (443, 8443, 2053, 2083, 2087, 2096, 8443):
+            return True
+        try:
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            with socket.create_connection((host, port), timeout=timeout) as sock:
+                with context.wrap_socket(sock, server_hostname=sni or host) as ssock:
+                    return True
         except Exception:
             return False
 
@@ -362,86 +338,15 @@ class XrayChecker:
         except Exception:
             return None
 
-    def _build_xray_config(self, cfg: ProxyConfig, port: int) -> Dict:
-        outbound = {
-            "protocol": cfg.protocol,
-            "settings": {},
-            "streamSettings": {
-                "network": cfg.transport,
-                "security": cfg.tls if cfg.tls != "none" else None
-            }
-        }
-        if outbound["streamSettings"]["security"] is None:
-            del outbound["streamSettings"]["security"]
-        if cfg.sni:
-            outbound["streamSettings"]["sni"] = cfg.sni
-        if cfg.transport == "ws" and cfg.path:
-            outbound["streamSettings"]["wsSettings"] = {"path": cfg.path}
-        if cfg.protocol == "vmess":
-            outbound["settings"]["vnext"] = [{"address": cfg.host, "port": cfg.port, "users": [{"id": cfg.uuid, "alterId": 0}]}]
-        elif cfg.protocol == "vless":
-            outbound["settings"]["vnext"] = [{"address": cfg.host, "port": cfg.port, "users": [{"id": cfg.uuid, "encryption": "none"}]}]
-        elif cfg.protocol == "trojan":
-            outbound["settings"]["servers"] = [{"address": cfg.host, "port": cfg.port, "password": cfg.password}]
-        elif cfg.protocol == "ss":
-            outbound["settings"]["servers"] = [{"address": cfg.host, "port": cfg.port, "method": cfg.method, "password": cfg.password}]
-        elif cfg.protocol == "hysteria2":
-            outbound["settings"]["servers"] = [{"address": cfg.host, "port": cfg.port, "password": cfg.password}]
-        elif cfg.protocol == "tuic":
-            outbound["settings"]["servers"] = [{"address": cfg.host, "port": cfg.port, "uuid": cfg.uuid, "password": cfg.password}]
-        return {"log": {"loglevel": "warning"}, "inbounds": [{"listen": "127.0.0.1", "port": port, "protocol": "socks"}], "outbounds": [outbound]}
-
-    def _find_free_port(self) -> int:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(('127.0.0.1', 0))
-            return s.getsockname()[1]
-
     def test_config(self, cfg: ProxyConfig) -> Tuple[bool, float]:
-        # Этап 1: TCP
         if not self._tcp_check(cfg.host, cfg.port, timeout=3.0):
             return False, 0.0
 
-        if self.tcp_only:
-            return True, 0.0
+        if cfg.port in (443, 8443, 2053, 2083, 2087, 2096, 8443) and cfg.tls != 'none':
+            if not self._tls_check(cfg.host, cfg.port, cfg.sni, timeout=4.0):
+                return False, 0.0
 
-        # Этап 2 и 3: полная проверка через Xray
-        port = self._find_free_port()
-        xray_config = self._build_xray_config(cfg, port)
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            json.dump(xray_config, f)
-            config_path = f.name
-        process = None
-        try:
-            process = subprocess.Popen(
-                [self.xray_path, 'run', '-c', config_path],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-            time.sleep(3.0)  # Даём Xray время на установку соединения
-            import urllib.request
-            proxy_handler = urllib.request.ProxyHandler({
-                'http': f'socks5://127.0.0.1:{port}',
-                'https': f'socks5://127.0.0.1:{port}'
-            })
-            opener = urllib.request.build_opener(proxy_handler)
-            start = time.time()
-            req = urllib.request.Request(self.test_url, headers={'User-Agent': 'Mozilla/5.0'})
-            with opener.open(req, timeout=6) as resp:
-                if resp.status in (200, 204, 418):
-                    return True, (time.time() - start) * 1000
-            return False, 0.0
-        except Exception:
-            return False, 0.0
-        finally:
-            if process:
-                process.terminate()
-                try:
-                    process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-            try:
-                Path(config_path).unlink()
-            except Exception:
-                pass
+        return True, 0.0
 
     async def check_batch(self, configs: List[ProxyConfig]) -> List[ProxyConfig]:
         if self.max_check and len(configs) > self.max_check:
@@ -497,12 +402,11 @@ class XrayChecker:
 
 # ---------- Парсер подписок ----------
 class SubscriptionParser:
-    def __init__(self, timeout: int = 30, max_concurrent: int = 10, strategy: str = "diverse",
-                 tcp_only: bool = False, test_url: str = "http://www.gstatic.com/generate_204"):
+    def __init__(self, timeout: int = 30, max_concurrent: int = 10, strategy: str = "diverse"):
         self.timeout = timeout
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.session: Optional[aiohttp.ClientSession] = None
-        self.checker = XrayChecker(tcp_only=tcp_only, test_url=test_url)
+        self.checker = ProxyChecker()
         self.russian_filter = RussianFilter()
         self.source_manager = SourceManager()
         self.strategy = strategy
@@ -670,7 +574,6 @@ def save_subscriptions(configs: List[ProxyConfig], russian_filter: RussianFilter
             )
             logger.info(f"🇷🇺 Российская подписка: sub_russia.txt ({len(russia_configs)} шт.)")
 
-    # Файл со ссылками
     repo_user = "Darkoflox"
     repo_name = "Kfg-analizator"
     branch = "main"
@@ -696,14 +599,11 @@ def save_subscriptions(configs: List[ProxyConfig], russian_filter: RussianFilter
 async def main():
     parser_arg = ArgumentParser()
     parser_arg.add_argument('--max-check', type=int, default=5000)
-    parser_arg.add_argument('--threads', type=int, default=30)
+    parser_arg.add_argument('--threads', type=int, default=40)
     parser_arg.add_argument('--strategy', choices=['diverse', 'fastest', 'random'], default='diverse')
-    parser_arg.add_argument('--tcp-only', action='store_true', help='Только TCP-проверка (быстрее, но менее точно)')
-    parser_arg.add_argument('--test-url', default='http://www.gstatic.com/generate_204')
     args = parser_arg.parse_args()
 
-    async with SubscriptionParser(timeout=60, max_concurrent=5, strategy=args.strategy,
-                                 tcp_only=args.tcp_only, test_url=args.test_url) as parser:
+    async with SubscriptionParser(timeout=60, max_concurrent=5, strategy=args.strategy) as parser:
         parser.checker.max_check = args.max_check
         parser.checker.max_concurrent = args.threads
 
