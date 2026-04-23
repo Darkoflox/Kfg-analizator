@@ -546,20 +546,24 @@ def save_subscriptions(configs: List[ProxyConfig], russian_filter: RussianFilter
     if not working:
         logger.warning("Нет рабочих конфигураций. Выходные файлы будут пустыми.")
     else:
+        # Android
         (out_path / "sub_android.txt").write_text(
             "\n".join([f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in non_russia_configs]),
             encoding='utf-8'
         )
-        ios_candidates = [c for c in non_russia_configs if c.latency and c.latency < 300]
-        ios_candidates.sort(key=lambda x: x.latency)
+        # iOS (исправлено: убрана проверка `if c.latency`)
+        ios_candidates = [c for c in non_russia_configs if c.latency is not None]
+        ios_candidates.sort(key=lambda x: x.latency if x.latency else 999999)
         (out_path / "sub_ios.txt").write_text(
             "\n".join([f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in ios_candidates[:100]]),
             encoding='utf-8'
         )
+        # Все проверенные
         (out_path / "sub_all_checked.txt").write_text(
             "\n".join([f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in non_russia_configs]),
             encoding='utf-8'
         )
+        # По протоколам
         for proto in SUPPORTED_PROTOCOLS:
             proto_list = [c for c in non_russia_configs if c.protocol == proto]
             if proto_list:
@@ -567,6 +571,7 @@ def save_subscriptions(configs: List[ProxyConfig], russian_filter: RussianFilter
                     "\n".join([f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in proto_list]),
                     encoding='utf-8'
                 )
+        # Российская подписка
         if russia_configs:
             (out_path / "sub_russia.txt").write_text(
                 "\n".join([f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in russia_configs]),
@@ -574,6 +579,7 @@ def save_subscriptions(configs: List[ProxyConfig], russian_filter: RussianFilter
             )
             logger.info(f"🇷🇺 Российская подписка: sub_russia.txt ({len(russia_configs)} шт.)")
 
+    # Ссылки для импорта
     repo_user = "Darkoflox"
     repo_name = "Kfg-analizator"
     branch = "main"
@@ -598,8 +604,8 @@ def save_subscriptions(configs: List[ProxyConfig], russian_filter: RussianFilter
 
 async def main():
     parser_arg = ArgumentParser()
-    parser_arg.add_argument('--max-check', type=int, default=5000)
-    parser_arg.add_argument('--threads', type=int, default=40)
+    parser_arg.add_argument('--max-check', type=int, default=None, help='Ограничить число проверяемых конфигураций')
+    parser_arg.add_argument('--threads', type=int, default=40, help='Число потоков проверки')
     parser_arg.add_argument('--strategy', choices=['diverse', 'fastest', 'random'], default='diverse')
     args = parser_arg.parse_args()
 
