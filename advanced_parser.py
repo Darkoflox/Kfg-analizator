@@ -4,7 +4,7 @@
 фильтрацией по IP/доменам РФ и генерацией подписок для Android и iOS.
 
 Использование:
-    python advanced_parser.py [--max-check N] [--threads M] [--strategy {diverse,fastest,random}]
+    python advanced_parser.py [--max-check N] [--threads M] [--strategy {diverse,fastest,random}] [--test-url URL]
 """
 import asyncio
 import base64
@@ -258,12 +258,14 @@ class ConfigSelector:
             return shuffled[:max_count]
 
 
-# ---------- Чекер (двухэтапный + прогресс) ----------
+# ---------- Чекер (двухэтапный: TCP + Xray) ----------
 class XrayChecker:
-    def __init__(self, max_concurrent: int = 20, timeout: int = 5, max_check: Optional[int] = None):
+    def __init__(self, max_concurrent: int = 20, timeout: int = 8, max_check: Optional[int] = None,
+                 test_url: str = "http://www.gstatic.com/generate_204"):
         self.max_concurrent = max_concurrent
         self.timeout = timeout
         self.max_check = max_check
+        self.test_url = test_url
         self.xray_path = self._ensure_xray()
 
     def _ensure_xray(self) -> str:
@@ -291,7 +293,7 @@ class XrayChecker:
         logger.info(f"✅ Xray установлен: {xray_bin}")
         return str(Path(xray_bin).absolute())
 
-    def _tcp_check(self, host: str, port: int, timeout: float = 2.5) -> bool:
+    def _tcp_check(self, host: str, port: int, timeout: float = 3.0) -> bool:
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.settimeout(timeout)
@@ -392,10 +394,12 @@ class XrayChecker:
             s.bind(('127.0.0.1', 0))
             return s.getsockname()[1]
 
-    def test_config(self, cfg: ProxyConfig) -> Tuple[bool, float]:
-        if not self._tcp_check(cfg.host, cfg.port, timeout=2.5):
-            return False, 0.0
+    def test_config(self, cfg: ProxyConfig) -> Tuple[bool, float, str]:
+        # Этап 1: TCP
+        if not self._tcp_check(cfg.host, cfg.port, timeout=3.0):
+            return False, 0.0, "TCP fail"
 
+        # Этап 2: Xray
         port = self._find_free_port()
         xray_config = self._build_xray_config(cfg, port)
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
@@ -407,7 +411,7 @@ class XrayChecker:
                 [self.xray_path, 'run', '-c', config_path],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
-            time.sleep(1.5)
+            time.sleep(2.0)
             import urllib.request
             proxy_handler = urllib.request.ProxyHandler({
                 'http': f'socks5://127.0.0.1:{port}',
@@ -415,13 +419,13 @@ class XrayChecker:
             })
             opener = urllib.request.build_opener(proxy_handler)
             start = time.time()
-            req = urllib.request.Request('http://cp.cloudflare.com/', headers={'User-Agent': 'Mozilla/5.0'})
+            req = urllib.request.Request(self.test_url, headers={'User-Agent': 'Mozilla/5.0'})
             with opener.open(req, timeout=self.timeout) as resp:
                 if resp.status in (200, 204):
-                    return True, (time.time() - start) * 1000
-            return False, 0.0
-        except Exception:
-            return False, 0.0
+                    return True, (time.time() - start) * 1000, "OK"
+                return False, 0.0, f"HTTP {resp.status}"
+        except Exception as e:
+            return False, 0.0, str(e)
         finally:
             if process:
                 process.terminate()
@@ -458,7 +462,7 @@ class XrayChecker:
             async with semaphore:
                 loop = asyncio.get_event_loop()
                 with ThreadPoolExecutor() as executor:
-                    success, latency = await loop.run_in_executor(executor, self.test_config, cfg)
+                    success, latency, _ = await loop.run_in_executor(executor, self.test_config, cfg)
                 if success:
                     cfg.working = True
                     cfg.latency = latency
@@ -488,11 +492,12 @@ class XrayChecker:
 
 # ---------- Парсер подписок ----------
 class SubscriptionParser:
-    def __init__(self, timeout: int = 30, max_concurrent: int = 10, strategy: str = "diverse"):
+    def __init__(self, timeout: int = 30, max_concurrent: int = 10, strategy: str = "diverse",
+                 test_url: str = "http://www.gstatic.com/generate_204"):
         self.timeout = timeout
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.session: Optional[aiohttp.ClientSession] = None
-        self.checker = XrayChecker()
+        self.checker = XrayChecker(test_url=test_url)
         self.russian_filter = RussianFilter()
         self.source_manager = SourceManager()
         self.strategy = strategy
@@ -663,7 +668,7 @@ def save_subscriptions(configs: List[ProxyConfig], russian_filter: RussianFilter
         )
         logger.info(f"🇷🇺 Российская подписка: sub_russia.txt ({len(russia_configs)} шт.)")
 
-    # Файл со ссылками (включая зеркала для обхода блокировок)
+    # Файл со ссылками
     repo_user = "Darkoflox"
     repo_name = "Kfg-analizator"
     branch = "main"
@@ -683,18 +688,19 @@ def save_subscriptions(configs: List[ProxyConfig], russian_filter: RussianFilter
             f.write(f"# {sf}\n")
             f.write(f"{cdn_statically}/{sf}\n")
             f.write(f"{cdn_jsdelivr}/{sf}\n")
-    logger.info(f"🔗 Файл со ссылками (включая зеркала): {out_path / 'subscription_urls.txt'}")
+    logger.info(f"🔗 Файл со ссылками: {out_path / 'subscription_urls.txt'}")
 
 
 async def main():
     parser_arg = ArgumentParser()
-    parser_arg.add_argument('--max-check', type=int, default=None, help='Ограничить число проверяемых конфигураций')
-    parser_arg.add_argument('--threads', type=int, default=20, help='Число потоков проверки')
-    parser_arg.add_argument('--strategy', choices=['diverse', 'fastest', 'random'], default='diverse',
-                            help='Стратегия отбора конфигураций при ограничении')
+    parser_arg.add_argument('--max-check', type=int, default=5000, help='Ограничить число проверяемых конфигураций')
+    parser_arg.add_argument('--threads', type=int, default=40, help='Число потоков проверки')
+    parser_arg.add_argument('--strategy', choices=['diverse', 'fastest', 'random'], default='diverse')
+    parser_arg.add_argument('--test-url', default='http://www.gstatic.com/generate_204', help='URL для Xray-проверки')
     args = parser_arg.parse_args()
 
-    async with SubscriptionParser(timeout=60, max_concurrent=5, strategy=args.strategy) as parser:
+    async with SubscriptionParser(timeout=60, max_concurrent=5, strategy=args.strategy,
+                                 test_url=args.test_url) as parser:
         parser.checker.max_check = args.max_check
         parser.checker.max_concurrent = args.threads
 
