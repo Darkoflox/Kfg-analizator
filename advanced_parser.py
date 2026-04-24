@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Универсальный асинхронный парсер подписок с комбинированной проверкой (TCP + TLS) по умолчанию.
-Опциональная Xray‑верификация включается флагом --force-xray.
-Использует множественные тестовые эндпоинты и fallback на curl через SOCKS5.
+Универсальный асинхронный парсер с поддержкой URL‑подписок и Telegram‑каналов.
+Проверка: TCP + TLS (быстрая) + опционально Xray‑верификация.
+Генерация подписок для Android и iOS.
 
 Использование:
     python advanced_parser.py [--threads M] [--strategy {diverse,fastest,random}]
                              [--force-xray] [--full-check N] [--test-urls URL1 URL2 ...]
-                             [--full-check-retries R]
+                             [--full-check-retries R] [--parse-telegram]
 """
 import asyncio
 import base64
@@ -32,6 +32,13 @@ from urllib.parse import parse_qs, urlparse, unquote
 
 import aiohttp
 import yaml
+
+# Попытка импорта TelegramParser
+try:
+    from telegram_parser import TelegramParser
+    TG_AVAILABLE = True
+except ImportError:
+    TG_AVAILABLE = False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -148,10 +155,7 @@ class ProxyConfig:
         tld = parts[-1].lower() if len(parts) >= 2 else ''
         flag = TLD_FLAGS.get(tld, '🏳️')
         country_code = TLD_TO_CODE.get(tld, '??')
-        icon = {'vmess': '📦', 'vless': '🔒', 'trojan': '🐴', 'ss': '🕶️', 'hysteria2': '⚡'}.get(self.protocol, '🔗')
-        base = f"{flag} {country_code} | {icon} {self.protocol.upper()}"
-        if include_latency and self.latency is not None:
-            base += f" | {self.latency:.0f}ms"
+        base = f"{flag} {country_code}"
         return base
 
 
@@ -195,7 +199,7 @@ class ConfigSelector:
             return shuffled[:max_count]
 
 
-# ---------- Чекер (TCP + TLS + Xray с fallback на curl) ----------
+# ---------- Чекер (TCP + TLS + Xray) ----------
 class ProxyChecker:
     def __init__(self, max_concurrent: int = 20, timeout: int = 5,
                  force_xray: bool = False, full_check_count: int = 500,
@@ -361,7 +365,6 @@ class ProxyChecker:
             return s.getsockname()[1]
 
     def _test_via_curl(self, socks_port: int, test_url: str) -> bool:
-        """Проверка через curl с SOCKS5 прокси."""
         try:
             cmd = [
                 'curl', '-s', '-o', '/dev/null', '-w', '%{http_code}',
@@ -387,8 +390,6 @@ class ProxyChecker:
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
             time.sleep(3.0)
-
-            # Пробуем несколько тестовых URL через urllib
             for test_url in self.test_urls:
                 try:
                     import urllib.request
@@ -403,14 +404,11 @@ class ProxyChecker:
                             return True
                 except Exception:
                     continue
-
-            # Fallback: проверка через curl
             if self.curl_available:
                 logger.debug(f"urllib не сработал для {cfg.host}:{cfg.port}, пробуем curl")
                 for test_url in self.test_urls:
                     if self._test_via_curl(port, test_url):
                         return True
-
             return False
         except Exception:
             return False
@@ -482,7 +480,7 @@ class ProxyChecker:
         elapsed = time.time() - start_time
         logger.info(f"✅ Базовая проверка завершена за {elapsed/60:.1f} мин. Рабочих: {len(working)} из {total}")
 
-        # Xray-верификация только при force_xray
+        # Xray-верификация при force_xray
         if self.force_xray and self.full_check_count > 0 and len(working) > 0:
             working.sort(key=lambda x: x.latency if x.latency else 999999)
             top_candidates = working[:self.full_check_count]
@@ -525,7 +523,8 @@ class SubscriptionParser:
     def __init__(self, timeout: int = 30, max_concurrent: int = 10, strategy: str = "diverse",
                  force_xray: bool = False, full_check_count: int = 500,
                  test_urls: Optional[List[str]] = None,
-                 full_check_retries: int = 2):
+                 full_check_retries: int = 2,
+                 parse_telegram: bool = False):
         self.timeout = timeout
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.session: Optional[aiohttp.ClientSession] = None
@@ -533,6 +532,7 @@ class SubscriptionParser:
                                    test_urls=test_urls, full_check_retries=full_check_retries)
         self.source_manager = SourceManager()
         self.strategy = strategy
+        self.parse_telegram = parse_telegram
 
     async def __aenter__(self):
         connector = aiohttp.TCPConnector(limit=0, ssl=False)
@@ -636,6 +636,19 @@ class SubscriptionParser:
             elif isinstance(result, list):
                 all_configs.extend(result)
 
+        # Telegram
+        if self.parse_telegram and TG_AVAILABLE:
+            try:
+                tg_parser = TelegramParser()
+                tg_links = await tg_parser.collect_from_channels()
+                for link in tg_links:
+                    cfg = self.checker._parse_uri(link)
+                    if cfg:
+                        all_configs.append(cfg)
+                logger.info(f"Добавлено конфигураций из Telegram: {len(tg_links)}")
+            except Exception as e:
+                logger.error(f"Ошибка при парсинге Telegram: {e}")
+
         seen = set()
         unique = []
         for cfg in all_configs:
@@ -688,7 +701,7 @@ def save_subscriptions(configs: List[ProxyConfig], output_dir: str = "."):
                     for c in proto_list:
                         f.write(f"{c.to_uri().split('#')[0]}#{c.format_name()}\n")
 
-    # Ссылки для импорта
+    # Ссылки
     repo_user = "Darkoflox"
     repo_name = "Kfg-analizator"
     branch = "main"
@@ -719,12 +732,14 @@ async def main():
     parser_arg.add_argument('--full-check', type=int, default=500, help='Количество кандидатов для Xray')
     parser_arg.add_argument('--test-urls', nargs='*', help='Список тестовых URL для Xray (через пробел)')
     parser_arg.add_argument('--full-check-retries', type=int, default=2, help='Повторы Xray-теста')
+    parser_arg.add_argument('--parse-telegram', action='store_true', help='Включить сбор из Telegram-каналов')
     args = parser_arg.parse_args()
 
     async with SubscriptionParser(timeout=60, max_concurrent=5, strategy=args.strategy,
                                  force_xray=args.force_xray, full_check_count=args.full_check,
                                  test_urls=args.test_urls,
-                                 full_check_retries=args.full_check_retries) as parser:
+                                 full_check_retries=args.full_check_retries,
+                                 parse_telegram=args.parse_telegram) as parser:
         parser.checker.max_concurrent = args.threads
 
         configs = await parser.collect_all()
