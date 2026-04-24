@@ -42,3 +42,4 @@ https://raw.githubusercontent.com/zieng2/wl/main/vless_universal.txt
 https://gbr.mydan.online/configs
 https://gitflic.ru/project/sigil/my-new-cool-project/blob/raw?file=whitelist
 https://gitverse.ru/api/repos/bywarm/rser/raw/branch/master/selected.txt
+https://raw.githubusercontent.com/Ilyacom4ik/free-v2ray-2026/main/subscriptions/FreeCFGHub1.txt
