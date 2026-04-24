@@ -8,9 +8,9 @@ on:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 15      # базовой проверки хватает с запасом
+    timeout-minutes: 30      # немного увеличен для Xray
     permissions:
-      contents: write        # разрешаем коммиты
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -22,8 +22,8 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run parser
-        run: python advanced_parser.py --threads 40 --strategy diverse
+      - name: Run parser with Telegram and Xray
+        run: python advanced_parser.py --threads 40 --strategy diverse --force-xray --parse-telegram --full-check 300 --full-check-retries 2
 
       - name: Update README with subscription links
         run: python update_readme.py
