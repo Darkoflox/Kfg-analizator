@@ -214,7 +214,6 @@ class ProxyChecker:
         self.full_check_retries = full_check_retries
         self.xray_path = None
         self.xray_ready = False
-        # Проверяем наличие curl
         self.curl_available = shutil.which('curl') is not None
 
     def _ensure_xray(self):
