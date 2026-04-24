@@ -1,16 +1,16 @@
 name: "Update Subscriptions"
-
+run: python advanced_parser.py --threads 40 --strategy diverse --force-xray --full-check 300 --full-check-retries 2
 on:
   schedule:
-    - cron: '0 */6 * * *'
-  workflow_dispatch:
+    - cron: '0 */6 * * *'   # каждые 6 часов
+  workflow_dispatch:         # ручной запуск
 
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 15      # базовой проверки хватает с запасом
     permissions:
-      contents: write
+      contents: write        # разрешаем коммиты
     steps:
       - uses: actions/checkout@v4
 
