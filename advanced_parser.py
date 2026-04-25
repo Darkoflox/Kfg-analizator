@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """
 Универсальный асинхронный парсер с поддержкой URL‑подписок и Telegram‑каналов.
-Проверка: TCP + TLS + всегда расширенная верификация (Sing‑box / Hysteria2).
-Генерация подписок для Android и iOS.
+Проверка: TCP + TLS (без расширенной верификации). Генерация подписок для Android и iOS.
 
 Использование:
     python advanced_parser.py [--threads M] [--strategy {diverse,fastest,random}]
-                             [--full-check N] [--test-urls URL1 URL2 ...]
                              [--parse-telegram]
 """
 import asyncio
@@ -17,17 +15,13 @@ import logging
 import os
 import random
 import re
-import shutil
 import socket
 import ssl
-import subprocess
-import sys
-import tempfile
 import time
 from argparse import ArgumentParser
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlparse, unquote
 
 import aiohttp
@@ -51,18 +45,6 @@ PROXY_LINK_PATTERN = re.compile(
     r'(vmess|vless|trojan|ss|ssr|hysteria2|tuic)://[^\s#]+',
     re.IGNORECASE
 )
-
-# Обновлённые URL (актуальные версии)
-SING_BOX_URLS = {
-    'linux': 'https://github.com/SagerNet/sing-box/releases/download/v1.9.0/sing-box-1.9.0-linux-amd64.tar.gz',
-    'darwin': 'https://github.com/SagerNet/sing-box/releases/download/v1.9.0/sing-box-1.9.0-darwin-amd64.tar.gz',
-    'windows': 'https://github.com/SagerNet/sing-box/releases/download/v1.9.0/sing-box-1.9.0-windows-amd64.zip',
-}
-HYSTERIA2_URLS = {
-    'linux': 'https://github.com/apernet/hysteria/releases/download/v2.4.0/hysteria-linux-amd64',
-    'darwin': 'https://github.com/apernet/hysteria/releases/download/v2.4.0/hysteria-darwin-amd64',
-    'windows': 'https://github.com/apernet/hysteria/releases/download/v2.4.0/hysteria-windows-amd64.exe',
-}
 
 TLD_FLAGS = {
     'ru': '🇷🇺', 'us': '🇺🇸', 'de': '🇩🇪', 'nl': '🇳🇱', 'fr': '🇫🇷', 'gb': '🇬🇧', 'uk': '🇬🇧',
@@ -205,81 +187,11 @@ class ConfigSelector:
             return shuffled[:max_count]
 
 
-# ---------- Лёгкий чекер (TCP + TLS + Sing‑box / Hysteria2) ----------
-class LightweightChecker:
-    def __init__(self, max_concurrent: int = 20, timeout: int = 5,
-                 full_check_count: int = 300,
-                 test_urls: Optional[List[str]] = None):
+# ---------- Чекер (TCP + TLS) ----------
+class ProxyChecker:
+    def __init__(self, max_concurrent: int = 20, timeout: int = 5):
         self.max_concurrent = max_concurrent
         self.timeout = timeout
-        self.full_check_count = full_check_count
-        self.test_urls = test_urls or [
-            "http://www.gstatic.com/generate_204",
-            "http://httpbin.org/ip",
-            "http://cp.cloudflare.com/"
-        ]
-        self.sing_box_path = None
-        self.hysteria2_path = None
-        self.curl_available = shutil.which('curl') is not None
-
-    def _ensure_tools(self):
-        """Автоматически скачивает Sing‑box и Hysteria2, если их нет."""
-        system = sys.platform
-        if system == 'win32':
-            sing_bin = 'sing-box.exe'
-            hyst_bin = 'hysteria2.exe'
-        else:
-            sing_bin = 'sing-box'
-            hyst_bin = 'hysteria2'
-
-        # Sing‑box
-        if not self.sing_box_path:
-            if Path(sing_bin).exists():
-                self.sing_box_path = str(Path(sing_bin).absolute())
-            else:
-                logger.info("📥 Скачиваем Sing‑box...")
-                url = SING_BOX_URLS.get('windows' if system == 'win32' else ('darwin' if system == 'darwin' else 'linux'))
-                if url:
-                    try:
-                        import urllib.request, tarfile, zipfile
-                        archive = 'sing-box.tar.gz' if not url.endswith('.zip') else 'sing-box.zip'
-                        urllib.request.urlretrieve(url, archive)
-                        if archive.endswith('.tar.gz'):
-                            with tarfile.open(archive, 'r:gz') as tar:
-                                for member in tar.getmembers():
-                                    if member.name.endswith(sing_bin):
-                                        tar.extract(member)
-                                        os.chmod(sing_bin, 0o755)
-                                        break
-                        else:
-                            with zipfile.ZipFile(archive, 'r') as zf:
-                                for name in zf.namelist():
-                                    if name.endswith(sing_bin):
-                                        zf.extract(name)
-                                        os.chmod(sing_bin, 0o755)
-                                        break
-                        Path(archive).unlink()
-                        self.sing_box_path = str(Path(sing_bin).absolute())
-                        logger.info(f"✅ Sing‑box готов: {self.sing_box_path}")
-                    except Exception as e:
-                        logger.error(f"Не удалось скачать Sing‑box: {e}")
-
-        # Hysteria2
-        if not self.hysteria2_path:
-            if Path(hyst_bin).exists():
-                self.hysteria2_path = str(Path(hyst_bin).absolute())
-            else:
-                logger.info("📥 Скачиваем Hysteria2...")
-                url = HYSTERIA2_URLS.get('windows' if system == 'win32' else ('darwin' if system == 'darwin' else 'linux'))
-                if url:
-                    try:
-                        import urllib.request
-                        urllib.request.urlretrieve(url, hyst_bin)
-                        os.chmod(hyst_bin, 0o755)
-                        self.hysteria2_path = str(Path(hyst_bin).absolute())
-                        logger.info(f"✅ Hysteria2 готов: {self.hysteria2_path}")
-                    except Exception as e:
-                        logger.error(f"Не удалось скачать Hysteria2: {e}")
 
     def _tcp_check(self, host: str, port: int, timeout: float = 3.0) -> Tuple[bool, float]:
         start = time.time()
@@ -363,121 +275,7 @@ class LightweightChecker:
         except Exception:
             return None
 
-    def _build_sing_box_config(self, cfg: ProxyConfig) -> Dict:
-        """Генерирует минимальную конфигурацию Sing‑box для проверки."""
-        inbound = {
-            "type": "socks",
-            "listen": "127.0.0.1",
-            "listen_port": 0  # будет назначен свободный порт
-        }
-        outbound = {
-            "type": cfg.protocol,
-            "server": cfg.host,
-            "server_port": cfg.port,
-            "tls": {"enabled": cfg.tls != "none", "server_name": cfg.sni or cfg.host}
-        }
-        if cfg.protocol in ('vless', 'vmess'):
-            outbound["uuid"] = cfg.uuid
-        if cfg.protocol in ('trojan', 'ss', 'hysteria2'):
-            outbound["password"] = cfg.password
-        if cfg.transport != "tcp":
-            outbound["transport"] = {"type": cfg.transport}
-            if cfg.transport == "ws" and cfg.path:
-                outbound["transport"]["path"] = cfg.path
-        return {"log": {"level": "error"}, "inbounds": [inbound], "outbounds": [outbound]}
-
-    def _test_with_sing_box(self, cfg: ProxyConfig) -> bool:
-        if not self.sing_box_path:
-            return False
-        config = self._build_sing_box_config(cfg)
-        config["inbounds"][0]["listen_port"] = self._find_free_port()
-        with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            json.dump(config, f)
-            config_path = f.name
-        process = None
-        try:
-            process = subprocess.Popen(
-                [self.sing_box_path, 'run', '-c', config_path],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )
-            time.sleep(2.0)
-            socks_port = config["inbounds"][0]["listen_port"]
-            if self.curl_available:
-                for test_url in self.test_urls:
-                    try:
-                        cmd = [
-                            'curl', '-s', '-o', '/dev/null', '-w', '%{http_code}',
-                            '--socks5-hostname', f'127.0.0.1:{socks_port}',
-                            '--max-time', '8', test_url
-                        ]
-                        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-                        if result.stdout.strip() in ('200', '204'):
-                            return True
-                    except Exception:
-                        continue
-            return False
-        except Exception:
-            return False
-        finally:
-            if process:
-                process.terminate()
-                try:
-                    process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-            try:
-                Path(config_path).unlink()
-            except Exception:
-                pass
-
-    def _test_with_hysteria2(self, cfg: ProxyConfig) -> bool:
-        if not self.hysteria2_path or cfg.protocol != 'hysteria2':
-            return False
-        socks_port = self._find_free_port()
-        cmd = [
-            self.hysteria2_path, 'client',
-            '--server', f'{cfg.host}:{cfg.port}',
-            '--socks5-listen', f'127.0.0.1:{socks_port}',
-            '--password', cfg.password or '',
-            '--insecure',
-            '--log-level', 'error'
-        ]
-        if cfg.sni:
-            cmd += ['--sni', cfg.sni]
-        process = None
-        try:
-            process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            time.sleep(2.0)
-            if self.curl_available:
-                for test_url in self.test_urls:
-                    try:
-                        curl_cmd = [
-                            'curl', '-s', '-o', '/dev/null', '-w', '%{http_code}',
-                            '--socks5-hostname', f'127.0.0.1:{socks_port}',
-                            '--max-time', '8', test_url
-                        ]
-                        result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=10)
-                        if result.stdout.strip() in ('200', '204'):
-                            return True
-                    except Exception:
-                        continue
-            return False
-        except Exception:
-            return False
-        finally:
-            if process:
-                process.terminate()
-                try:
-                    process.wait(timeout=2)
-                except subprocess.TimeoutExpired:
-                    process.kill()
-
-    def _find_free_port(self) -> int:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(('127.0.0.1', 0))
-            return s.getsockname()[1]
-
-    def test_config_basic(self, cfg: ProxyConfig) -> Tuple[bool, float]:
+    def test_config(self, cfg: ProxyConfig) -> Tuple[bool, float]:
         ok, latency = self._tcp_check(cfg.host, cfg.port)
         if not ok:
             return False, latency
@@ -506,7 +304,7 @@ class LightweightChecker:
             async with semaphore:
                 loop = asyncio.get_event_loop()
                 with ThreadPoolExecutor() as executor:
-                    ok, latency = await loop.run_in_executor(executor, self.test_config_basic, cfg)
+                    ok, latency = await loop.run_in_executor(executor, self.test_config, cfg)
                 if ok:
                     cfg.working = True
                     cfg.latency = latency
@@ -531,56 +329,18 @@ class LightweightChecker:
             heartbeat_task.cancel()
 
         elapsed = time.time() - start_time
-        logger.info(f"✅ Базовая проверка завершена за {elapsed/60:.1f} мин. Рабочих: {len(working)} из {total}")
-
-        # Расширенная проверка с безопасным fallback
-        if self.full_check_count > 0 and len(working) > 0:
-            working.sort(key=lambda x: x.latency if x.latency else 999999)
-            top_candidates = working[:self.full_check_count]
-            logger.info(f"🚀 Запускаем расширенную проверку для топ‑{len(top_candidates)} (Sing‑box/Hysteria2)...")
-            self._ensure_tools()
-
-            # Проверяем, удалось ли загрузить хотя бы один инструмент
-            if not self.sing_box_path and not self.hysteria2_path:
-                logger.warning("Инструменты расширенной проверки недоступны – пропускаем, все кандидаты сохранены.")
-            else:
-                check_sem = asyncio.Semaphore(10)
-                verified = []
-
-                async def deep_check(cfg: ProxyConfig):
-                    async with check_sem:
-                        loop = asyncio.get_event_loop()
-                        with ThreadPoolExecutor() as executor:
-                            ok = False
-                            if self.sing_box_path:
-                                ok = await loop.run_in_executor(executor, self._test_with_sing_box, cfg)
-                            if not ok and cfg.protocol == 'hysteria2' and self.hysteria2_path:
-                                ok = await loop.run_in_executor(executor, self._test_with_hysteria2, cfg)
-                            if ok:
-                                async with lock:
-                                    verified.append(cfg)
-                                    logger.info(f"✅ Проверен: {cfg.host}:{cfg.port} ({cfg.protocol})")
-                            else:
-                                cfg.working = False
-                                logger.debug(f"❌ Не прошёл проверку: {cfg.host}:{cfg.port}")
-                        return cfg
-
-                await asyncio.gather(*[deep_check(cfg) for cfg in top_candidates])
-                logger.info(f"🔬 После расширенной проверки осталось {len(verified)} конфигураций")
-
+        logger.info(f"✅ Проверка завершена за {elapsed/60:.1f} мин. Рабочих: {len(working)} из {total}")
         return configs
 
 
 # ---------- Парсер подписок ----------
 class SubscriptionParser:
     def __init__(self, timeout: int = 30, max_concurrent: int = 10, strategy: str = "diverse",
-                 full_check_count: int = 300,
-                 test_urls: Optional[List[str]] = None,
                  parse_telegram: bool = False):
         self.timeout = timeout
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.session: Optional[aiohttp.ClientSession] = None
-        self.checker = LightweightChecker(full_check_count=full_check_count, test_urls=test_urls)
+        self.checker = ProxyChecker()
         self.source_manager = SourceManager()
         self.strategy = strategy
         self.parse_telegram = parse_telegram
@@ -779,14 +539,10 @@ async def main():
     parser_arg = ArgumentParser()
     parser_arg.add_argument('--threads', type=int, default=40, help='Число потоков проверки')
     parser_arg.add_argument('--strategy', choices=['diverse', 'fastest', 'random'], default='diverse')
-    parser_arg.add_argument('--full-check', type=int, default=300, help='Количество кандидатов для расширенной проверки')
-    parser_arg.add_argument('--test-urls', nargs='*', help='Список тестовых URL (через пробел)')
     parser_arg.add_argument('--parse-telegram', action='store_true', help='Включить сбор из Telegram-каналов')
     args = parser_arg.parse_args()
 
     async with SubscriptionParser(timeout=60, max_concurrent=5, strategy=args.strategy,
-                                 full_check_count=args.full_check,
-                                 test_urls=args.test_urls,
                                  parse_telegram=args.parse_telegram) as parser:
         parser.checker.max_concurrent = args.threads
 
