@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 """
-Универсальный асинхронный парсер с поддержкой URL‑подписок и Telegram‑каналов.
-Проверка: TCP + TLS. Генерация подписок для Android и iOS.
-
-Использование:
-    python advanced_parser.py [--threads M] [--strategy {diverse,fastest,random}]
-                             [--parse-telegram]
+Финальный парсер с поддержкой URL‑подписок и Telegram‑каналов (через зеркала).
+Двухэтапная проверка (TCP+TLS + дополнительная фильтрация).
+Ограничения: Android ≤5000, iOS ≤300.
 """
 import asyncio
 import base64
@@ -71,6 +68,16 @@ TG_USER_AGENTS = [
     'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
 ]
 TG_REQUEST_DELAY = 2.0
+
+# Зеркала Telegram (пробуются по порядку, сначала альтернативные)
+TG_MIRRORS = [
+    "https://tg.i-c-a.su/s/{}",        # альтернативное зеркало
+    "https://tlgrm.ru/s/{}",           # ещё одно зеркало
+    "https://tg.snowfall.ru/s/{}",     # дополнительное зеркало
+    "https://t.me/s/{}"                # основной домен (пробуется последним)
+]
+
+HEADER = "# Niyakwi⚪ | обновление каждые 6 часов\n"
 
 
 # ---------- Управление источниками ----------
@@ -284,6 +291,21 @@ class ProxyChecker:
                 return False, latency
         return True, latency
 
+    def test_config_advanced(self, cfg: ProxyConfig) -> bool:
+        """Дополнительная проверка: повторный TLS с более строгими настройками."""
+        if cfg.port not in (443, 8443, 2053, 2083, 2087, 2096, 8443) or cfg.tls == 'none':
+            return True
+        try:
+            context = ssl.create_default_context()
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            context.minimum_version = ssl.TLSVersion.TLSv1_2
+            with socket.create_connection((cfg.host, cfg.port), timeout=3.0) as sock:
+                with context.wrap_socket(sock, server_hostname=cfg.sni or cfg.host) as ssock:
+                    return True
+        except Exception:
+            return False
+
     async def check_batch(self, configs: List[ProxyConfig]) -> List[ProxyConfig]:
         total = len(configs)
         checked = 0
@@ -330,6 +352,19 @@ class ProxyChecker:
 
         elapsed = time.time() - start_time
         logger.info(f"✅ Проверка завершена за {elapsed/60:.1f} мин. Рабочих: {len(working)} из {total}")
+
+        # Второй этап: дополнительная проверка лучших кандидатов
+        working.sort(key=lambda x: x.latency if x.latency else 999999)
+        top_candidates = working[:500]
+        logger.info(f"🔍 Дополнительная проверка топ‑{len(top_candidates)} кандидатов...")
+        for cfg in top_candidates:
+            loop = asyncio.get_event_loop()
+            with ThreadPoolExecutor() as executor:
+                ok = await loop.run_in_executor(executor, self.test_config_advanced, cfg)
+            if not ok:
+                cfg.working = False
+        logger.info(f"🔬 После дополнительной проверки осталось {sum(1 for c in top_candidates if c.working)} конфигураций")
+
         return configs
 
 
@@ -435,8 +470,24 @@ class SubscriptionParser:
             self.source_manager.mark_failed(url)
         return configs
 
+    async def _fetch_tg_page(self, username: str) -> Optional[str]:
+        """Пытается загрузить страницу канала через разные зеркала."""
+        for mirror_template in TG_MIRRORS:
+            url = mirror_template.format(username)
+            headers = {'User-Agent': random.choice(TG_USER_AGENTS)}
+            try:
+                async with self.session.get(url, headers=headers, allow_redirects=True) as resp:
+                    if resp.status == 200:
+                        return await resp.text()
+                    else:
+                        logger.debug(f"Зеркало {url}: HTTP {resp.status}")
+            except Exception as e:
+                logger.debug(f"Ошибка при обращении к {url}: {e}")
+                continue
+        return None
+
     async def _parse_telegram_channels(self) -> List[ProxyConfig]:
-        """Сбор из Telegram-каналов через t.me/s с резервным поиском по всему HTML."""
+        """Сбор из Telegram-каналов. Поддерживает полные URL и ники."""
         tg_file = Path("sources_tg.txt")
         if not tg_file.exists():
             logger.warning("Файл sources_tg.txt не найден – Telegram-сбор пропущен.")
@@ -465,58 +516,58 @@ class SubscriptionParser:
             if i > 0:
                 delay = TG_REQUEST_DELAY + random.uniform(0.5, 1.5)
                 await asyncio.sleep(delay)
-            url = f"https://t.me/s/{channel}"
-            headers = {'User-Agent': random.choice(TG_USER_AGENTS)}
-            try:
-                async with self.session.get(url, headers=headers, allow_redirects=True) as resp:
-                    if resp.status != 200:
-                        logger.warning(f"Канал {channel}: HTTP {resp.status}")
-                        continue
-                    html = await resp.text()
-                # Попытка 1: стандартный класс сообщения
-                messages = []
-                for block in re.findall(r'<div class="tgme_widget_message_text">(.*?)</div>', html, re.DOTALL):
+            html = await self._fetch_tg_page(channel)
+            if not html:
+                logger.warning(f"Канал {channel}: не удалось загрузить ни через одно зеркало")
+                continue
+            # Попытка 1: стандартный класс сообщения
+            messages = []
+            for block in re.findall(r'<div class="tgme_widget_message_text">(.*?)</div>', html, re.DOTALL):
+                text = re.sub(r'<[^>]+>', '', block).strip()
+                if text:
+                    messages.append(text)
+            # Попытка 2: альтернативный селектор
+            if not messages:
+                for block in re.findall(r'<div class="tgme_widget_message_text"[^>]*>(.*?)</div>', html, re.DOTALL):
                     text = re.sub(r'<[^>]+>', '', block).strip()
                     if text:
                         messages.append(text)
-                # Попытка 2: альтернативный селектор
-                if not messages:
-                    for block in re.findall(r'<div class="tgme_widget_message_text"[^>]*>(.*?)</div>', html, re.DOTALL):
-                        text = re.sub(r'<[^>]+>', '', block).strip()
-                        if text:
-                            messages.append(text)
-                # Попытка 3: ищем ссылки прямо во всём HTML
-                if not messages:
-                    direct_links = self.extract_links(html)
-                    if direct_links:
-                        logger.info(f"Канал {channel}: найдено {len(direct_links)} ссылок в сыром HTML")
-                        for link in direct_links:
-                            cfg = self.checker._parse_uri(link)
-                            if not cfg:
-                                continue
-                            key = f"{cfg.host}:{cfg.port}:{cfg.uuid or cfg.password or cfg.method}"
-                            if key not in seen_keys:
-                                seen_keys.add(key)
-                                all_configs.append(cfg)
-                        continue
-                    else:
-                        logger.warning(f"Канал {channel}: сообщения и ссылки не найдены")
-                        continue
-                # Извлекаем ссылки из сообщений
-                channel_links = []
-                for msg in messages[:20]:
-                    channel_links.extend(self.extract_links(msg))
-                for link in channel_links:
-                    cfg = self.checker._parse_uri(link)
-                    if not cfg:
-                        continue
-                    key = f"{cfg.host}:{cfg.port}:{cfg.uuid or cfg.password or cfg.method}"
-                    if key not in seen_keys:
-                        seen_keys.add(key)
-                        all_configs.append(cfg)
-                logger.info(f"Канал {channel}: +{len(channel_links)} ссылок (всего собрано {len(all_configs)})")
-            except Exception as e:
-                logger.error(f"Ошибка при загрузке канала {channel}: {e}")
+            # Попытка 3: ищем любой div с классом, содержащим 'message_text'
+            if not messages:
+                for block in re.findall(r'<div[^>]*class="[^"]*tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', html, re.DOTALL):
+                    text = re.sub(r'<[^>]+>', '', block).strip()
+                    if text:
+                        messages.append(text)
+            # Если всё ещё пусто – ищем ссылки прямо во всём HTML
+            if not messages:
+                direct_links = self.extract_links(html)
+                if direct_links:
+                    logger.info(f"Канал {channel}: найдено {len(direct_links)} ссылок в сыром HTML")
+                    for link in direct_links:
+                        cfg = self.checker._parse_uri(link)
+                        if not cfg:
+                            continue
+                        key = f"{cfg.host}:{cfg.port}:{cfg.uuid or cfg.password or cfg.method}"
+                        if key not in seen_keys:
+                            seen_keys.add(key)
+                            all_configs.append(cfg)
+                    continue
+                else:
+                    logger.warning(f"Канал {channel}: сообщения и ссылки не найдены")
+                    continue
+            # Извлекаем ссылки из сообщений
+            channel_links = []
+            for msg in messages[:20]:
+                channel_links.extend(self.extract_links(msg))
+            for link in channel_links:
+                cfg = self.checker._parse_uri(link)
+                if not cfg:
+                    continue
+                key = f"{cfg.host}:{cfg.port}:{cfg.uuid or cfg.password or cfg.method}"
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    all_configs.append(cfg)
+            logger.info(f"Канал {channel}: +{len(channel_links)} ссылок (всего собрано {len(all_configs)})")
         logger.info(f"Telegram-сбор завершён: всего {len(all_configs)} конфигураций")
         return all_configs
 
@@ -562,21 +613,20 @@ def save_subscriptions(configs: List[ProxyConfig], output_dir: str = "."):
 
     logger.info(f"Рабочих: {len(working)}")
 
-    HEADER = "# Niyakwi | обновление каждые 6 часов\n"
-
     if not working:
         logger.warning("Нет рабочих конфигураций. Выходные файлы будут пустыми.")
     else:
-        # Android
+        # Android (максимум 5000)
+        android_list = working[:5000]
         with open(out_path / "sub_android.txt", "w", encoding='utf-8') as f:
             f.write(HEADER)
-            for c in working:
+            for c in android_list:
                 f.write(f"{c.to_uri().split('#')[0]}#{c.format_name()}\n")
-        # iOS: топ-100 с наименьшим пингом
-        ios_candidates = sorted(working, key=lambda x: x.latency if x.latency else 999999)
+        # iOS (максимум 300, сортировка по пингу)
+        ios_list = working[:300]
         with open(out_path / "sub_ios.txt", "w", encoding='utf-8') as f:
             f.write(HEADER)
-            for c in ios_candidates[:100]:
+            for c in ios_list:
                 f.write(f"{c.to_uri().split('#')[0]}#{c.format_name()}\n")
         # Все проверенные
         with open(out_path / "sub_all_checked.txt", "w", encoding='utf-8') as f:
@@ -589,7 +639,7 @@ def save_subscriptions(configs: List[ProxyConfig], output_dir: str = "."):
             if proto_list:
                 with open(out_path / f"sub_{proto}.txt", "w", encoding='utf-8') as f:
                     f.write(HEADER)
-                    for c in proto_list:
+                    for c in proto_list[:5000]:
                         f.write(f"{c.to_uri().split('#')[0]}#{c.format_name()}\n")
 
     # Ссылки
