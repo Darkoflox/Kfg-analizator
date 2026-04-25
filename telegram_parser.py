@@ -125,8 +125,7 @@ class TelegramParser:
                 delay = self.request_delay + random.uniform(0.5, 1.5)
                 await asyncio.sleep(delay)
             messages = await self.fetch_channel_messages(channel)
-            # Инициализируем links здесь, чтобы избежать ошибки с неопределённой переменной
-            links = []
+            links = []  # <-- исправлено: объявляем до цикла
             for message in messages:
                 links.extend(self.extract_links(message))
             for link in links:
