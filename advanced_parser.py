@@ -436,7 +436,7 @@ class SubscriptionParser:
         return configs
 
     async def _parse_telegram_channels(self) -> List[ProxyConfig]:
-        """Встроенный сбор из Telegram-каналов через t.me/s с улучшенным парсингом."""
+        """Сбор из Telegram-каналов через t.me/s с резервным поиском по всему HTML."""
         tg_file = Path("sources_tg.txt")
         if not tg_file.exists():
             logger.warning("Файл sources_tg.txt не найден – Telegram-сбор пропущен.")
@@ -485,17 +485,8 @@ class SubscriptionParser:
                         text = re.sub(r'<[^>]+>', '', block).strip()
                         if text:
                             messages.append(text)
-                # Попытка 3: ищем любой div с классом, содержащим 'message_text'
+                # Попытка 3: ищем ссылки прямо во всём HTML
                 if not messages:
-                    for block in re.findall(r'<div[^>]*class="[^"]*tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', html, re.DOTALL):
-                        text = re.sub(r'<[^>]+>', '', block).strip()
-                        if text:
-                            messages.append(text)
-                # Если всё ещё пусто – логируем фрагмент для диагностики
-                if not messages:
-                    snippet = html[:300].replace('\n', ' ')
-                    logger.warning(f"Канал {channel}: сообщения не найдены, начало HTML: {snippet}")
-                    # Попробуем искать ссылки прямо во всём HTML
                     direct_links = self.extract_links(html)
                     if direct_links:
                         logger.info(f"Канал {channel}: найдено {len(direct_links)} ссылок в сыром HTML")
@@ -507,6 +498,9 @@ class SubscriptionParser:
                             if key not in seen_keys:
                                 seen_keys.add(key)
                                 all_configs.append(cfg)
+                        continue
+                    else:
+                        logger.warning(f"Канал {channel}: сообщения и ссылки не найдены")
                         continue
                 # Извлекаем ссылки из сообщений
                 channel_links = []
