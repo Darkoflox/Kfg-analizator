@@ -65,7 +65,6 @@ DEFAULT_SOURCES = [
     "https://raw.githubusercontent.com/Bypass-LAN/V2ray/main/Sub.txt",
 ]
 
-# Telegram‑сбор
 TG_USER_AGENTS = [
     'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
@@ -437,7 +436,7 @@ class SubscriptionParser:
         return configs
 
     async def _parse_telegram_channels(self) -> List[ProxyConfig]:
-        """Встроенный сбор из Telegram-каналов через t.me/s."""
+        """Встроенный сбор из Telegram-каналов через t.me/s с улучшенным парсингом."""
         tg_file = Path("sources_tg.txt")
         if not tg_file.exists():
             logger.warning("Файл sources_tg.txt не найден – Telegram-сбор пропущен.")
@@ -448,7 +447,6 @@ class SubscriptionParser:
                 line = line.strip()
                 if not line or line.startswith('#'):
                     continue
-                # Извлекаем username из возможных форматов: @name, https://t.me/s/name, name
                 username = line
                 if username.startswith('@'):
                     username = username[1:]
@@ -475,20 +473,44 @@ class SubscriptionParser:
                         logger.warning(f"Канал {channel}: HTTP {resp.status}")
                         continue
                     html = await resp.text()
-                # Извлекаем сообщения
+                # Попытка 1: стандартный класс сообщения
                 messages = []
                 for block in re.findall(r'<div class="tgme_widget_message_text">(.*?)</div>', html, re.DOTALL):
                     text = re.sub(r'<[^>]+>', '', block).strip()
                     if text:
                         messages.append(text)
-                # Если не нашли, пробуем альтернативный селектор
+                # Попытка 2: альтернативный селектор
                 if not messages:
                     for block in re.findall(r'<div class="tgme_widget_message_text"[^>]*>(.*?)</div>', html, re.DOTALL):
                         text = re.sub(r'<[^>]+>', '', block).strip()
                         if text:
                             messages.append(text)
+                # Попытка 3: ищем любой div с классом, содержащим 'message_text'
+                if not messages:
+                    for block in re.findall(r'<div[^>]*class="[^"]*tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', html, re.DOTALL):
+                        text = re.sub(r'<[^>]+>', '', block).strip()
+                        if text:
+                            messages.append(text)
+                # Если всё ещё пусто – логируем фрагмент для диагностики
+                if not messages:
+                    snippet = html[:300].replace('\n', ' ')
+                    logger.warning(f"Канал {channel}: сообщения не найдены, начало HTML: {snippet}")
+                    # Попробуем искать ссылки прямо во всём HTML
+                    direct_links = self.extract_links(html)
+                    if direct_links:
+                        logger.info(f"Канал {channel}: найдено {len(direct_links)} ссылок в сыром HTML")
+                        for link in direct_links:
+                            cfg = self.checker._parse_uri(link)
+                            if not cfg:
+                                continue
+                            key = f"{cfg.host}:{cfg.port}:{cfg.uuid or cfg.password or cfg.method}"
+                            if key not in seen_keys:
+                                seen_keys.add(key)
+                                all_configs.append(cfg)
+                        continue
+                # Извлекаем ссылки из сообщений
                 channel_links = []
-                for msg in messages[:20]:  # максимум 20 сообщений
+                for msg in messages[:20]:
                     channel_links.extend(self.extract_links(msg))
                 for link in channel_links:
                     cfg = self.checker._parse_uri(link)
