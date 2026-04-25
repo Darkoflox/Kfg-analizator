@@ -8,7 +8,7 @@ on:
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 45          # увеличено
     permissions:
       contents: write
     steps:
@@ -22,8 +22,8 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run parser with Telegram
-        run: python advanced_parser.py --threads 40 --strategy diverse --parse-telegram
+      - name: Run parser (без Telegram)
+        run: python advanced_parser.py --threads 40 --strategy diverse
 
       - name: Update README with subscription links
         run: python update_readme.py
