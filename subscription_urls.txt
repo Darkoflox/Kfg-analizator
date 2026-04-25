@@ -2,11 +2,11 @@
 https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_android.txt
 https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_ios.txt
 https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_all_checked.txt
-https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_trojan.txt
-https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_tuic.txt
 https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_vless.txt
 https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_hysteria2.txt
 https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_ss.txt
+https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_trojan.txt
+https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_tuic.txt
 
 # Обходные ссылки (для регионов с блокировкой raw.githubusercontent.com)
 # sub_android.txt
@@ -18,12 +18,6 @@ https://cdn.jsdelivr.net/gh/Darkoflox/Kfg-analizator@main/sub_ios.txt
 # sub_all_checked.txt
 https://cdn.statically.io/gh/Darkoflox/Kfg-analizator/main/sub_all_checked.txt
 https://cdn.jsdelivr.net/gh/Darkoflox/Kfg-analizator@main/sub_all_checked.txt
-# sub_trojan.txt
-https://cdn.statically.io/gh/Darkoflox/Kfg-analizator/main/sub_trojan.txt
-https://cdn.jsdelivr.net/gh/Darkoflox/Kfg-analizator@main/sub_trojan.txt
-# sub_tuic.txt
-https://cdn.statically.io/gh/Darkoflox/Kfg-analizator/main/sub_tuic.txt
-https://cdn.jsdelivr.net/gh/Darkoflox/Kfg-analizator@main/sub_tuic.txt
 # sub_vless.txt
 https://cdn.statically.io/gh/Darkoflox/Kfg-analizator/main/sub_vless.txt
 https://cdn.jsdelivr.net/gh/Darkoflox/Kfg-analizator@main/sub_vless.txt
@@ -33,3 +27,9 @@ https://cdn.jsdelivr.net/gh/Darkoflox/Kfg-analizator@main/sub_hysteria2.txt
 # sub_ss.txt
 https://cdn.statically.io/gh/Darkoflox/Kfg-analizator/main/sub_ss.txt
 https://cdn.jsdelivr.net/gh/Darkoflox/Kfg-analizator@main/sub_ss.txt
+# sub_trojan.txt
+https://cdn.statically.io/gh/Darkoflox/Kfg-analizator/main/sub_trojan.txt
+https://cdn.jsdelivr.net/gh/Darkoflox/Kfg-analizator@main/sub_trojan.txt
+# sub_tuic.txt
+https://cdn.statically.io/gh/Darkoflox/Kfg-analizator/main/sub_tuic.txt
+https://cdn.jsdelivr.net/gh/Darkoflox/Kfg-analizator@main/sub_tuic.txt
