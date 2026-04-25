@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Парсер Telegram-каналов через веб-версию (t.me/s).
+Улучшенный парсер Telegram-каналов через веб-версию (t.me/s).
 Собирает прокси-конфигурации, дедуплицирует и сохраняет в файл.
 """
 import asyncio
@@ -9,7 +9,7 @@ import random
 import re
 from argparse import ArgumentParser
 from pathlib import Path
-from typing import List, Set
+from typing import List, Set, Optional, Tuple
 from urllib.parse import urlparse
 
 import aiohttp
@@ -30,19 +30,19 @@ DEFAULT_CHANNELS = [
 ]
 
 USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/14.0 Safari/605.1.15',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/90.0.4430.212 Safari/537.36'
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
 ]
 
 class TelegramParser:
-    def __init__(self, channels_file="sources_tg.txt", output_file="parsed_tg.txt",
-                 max_messages=20, request_delay=2.0):
+    def __init__(self, channels_file: str = "sources_tg.txt", output_file: str = "parsed_tg.txt",
+                 max_messages: int = 20, request_delay: float = 2.0):
         self.channels_file = channels_file
         self.output_file = output_file
         self.max_messages = max_messages
         self.request_delay = request_delay
-        self.session = None
+        self.session: Optional[aiohttp.ClientSession] = None
 
     async def __aenter__(self):
         connector = aiohttp.TCPConnector(limit=5, ssl=False)
@@ -55,6 +55,7 @@ class TelegramParser:
             await self.session.close()
 
     def load_channels(self) -> List[str]:
+        """Загружает список каналов из файла."""
         try:
             with open(self.channels_file, 'r', encoding='utf-8') as f:
                 channels = [line.strip() for line in f if line.strip() and not line.startswith('#')]
@@ -69,33 +70,56 @@ class TelegramParser:
                     f.write(f"{channel}\n")
         return DEFAULT_CHANNELS
 
-    async def fetch_channel_messages(self, channel: str) -> List[str]:
+    async def fetch_channel_messages(self, channel: str) -> Tuple[List[str], Optional[str]]:
+        """Получает текст сообщений и HTML-заголовок (для диагностики)."""
         username = channel.lstrip('@')
         url = f"https://t.me/s/{username}"
         headers = {'User-Agent': random.choice(USER_AGENTS)}
         messages = []
+        error = None
         try:
-            async with self.session.get(url, headers=headers) as response:
+            async with self.session.get(url, headers=headers, allow_redirects=True) as response:
                 if response.status != 200:
-                    logger.warning(f"Не удалось загрузить {url}: HTTP {response.status}")
-                    return messages
+                    error = f"HTTP {response.status}"
+                    logger.warning(f"Не удалось загрузить {url}: {error}")
+                    return messages, error
                 html = await response.text()
-                message_blocks = re.findall(r'<div class="tgme_widget_message_text">(.*?)</div>', html, re.DOTALL)
+                # Ищем сообщения внутри <div class="tgme_widget_message_text">
+                message_blocks = re.findall(
+                    r'<div class="tgme_widget_message_text">(.*?)</div>',
+                    html,
+                    re.DOTALL
+                )
                 for block in message_blocks[:self.max_messages]:
                     clean_text = re.sub(r'<[^>]+>', '', block).strip()
                     if clean_text:
                         messages.append(clean_text)
+                if not messages:
+                    # Попробуем альтернативный селектор
+                    alt_blocks = re.findall(
+                        r'<div class="tgme_widget_message_text"[^>]*>(.*?)</div>',
+                        html,
+                        re.DOTALL
+                    )
+                    for block in alt_blocks[:self.max_messages]:
+                        clean_text = re.sub(r'<[^>]+>', '', block).strip()
+                        if clean_text:
+                            messages.append(clean_text)
                 logger.debug(f"Из {channel} извлечено {len(messages)} сообщений")
         except asyncio.TimeoutError:
+            error = "timeout"
             logger.warning(f"Тайм-аут при загрузке {url}")
         except Exception as e:
+            error = str(e)
             logger.error(f"Ошибка при загрузке {url}: {e}")
-        return messages
+        return messages, error
 
     def extract_links(self, text: str) -> List[str]:
+        """Извлекает прокси-ссылки из текста."""
         return PROXY_LINK_PATTERN.findall(text)
 
     def normalize_link(self, link: str) -> str:
+        """Возвращает ключ для дедупликации."""
         try:
             proto = link.split('://')[0].lower()
             parsed = urlparse(link)
@@ -117,27 +141,61 @@ class TelegramParser:
             return link
 
     async def collect_from_channels(self) -> List[str]:
+        """Основной метод сбора конфигураций из Telegram."""
         channels = self.load_channels()
         all_links: Set[str] = set()
         seen_keys: Set[str] = set()
+        successful_channels = 0
+        empty_channels = 0
+        error_channels = 0
+
         for i, channel in enumerate(channels):
             if i > 0:
                 delay = self.request_delay + random.uniform(0.5, 1.5)
                 await asyncio.sleep(delay)
-            messages = await self.fetch_channel_messages(channel)
-            links = []  # <-- исправлено: объявляем до цикла
+            
+            messages, error = await self.fetch_channel_messages(channel)
+            if error:
+                error_channels += 1
+                continue
+            
+            if not messages:
+                empty_channels += 1
+                logger.info(f"Канал {channel}: нет сообщений для анализа")
+                continue
+            
+            channel_links = []
             for message in messages:
-                links.extend(self.extract_links(message))
-            for link in links:
+                channel_links.extend(self.extract_links(message))
+            
+            if not channel_links:
+                empty_channels += 1
+                logger.info(f"Канал {channel}: нет прокси-ссылок в сообщениях")
+                continue
+            
+            # Дедупликация
+            new_links = 0
+            for link in channel_links:
                 key = self.normalize_link(link)
                 if key not in seen_keys:
                     seen_keys.add(key)
                     all_links.add(link)
-            logger.info(f"Канал {channel}: добавлено {len(links)} ссылок (уникальных всего: {len(all_links)})")
-        logger.info(f"Всего собрано {len(all_links)} уникальных конфигураций из Telegram")
+                    new_links += 1
+            
+            successful_channels += 1
+            logger.info(f"Канал {channel}: добавлено {new_links} новых ссылок (всего уникальных: {len(all_links)})")
+
+        logger.info(
+            f"Статистика Telegram-сбора: "
+            f"успешных каналов: {successful_channels}, "
+            f"пустых: {empty_channels}, "
+            f"с ошибками: {error_channels}, "
+            f"всего уникальных ссылок: {len(all_links)}"
+        )
         return list(all_links)
 
     def save_results(self, links: List[str]):
+        """Сохраняет ссылки в файл."""
         with open(self.output_file, 'w', encoding='utf-8') as f:
             f.write('\n'.join(links))
         logger.info(f"Результат сохранён в {self.output_file}")
