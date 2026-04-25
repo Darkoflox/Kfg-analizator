@@ -2,13 +2,13 @@ name: "Update Subscriptions"
 
 on:
   schedule:
-    - cron: '0 */6 * * *'   # каждые 6 часов
-  workflow_dispatch:         # ручной запуск
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
 
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 30      # немного увеличен для Xray
+    timeout-minutes: 45          # расширенная проверка требует больше времени
     permissions:
       contents: write
     steps:
@@ -22,8 +22,8 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run parser with Telegram and Xray
-        run: python advanced_parser.py --threads 40 --strategy diverse --force-xray --parse-telegram --full-check 300 --full-check-retries 2
+      - name: Run parser with extended verification
+        run: python advanced_parser.py --threads 40 --strategy diverse --full-check 300 --parse-telegram
 
       - name: Update README with subscription links
         run: python update_readme.py
