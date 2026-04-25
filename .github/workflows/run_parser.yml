@@ -2,15 +2,15 @@ name: "Update Subscriptions"
 
 on:
   schedule:
-    - cron: '0 */6 * * *'   # каждые 6 часов
-  workflow_dispatch:         # ручной запуск
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
 
 jobs:
   update:
     runs-on: ubuntu-latest
-    timeout-minutes: 45      # увеличено для большого количества конфигураций
+    timeout-minutes: 45
     permissions:
-      contents: write        # разрешаем коммиты
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -22,8 +22,8 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run parser (URL sources only)
-        run: python advanced_parser.py --threads 40 --strategy diverse
+      - name: Run parser (URL + Telegram)
+        run: python advanced_parser.py --threads 40 --strategy diverse --parse-telegram
 
       - name: Update README with subscription links
         run: python update_readme.py
