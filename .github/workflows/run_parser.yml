@@ -2,8 +2,8 @@ name: "Update Subscriptions"
 
 on:
   schedule:
-    - cron: '0 */6 * * *'   # каждые 6 часов
-  workflow_dispatch:         # ручной запуск
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
 
 jobs:
   update:
