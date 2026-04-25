@@ -2,7 +2,7 @@
 """
 Финальный парсер с поддержкой URL‑подписок и Telegram‑каналов (через зеркала).
 Двухэтапная проверка (TCP+TLS + дополнительная фильтрация).
-Ограничения: Android ≤5000, iOS ≤300.
+Разнообразие протоколов при ограничении размера подписки.
 """
 import asyncio
 import base64
@@ -69,15 +69,14 @@ TG_USER_AGENTS = [
 ]
 TG_REQUEST_DELAY = 2.0
 
-# Зеркала Telegram (пробуются по порядку, сначала альтернативные)
 TG_MIRRORS = [
-    "https://tg.i-c-a.su/s/{}",        # альтернативное зеркало
-    "https://tlgrm.ru/s/{}",           # ещё одно зеркало
-    "https://tg.snowfall.ru/s/{}",     # дополнительное зеркало
-    "https://t.me/s/{}"                # основной домен (пробуется последним)
+    "https://tg.i-c-a.su/s/{}",
+    "https://tlgrm.ru/s/{}",
+    "https://tg.snowfall.ru/s/{}",
+    "https://t.me/s/{}"
 ]
 
-HEADER = "# Niyakwi⚪ | обновление каждые 6 часов\n"
+HEADER = "# profile-title: Niyakwi⚪ | БС | обновление каждые 6 часов\n# profile-update-interval: 6\n"
 
 
 # ---------- Управление источниками ----------
@@ -471,7 +470,6 @@ class SubscriptionParser:
         return configs
 
     async def _fetch_tg_page(self, username: str) -> Optional[str]:
-        """Пытается загрузить страницу канала через разные зеркала."""
         for mirror_template in TG_MIRRORS:
             url = mirror_template.format(username)
             headers = {'User-Agent': random.choice(TG_USER_AGENTS)}
@@ -487,7 +485,6 @@ class SubscriptionParser:
         return None
 
     async def _parse_telegram_channels(self) -> List[ProxyConfig]:
-        """Сбор из Telegram-каналов. Поддерживает полные URL и ники."""
         tg_file = Path("sources_tg.txt")
         if not tg_file.exists():
             logger.warning("Файл sources_tg.txt не найден – Telegram-сбор пропущен.")
@@ -520,25 +517,21 @@ class SubscriptionParser:
             if not html:
                 logger.warning(f"Канал {channel}: не удалось загрузить ни через одно зеркало")
                 continue
-            # Попытка 1: стандартный класс сообщения
             messages = []
             for block in re.findall(r'<div class="tgme_widget_message_text">(.*?)</div>', html, re.DOTALL):
                 text = re.sub(r'<[^>]+>', '', block).strip()
                 if text:
                     messages.append(text)
-            # Попытка 2: альтернативный селектор
             if not messages:
                 for block in re.findall(r'<div class="tgme_widget_message_text"[^>]*>(.*?)</div>', html, re.DOTALL):
                     text = re.sub(r'<[^>]+>', '', block).strip()
                     if text:
                         messages.append(text)
-            # Попытка 3: ищем любой div с классом, содержащим 'message_text'
             if not messages:
                 for block in re.findall(r'<div[^>]*class="[^"]*tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', html, re.DOTALL):
                     text = re.sub(r'<[^>]+>', '', block).strip()
                     if text:
                         messages.append(text)
-            # Если всё ещё пусто – ищем ссылки прямо во всём HTML
             if not messages:
                 direct_links = self.extract_links(html)
                 if direct_links:
@@ -555,7 +548,6 @@ class SubscriptionParser:
                 else:
                     logger.warning(f"Канал {channel}: сообщения и ссылки не найдены")
                     continue
-            # Извлекаем ссылки из сообщений
             channel_links = []
             for msg in messages[:20]:
                 channel_links.extend(self.extract_links(msg))
@@ -583,7 +575,6 @@ class SubscriptionParser:
             elif isinstance(result, list):
                 all_configs.extend(result)
 
-        # Telegram
         if self.parse_telegram:
             try:
                 tg_configs = await self._parse_telegram_channels()
@@ -616,19 +607,19 @@ def save_subscriptions(configs: List[ProxyConfig], output_dir: str = "."):
     if not working:
         logger.warning("Нет рабочих конфигураций. Выходные файлы будут пустыми.")
     else:
-        # Android (максимум 5000)
-        android_list = working[:5000]
+        # Android (максимум 5000, разнообразие)
+        android_list = ConfigSelector.select(working, 5000, "diverse")
         with open(out_path / "sub_android.txt", "w", encoding='utf-8') as f:
             f.write(HEADER)
             for c in android_list:
                 f.write(f"{c.to_uri().split('#')[0]}#{c.format_name()}\n")
-        # iOS (максимум 300, сортировка по пингу)
-        ios_list = working[:300]
+        # iOS (максимум 300, разнообразие)
+        ios_list = ConfigSelector.select(working, 300, "diverse")
         with open(out_path / "sub_ios.txt", "w", encoding='utf-8') as f:
             f.write(HEADER)
             for c in ios_list:
                 f.write(f"{c.to_uri().split('#')[0]}#{c.format_name()}\n")
-        # Все проверенные
+        # Все проверенные (без ограничений)
         with open(out_path / "sub_all_checked.txt", "w", encoding='utf-8') as f:
             f.write(HEADER)
             for c in working:
