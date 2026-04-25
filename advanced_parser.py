@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 Универсальный асинхронный парсер с поддержкой URL‑подписок и Telegram‑каналов.
-Проверка: TCP + TLS (быстрая) + опционально Xray‑верификация.
+Проверка: TCP + TLS + всегда расширенная верификация (Sing‑box / Hysteria2).
 Генерация подписок для Android и iOS.
 
 Использование:
     python advanced_parser.py [--threads M] [--strategy {diverse,fastest,random}]
-                             [--force-xray] [--full-check N] [--test-urls URL1 URL2 ...]
-                             [--full-check-retries R] [--parse-telegram]
+                             [--full-check N] [--test-urls URL1 URL2 ...]
+                             [--parse-telegram]
 """
 import asyncio
 import base64
@@ -52,10 +52,16 @@ PROXY_LINK_PATTERN = re.compile(
     re.IGNORECASE
 )
 
-XRAY_DOWNLOAD_URLS = {
-    'linux': 'https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip',
-    'darwin': 'https://github.com/XTLS/Xray-core/releases/latest/download/Xray-macos-64.zip',
-    'windows': 'https://github.com/XTLS/Xray-core/releases/latest/download/Xray-windows-64.zip',
+# URL для скачивания Sing‑box и Hysteria2
+SING_BOX_URLS = {
+    'linux': 'https://github.com/SagerNet/sing-box/releases/latest/download/sing-box-linux-amd64.tar.gz',
+    'darwin': 'https://github.com/SagerNet/sing-box/releases/latest/download/sing-box-darwin-amd64.tar.gz',
+    'windows': 'https://github.com/SagerNet/sing-box/releases/latest/download/sing-box-windows-amd64.zip',
+}
+HYSTERIA2_URLS = {
+    'linux': 'https://github.com/apernet/hysteria/releases/latest/download/hysteria2-linux-amd64',
+    'darwin': 'https://github.com/apernet/hysteria/releases/latest/download/hysteria2-darwin-amd64',
+    'windows': 'https://github.com/apernet/hysteria/releases/latest/download/hysteria2-windows-amd64.exe',
 }
 
 TLD_FLAGS = {
@@ -199,54 +205,81 @@ class ConfigSelector:
             return shuffled[:max_count]
 
 
-# ---------- Чекер (TCP + TLS + Xray) ----------
-class ProxyChecker:
+# ---------- Лёгкий чекер (TCP + TLS + Sing‑box / Hysteria2) ----------
+class LightweightChecker:
     def __init__(self, max_concurrent: int = 20, timeout: int = 5,
-                 force_xray: bool = False, full_check_count: int = 500,
-                 test_urls: Optional[List[str]] = None,
-                 full_check_retries: int = 2):
+                 full_check_count: int = 300,
+                 test_urls: Optional[List[str]] = None):
         self.max_concurrent = max_concurrent
         self.timeout = timeout
-        self.force_xray = force_xray
         self.full_check_count = full_check_count
         self.test_urls = test_urls or [
             "http://www.gstatic.com/generate_204",
             "http://httpbin.org/ip",
-            "http://cp.cloudflare.com/",
-            "http://example.com"
+            "http://cp.cloudflare.com/"
         ]
-        self.full_check_retries = full_check_retries
-        self.xray_path = None
-        self.xray_ready = False
+        self.sing_box_path = None
+        self.hysteria2_path = None
         self.curl_available = shutil.which('curl') is not None
 
-    def _ensure_xray(self):
-        if self.xray_ready:
-            return
+    def _ensure_tools(self):
+        """Автоматически скачивает Sing‑box и Hysteria2, если их нет."""
         system = sys.platform
-        xray_bin = 'xray' if system != 'win32' else 'xray.exe'
-        if Path(xray_bin).exists():
-            self.xray_path = str(Path(xray_bin).absolute())
+        if system == 'win32':
+            sing_bin = 'sing-box.exe'
+            hyst_bin = 'hysteria2.exe'
         else:
-            logger.info("📥 Скачиваем Xray...")
-            import urllib.request, zipfile
-            key = 'windows' if system == 'win32' else ('darwin' if system == 'darwin' else 'linux')
-            url = XRAY_DOWNLOAD_URLS.get(key)
-            if not url:
-                raise RuntimeError(f"Нет URL для {key}")
-            zip_path = 'xray.zip'
-            urllib.request.urlretrieve(url, zip_path)
-            with zipfile.ZipFile(zip_path, 'r') as zf:
-                for m in zf.namelist():
-                    if m.endswith(xray_bin):
-                        with open(xray_bin, 'wb') as f:
-                            f.write(zf.read(m))
-                        os.chmod(xray_bin, 0o755)
-                        break
-            Path(zip_path).unlink()
-            self.xray_path = str(Path(xray_bin).absolute())
-        self.xray_ready = True
-        logger.info(f"✅ Xray готов: {self.xray_path}")
+            sing_bin = 'sing-box'
+            hyst_bin = 'hysteria2'
+
+        # Sing‑box
+        if not self.sing_box_path:
+            if Path(sing_bin).exists():
+                self.sing_box_path = str(Path(sing_bin).absolute())
+            else:
+                logger.info("📥 Скачиваем Sing‑box...")
+                url = SING_BOX_URLS.get('windows' if system == 'win32' else ('darwin' if system == 'darwin' else 'linux'))
+                if url:
+                    try:
+                        import urllib.request, tarfile, zipfile
+                        archive = 'sing-box.tar.gz' if not url.endswith('.zip') else 'sing-box.zip'
+                        urllib.request.urlretrieve(url, archive)
+                        if archive.endswith('.tar.gz'):
+                            with tarfile.open(archive, 'r:gz') as tar:
+                                for member in tar.getmembers():
+                                    if member.name.endswith(sing_bin):
+                                        tar.extract(member)
+                                        os.chmod(sing_bin, 0o755)
+                                        break
+                        else:
+                            with zipfile.ZipFile(archive, 'r') as zf:
+                                for name in zf.namelist():
+                                    if name.endswith(sing_bin):
+                                        zf.extract(name)
+                                        os.chmod(sing_bin, 0o755)
+                                        break
+                        Path(archive).unlink()
+                        self.sing_box_path = str(Path(sing_bin).absolute())
+                        logger.info(f"✅ Sing‑box готов: {self.sing_box_path}")
+                    except Exception as e:
+                        logger.error(f"Не удалось скачать Sing‑box: {e}")
+
+        # Hysteria2
+        if not self.hysteria2_path:
+            if Path(hyst_bin).exists():
+                self.hysteria2_path = str(Path(hyst_bin).absolute())
+            else:
+                logger.info("📥 Скачиваем Hysteria2...")
+                url = HYSTERIA2_URLS.get('windows' if system == 'win32' else ('darwin' if system == 'darwin' else 'linux'))
+                if url:
+                    try:
+                        import urllib.request
+                        urllib.request.urlretrieve(url, hyst_bin)
+                        os.chmod(hyst_bin, 0o755)
+                        self.hysteria2_path = str(Path(hyst_bin).absolute())
+                        logger.info(f"✅ Hysteria2 готов: {self.hysteria2_path}")
+                    except Exception as e:
+                        logger.error(f"Не удалось скачать Hysteria2: {e}")
 
     def _tcp_check(self, host: str, port: int, timeout: float = 3.0) -> Tuple[bool, float]:
         start = time.time()
@@ -330,85 +363,59 @@ class ProxyChecker:
         except Exception:
             return None
 
-    def _build_xray_config(self, cfg: ProxyConfig, port: int) -> Dict:
-        outbound = {
-            "protocol": cfg.protocol,
-            "settings": {},
-            "streamSettings": {
-                "network": cfg.transport,
-                "security": cfg.tls if cfg.tls != "none" else None
-            }
+    def _build_sing_box_config(self, cfg: ProxyConfig) -> Dict:
+        """Генерирует минимальную конфигурацию Sing‑box для проверки."""
+        inbound = {
+            "type": "socks",
+            "listen": "127.0.0.1",
+            "listen_port": 0  # будет назначен свободный порт
         }
-        if outbound["streamSettings"]["security"] is None:
-            del outbound["streamSettings"]["security"]
-        if cfg.sni:
-            outbound["streamSettings"]["sni"] = cfg.sni
-        if cfg.transport == "ws" and cfg.path:
-            outbound["streamSettings"]["wsSettings"] = {"path": cfg.path}
-        if cfg.protocol == "vmess":
-            outbound["settings"]["vnext"] = [{"address": cfg.host, "port": cfg.port, "users": [{"id": cfg.uuid, "alterId": 0}]}]
-        elif cfg.protocol == "vless":
-            outbound["settings"]["vnext"] = [{"address": cfg.host, "port": cfg.port, "users": [{"id": cfg.uuid, "encryption": "none"}]}]
-        elif cfg.protocol == "trojan":
-            outbound["settings"]["servers"] = [{"address": cfg.host, "port": cfg.port, "password": cfg.password}]
-        elif cfg.protocol == "ss":
-            outbound["settings"]["servers"] = [{"address": cfg.host, "port": cfg.port, "method": cfg.method, "password": cfg.password}]
-        elif cfg.protocol == "hysteria2":
-            outbound["settings"]["servers"] = [{"address": cfg.host, "port": cfg.port, "password": cfg.password}]
-        elif cfg.protocol == "tuic":
-            outbound["settings"]["servers"] = [{"address": cfg.host, "port": cfg.port, "uuid": cfg.uuid, "password": cfg.password}]
-        return {"log": {"loglevel": "warning"}, "inbounds": [{"listen": "127.0.0.1", "port": port, "protocol": "socks"}], "outbounds": [outbound]}
+        outbound = {
+            "type": cfg.protocol,
+            "server": cfg.host,
+            "server_port": cfg.port,
+            "tls": {"enabled": cfg.tls != "none", "server_name": cfg.sni or cfg.host}
+        }
+        if cfg.protocol in ('vless', 'vmess'):
+            outbound["uuid"] = cfg.uuid
+        if cfg.protocol in ('trojan', 'ss', 'hysteria2'):
+            outbound["password"] = cfg.password
+        if cfg.transport != "tcp":
+            outbound["transport"] = {"type": cfg.transport}
+            if cfg.transport == "ws" and cfg.path:
+                outbound["transport"]["path"] = cfg.path
+        return {"log": {"level": "error"}, "inbounds": [inbound], "outbounds": [outbound]}
 
-    def _find_free_port(self) -> int:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.bind(('127.0.0.1', 0))
-            return s.getsockname()[1]
-
-    def _test_via_curl(self, socks_port: int, test_url: str) -> bool:
-        try:
-            cmd = [
-                'curl', '-s', '-o', '/dev/null', '-w', '%{http_code}',
-                '--socks5-hostname', f'127.0.0.1:{socks_port}',
-                '--max-time', '10',
-                test_url
-            ]
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-            return result.stdout.strip() in ('200', '204')
-        except Exception:
+    def _test_with_sing_box(self, cfg: ProxyConfig) -> bool:
+        if not self.sing_box_path:
             return False
-
-    def _xray_test(self, cfg: ProxyConfig) -> bool:
-        port = self._find_free_port()
-        xray_config = self._build_xray_config(cfg, port)
+        config = self._build_sing_box_config(cfg)
+        # Назначаем порт динамически
+        config["inbounds"][0]["listen_port"] = self._find_free_port()
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
-            json.dump(xray_config, f)
+            json.dump(config, f)
             config_path = f.name
         process = None
         try:
             process = subprocess.Popen(
-                [self.xray_path, 'run', '-c', config_path],
+                [self.sing_box_path, 'run', '-c', config_path],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
-            time.sleep(3.0)
-            for test_url in self.test_urls:
-                try:
-                    import urllib.request
-                    proxy_handler = urllib.request.ProxyHandler({
-                        'http': f'socks5://127.0.0.1:{port}',
-                        'https': f'socks5://127.0.0.1:{port}'
-                    })
-                    opener = urllib.request.build_opener(proxy_handler)
-                    req = urllib.request.Request(test_url, headers={'User-Agent': 'Mozilla/5.0'})
-                    with opener.open(req, timeout=12) as resp:
-                        if resp.status in (200, 204):
-                            return True
-                except Exception:
-                    continue
+            time.sleep(2.0)
+            socks_port = config["inbounds"][0]["listen_port"]
             if self.curl_available:
-                logger.debug(f"urllib не сработал для {cfg.host}:{cfg.port}, пробуем curl")
                 for test_url in self.test_urls:
-                    if self._test_via_curl(port, test_url):
-                        return True
+                    try:
+                        cmd = [
+                            'curl', '-s', '-o', '/dev/null', '-w', '%{http_code}',
+                            '--socks5-hostname', f'127.0.0.1:{socks_port}',
+                            '--max-time', '8', test_url
+                        ]
+                        result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                        if result.stdout.strip() in ('200', '204'):
+                            return True
+                    except Exception:
+                        continue
             return False
         except Exception:
             return False
@@ -423,6 +430,53 @@ class ProxyChecker:
                 Path(config_path).unlink()
             except Exception:
                 pass
+
+    def _test_with_hysteria2(self, cfg: ProxyConfig) -> bool:
+        if not self.hysteria2_path or cfg.protocol != 'hysteria2':
+            return False
+        socks_port = self._find_free_port()
+        cmd = [
+            self.hysteria2_path, 'client',
+            '--server', f'{cfg.host}:{cfg.port}',
+            '--socks5-listen', f'127.0.0.1:{socks_port}',
+            '--password', cfg.password or '',
+            '--insecure',
+            '--log-level', 'error'
+        ]
+        if cfg.sni:
+            cmd += ['--sni', cfg.sni]
+        process = None
+        try:
+            process = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            time.sleep(2.0)
+            if self.curl_available:
+                for test_url in self.test_urls:
+                    try:
+                        curl_cmd = [
+                            'curl', '-s', '-o', '/dev/null', '-w', '%{http_code}',
+                            '--socks5-hostname', f'127.0.0.1:{socks_port}',
+                            '--max-time', '8', test_url
+                        ]
+                        result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=10)
+                        if result.stdout.strip() in ('200', '204'):
+                            return True
+                    except Exception:
+                        continue
+            return False
+        except Exception:
+            return False
+        finally:
+            if process:
+                process.terminate()
+                try:
+                    process.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+
+    def _find_free_port(self) -> int:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(('127.0.0.1', 0))
+            return s.getsockname()[1]
 
     def test_config_basic(self, cfg: ProxyConfig) -> Tuple[bool, float]:
         ok, latency = self._tcp_check(cfg.host, cfg.port)
@@ -480,40 +534,42 @@ class ProxyChecker:
         elapsed = time.time() - start_time
         logger.info(f"✅ Базовая проверка завершена за {elapsed/60:.1f} мин. Рабочих: {len(working)} из {total}")
 
-        # Xray-верификация при force_xray
-        if self.force_xray and self.full_check_count > 0 and len(working) > 0:
+        # Расширенная проверка (Sing‑box / Hysteria2) теперь всегда
+        if self.full_check_count > 0 and len(working) > 0:
             working.sort(key=lambda x: x.latency if x.latency else 999999)
             top_candidates = working[:self.full_check_count]
-            logger.info(f"🚀 Xray‑верификация для топ‑{len(top_candidates)} (повторов: {self.full_check_retries})...")
-            self._ensure_xray()
+            logger.info(f"🚀 Запускаем расширенную проверку для топ‑{len(top_candidates)} (Sing‑box/Hysteria2)...")
+            self._ensure_tools()
 
-            xray_sem = asyncio.Semaphore(min(10, self.max_concurrent))
-            xray_working = []
+            check_sem = asyncio.Semaphore(10)  # меньше потоков, чтобы не перегружать
+            verified = []
 
-            async def xray_check(cfg: ProxyConfig):
-                async with xray_sem:
+            async def deep_check(cfg: ProxyConfig):
+                async with check_sem:
                     loop = asyncio.get_event_loop()
                     with ThreadPoolExecutor() as executor:
-                        for attempt in range(self.full_check_retries + 1):
-                            ok = await loop.run_in_executor(executor, self._xray_test, cfg)
-                            if ok:
-                                break
-                            if attempt < self.full_check_retries:
-                                await asyncio.sleep(1.5)
-                    if ok:
-                        async with lock:
-                            xray_working.append(cfg)
-                            logger.info(f"✅ Xray‑OK: {cfg.host}:{cfg.port} ({cfg.protocol})")
-                    else:
-                        logger.debug(f"❌ Xray‑неудача: {cfg.host}:{cfg.port}")
+                        ok = False
+                        # Пробуем Sing‑box для всех протоколов
+                        if self.sing_box_path:
+                            ok = await loop.run_in_executor(executor, self._test_with_sing_box, cfg)
+                        # Для Hysteria2 можно использовать родной клиент
+                        if not ok and cfg.protocol == 'hysteria2' and self.hysteria2_path:
+                            ok = await loop.run_in_executor(executor, self._test_with_hysteria2, cfg)
+                        if ok:
+                            async with lock:
+                                verified.append(cfg)
+                                logger.info(f"✅ Проверен: {cfg.host}:{cfg.port} ({cfg.protocol})")
+                        else:
+                            cfg.working = False
+                            logger.debug(f"❌ Не прошёл проверку: {cfg.host}:{cfg.port}")
                     return cfg
 
-            await asyncio.gather(*[xray_check(cfg) for cfg in top_candidates])
+            await asyncio.gather(*[deep_check(cfg) for cfg in top_candidates])
 
             for cfg in top_candidates:
-                if cfg not in xray_working:
+                if cfg not in verified:
                     cfg.working = False
-            logger.info(f"🔬 После Xray осталось {len(xray_working)} конфигураций")
+            logger.info(f"🔬 После расширенной проверки осталось {len(verified)} конфигураций")
 
         return configs
 
@@ -521,15 +577,14 @@ class ProxyChecker:
 # ---------- Парсер подписок ----------
 class SubscriptionParser:
     def __init__(self, timeout: int = 30, max_concurrent: int = 10, strategy: str = "diverse",
-                 force_xray: bool = False, full_check_count: int = 500,
+                 full_check_count: int = 300,
                  test_urls: Optional[List[str]] = None,
-                 full_check_retries: int = 2,
                  parse_telegram: bool = False):
         self.timeout = timeout
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.session: Optional[aiohttp.ClientSession] = None
-        self.checker = ProxyChecker(force_xray=force_xray, full_check_count=full_check_count,
-                                   test_urls=test_urls, full_check_retries=full_check_retries)
+        self.checker = LightweightChecker(full_check_count=full_check_count,
+                                         test_urls=test_urls)
         self.source_manager = SourceManager()
         self.strategy = strategy
         self.parse_telegram = parse_telegram
@@ -728,17 +783,14 @@ async def main():
     parser_arg = ArgumentParser()
     parser_arg.add_argument('--threads', type=int, default=40, help='Число потоков проверки')
     parser_arg.add_argument('--strategy', choices=['diverse', 'fastest', 'random'], default='diverse')
-    parser_arg.add_argument('--force-xray', action='store_true', help='Принудительно включить Xray‑верификацию')
-    parser_arg.add_argument('--full-check', type=int, default=500, help='Количество кандидатов для Xray')
-    parser_arg.add_argument('--test-urls', nargs='*', help='Список тестовых URL для Xray (через пробел)')
-    parser_arg.add_argument('--full-check-retries', type=int, default=2, help='Повторы Xray-теста')
+    parser_arg.add_argument('--full-check', type=int, default=300, help='Количество кандидатов для расширенной проверки')
+    parser_arg.add_argument('--test-urls', nargs='*', help='Список тестовых URL (через пробел)')
     parser_arg.add_argument('--parse-telegram', action='store_true', help='Включить сбор из Telegram-каналов')
     args = parser_arg.parse_args()
 
     async with SubscriptionParser(timeout=60, max_concurrent=5, strategy=args.strategy,
-                                 force_xray=args.force_xray, full_check_count=args.full_check,
+                                 full_check_count=args.full_check,
                                  test_urls=args.test_urls,
-                                 full_check_retries=args.full_check_retries,
                                  parse_telegram=args.parse_telegram) as parser:
         parser.checker.max_concurrent = args.threads
 
