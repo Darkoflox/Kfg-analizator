@@ -52,16 +52,16 @@ PROXY_LINK_PATTERN = re.compile(
     re.IGNORECASE
 )
 
-# URL для скачивания Sing‑box и Hysteria2
+# Обновлённые URL (актуальные версии)
 SING_BOX_URLS = {
-    'linux': 'https://github.com/SagerNet/sing-box/releases/latest/download/sing-box-linux-amd64.tar.gz',
-    'darwin': 'https://github.com/SagerNet/sing-box/releases/latest/download/sing-box-darwin-amd64.tar.gz',
-    'windows': 'https://github.com/SagerNet/sing-box/releases/latest/download/sing-box-windows-amd64.zip',
+    'linux': 'https://github.com/SagerNet/sing-box/releases/download/v1.9.0/sing-box-1.9.0-linux-amd64.tar.gz',
+    'darwin': 'https://github.com/SagerNet/sing-box/releases/download/v1.9.0/sing-box-1.9.0-darwin-amd64.tar.gz',
+    'windows': 'https://github.com/SagerNet/sing-box/releases/download/v1.9.0/sing-box-1.9.0-windows-amd64.zip',
 }
 HYSTERIA2_URLS = {
-    'linux': 'https://github.com/apernet/hysteria/releases/latest/download/hysteria2-linux-amd64',
-    'darwin': 'https://github.com/apernet/hysteria/releases/latest/download/hysteria2-darwin-amd64',
-    'windows': 'https://github.com/apernet/hysteria/releases/latest/download/hysteria2-windows-amd64.exe',
+    'linux': 'https://github.com/apernet/hysteria/releases/download/v2.4.0/hysteria-linux-amd64',
+    'darwin': 'https://github.com/apernet/hysteria/releases/download/v2.4.0/hysteria-darwin-amd64',
+    'windows': 'https://github.com/apernet/hysteria/releases/download/v2.4.0/hysteria-windows-amd64.exe',
 }
 
 TLD_FLAGS = {
@@ -390,7 +390,6 @@ class LightweightChecker:
         if not self.sing_box_path:
             return False
         config = self._build_sing_box_config(cfg)
-        # Назначаем порт динамически
         config["inbounds"][0]["listen_port"] = self._find_free_port()
         with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
             json.dump(config, f)
@@ -534,42 +533,40 @@ class LightweightChecker:
         elapsed = time.time() - start_time
         logger.info(f"✅ Базовая проверка завершена за {elapsed/60:.1f} мин. Рабочих: {len(working)} из {total}")
 
-        # Расширенная проверка (Sing‑box / Hysteria2) теперь всегда
+        # Расширенная проверка с безопасным fallback
         if self.full_check_count > 0 and len(working) > 0:
             working.sort(key=lambda x: x.latency if x.latency else 999999)
             top_candidates = working[:self.full_check_count]
             logger.info(f"🚀 Запускаем расширенную проверку для топ‑{len(top_candidates)} (Sing‑box/Hysteria2)...")
             self._ensure_tools()
 
-            check_sem = asyncio.Semaphore(10)  # меньше потоков, чтобы не перегружать
-            verified = []
+            # Проверяем, удалось ли загрузить хотя бы один инструмент
+            if not self.sing_box_path and not self.hysteria2_path:
+                logger.warning("Инструменты расширенной проверки недоступны – пропускаем, все кандидаты сохранены.")
+            else:
+                check_sem = asyncio.Semaphore(10)
+                verified = []
 
-            async def deep_check(cfg: ProxyConfig):
-                async with check_sem:
-                    loop = asyncio.get_event_loop()
-                    with ThreadPoolExecutor() as executor:
-                        ok = False
-                        # Пробуем Sing‑box для всех протоколов
-                        if self.sing_box_path:
-                            ok = await loop.run_in_executor(executor, self._test_with_sing_box, cfg)
-                        # Для Hysteria2 можно использовать родной клиент
-                        if not ok and cfg.protocol == 'hysteria2' and self.hysteria2_path:
-                            ok = await loop.run_in_executor(executor, self._test_with_hysteria2, cfg)
-                        if ok:
-                            async with lock:
-                                verified.append(cfg)
-                                logger.info(f"✅ Проверен: {cfg.host}:{cfg.port} ({cfg.protocol})")
-                        else:
-                            cfg.working = False
-                            logger.debug(f"❌ Не прошёл проверку: {cfg.host}:{cfg.port}")
-                    return cfg
+                async def deep_check(cfg: ProxyConfig):
+                    async with check_sem:
+                        loop = asyncio.get_event_loop()
+                        with ThreadPoolExecutor() as executor:
+                            ok = False
+                            if self.sing_box_path:
+                                ok = await loop.run_in_executor(executor, self._test_with_sing_box, cfg)
+                            if not ok and cfg.protocol == 'hysteria2' and self.hysteria2_path:
+                                ok = await loop.run_in_executor(executor, self._test_with_hysteria2, cfg)
+                            if ok:
+                                async with lock:
+                                    verified.append(cfg)
+                                    logger.info(f"✅ Проверен: {cfg.host}:{cfg.port} ({cfg.protocol})")
+                            else:
+                                cfg.working = False
+                                logger.debug(f"❌ Не прошёл проверку: {cfg.host}:{cfg.port}")
+                        return cfg
 
-            await asyncio.gather(*[deep_check(cfg) for cfg in top_candidates])
-
-            for cfg in top_candidates:
-                if cfg not in verified:
-                    cfg.working = False
-            logger.info(f"🔬 После расширенной проверки осталось {len(verified)} конфигураций")
+                await asyncio.gather(*[deep_check(cfg) for cfg in top_candidates])
+                logger.info(f"🔬 После расширенной проверки осталось {len(verified)} конфигураций")
 
         return configs
 
@@ -583,8 +580,7 @@ class SubscriptionParser:
         self.timeout = timeout
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.session: Optional[aiohttp.ClientSession] = None
-        self.checker = LightweightChecker(full_check_count=full_check_count,
-                                         test_urls=test_urls)
+        self.checker = LightweightChecker(full_check_count=full_check_count, test_urls=test_urls)
         self.source_manager = SourceManager()
         self.strategy = strategy
         self.parse_telegram = parse_telegram
