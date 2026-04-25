@@ -1,4 +1,5 @@
 # Niyakwi | обновление каждые 6 часов
+hysteria2://48b36b6a-eaa6-4843-9231-0bb8b38b5da5@usa-hy2.onetaplink.app:443?sni=hy2-usa.onetaplink.app&insecure=0&obfs=salamander#🏳️ ??
 hysteria2://dongtaiwang.com@163.172.113.118:40022?headerType=none&encryption=none&sni=www.microsoft.com&insecure=1#🏳️ ??
-hysteria2://123456789StrongPass@144.31.224.14:443?sni=www.cloudflare.com#🏳️ ??
+hysteria2://123456789StrongPass@144.31.224.14:443?headerType=none&encryption=none&sni=eh.vk.com&insecure=1#🏳️ ??
 hysteria2://a305ac08-d136-11ee-b6db-f23c91cfbbc9@ffc60249-t53wg0-t92wi1-1qkeg.hk2.hyhuawei.com:443/?sni=ffc60249-t53wg0-t92wi1-1qkeg.hk2.hyhuawei.com#🏳️ ??
