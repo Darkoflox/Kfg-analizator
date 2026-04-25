@@ -3,8 +3,8 @@ https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_android.txt
 https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_ios.txt
 https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_all_checked.txt
 https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_vless.txt
-https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_hysteria2.txt
 https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_trojan.txt
+https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_hysteria2.txt
 https://raw.githubusercontent.com/Darkoflox/Kfg-analizator/main/sub_ss.txt
 
 # Обходные ссылки (для регионов с блокировкой raw.githubusercontent.com)
@@ -20,12 +20,12 @@ https://cdn.jsdelivr.net/gh/Darkoflox/Kfg-analizator@main/sub_all_checked.txt
 # sub_vless.txt
 https://cdn.statically.io/gh/Darkoflox/Kfg-analizator/main/sub_vless.txt
 https://cdn.jsdelivr.net/gh/Darkoflox/Kfg-analizator@main/sub_vless.txt
-# sub_hysteria2.txt
-https://cdn.statically.io/gh/Darkoflox/Kfg-analizator/main/sub_hysteria2.txt
-https://cdn.jsdelivr.net/gh/Darkoflox/Kfg-analizator@main/sub_hysteria2.txt
 # sub_trojan.txt
 https://cdn.statically.io/gh/Darkoflox/Kfg-analizator/main/sub_trojan.txt
 https://cdn.jsdelivr.net/gh/Darkoflox/Kfg-analizator@main/sub_trojan.txt
+# sub_hysteria2.txt
+https://cdn.statically.io/gh/Darkoflox/Kfg-analizator/main/sub_hysteria2.txt
+https://cdn.jsdelivr.net/gh/Darkoflox/Kfg-analizator@main/sub_hysteria2.txt
 # sub_ss.txt
 https://cdn.statically.io/gh/Darkoflox/Kfg-analizator/main/sub_ss.txt
 https://cdn.jsdelivr.net/gh/Darkoflox/Kfg-analizator@main/sub_ss.txt
