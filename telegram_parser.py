@@ -4,7 +4,6 @@
 Собирает прокси-конфигурации, дедуплицирует и сохраняет в файл.
 """
 import asyncio
-import hashlib
 import logging
 import random
 import re
@@ -126,13 +125,15 @@ class TelegramParser:
                 delay = self.request_delay + random.uniform(0.5, 1.5)
                 await asyncio.sleep(delay)
             messages = await self.fetch_channel_messages(channel)
+            # Инициализируем links здесь, чтобы избежать ошибки с неопределённой переменной
+            links = []
             for message in messages:
-                links = self.extract_links(message)
-                for link in links:
-                    key = self.normalize_link(link)
-                    if key not in seen_keys:
-                        seen_keys.add(key)
-                        all_links.add(link)
+                links.extend(self.extract_links(message))
+            for link in links:
+                key = self.normalize_link(link)
+                if key not in seen_keys:
+                    seen_keys.add(key)
+                    all_links.add(link)
             logger.info(f"Канал {channel}: добавлено {len(links)} ссылок (уникальных всего: {len(all_links)})")
         logger.info(f"Всего собрано {len(all_links)} уникальных конфигураций из Telegram")
         return list(all_links)
