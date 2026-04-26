@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Финальный парсер «БС» с Xray‑проверкой через сервис определения IP.
-Автоматически определяет страну по IP (GeoIP) и отображает флаг.
+Финальный парсер «БС» с Xray‑проверкой через сервис определения IP и GeoIP.
+Android – ровно 5000 рабочих после Xray, iOS – 300 самых быстрых.
 """
 import asyncio, base64, hashlib, json, logging, os, random, re, socket, ssl, subprocess, tempfile, time
 from argparse import ArgumentParser
@@ -44,9 +44,9 @@ DEFAULT_SOURCES = [
 ]
 
 TG_USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 …',
+    'Mozilla/5.0 (Macintosh; …',
+    'Mozilla/5.0 (X11; …'
 ]
 TG_REQUEST_DELAY = 2.0
 TG_MIRRORS = [
@@ -196,7 +196,6 @@ class ProxyConfig:
         return self.raw
 
     def format_name(self) -> str:
-        # Определяем страну по IP (если есть) или по TLD
         country_code = None
         if self.resolved_ip:
             country_code = get_country(self.resolved_ip)
@@ -526,6 +525,7 @@ class SourceManager:
             with open(self.failed_file, 'a') as f: f.write(f"{url}\n")
         except Exception as e: logger.error(f"Не удалось записать {self.failed_file}: {e}")
 
+# ---------- Сохранение подписок ----------
 def save_subscriptions(configs, output_dir="."):
     out_path = Path(output_dir)
     out_path.mkdir(exist_ok=True)
@@ -535,14 +535,37 @@ def save_subscriptions(configs, output_dir="."):
     if not working:
         logger.warning("Нет рабочих конфигураций. Выходные файлы будут пустыми.")
         return
-    (out_path / "sub_android.txt").write_text(HEADER + "\n".join(f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in working[:5000]), encoding='utf-8')
-    ios_list = sorted(working, key=lambda x: x.latency if x.latency else 999999)[:300]
-    (out_path / "sub_ios.txt").write_text(HEADER + "\n".join(f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in ios_list), encoding='utf-8')
-    (out_path / "sub_all_checked.txt").write_text(HEADER + "\n".join(f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in working), encoding='utf-8')
+
+    # Android – ровно 5000 лучших по пингу из прошедших Xray
+    android_list = working[:5000]
+    (out_path / "sub_android.txt").write_text(
+        HEADER + "\n".join(f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in android_list),
+        encoding='utf-8'
+    )
+
+    # iOS – ровно 300 лучших по пингу из прошедших Xray
+    ios_list = working[:300]
+    (out_path / "sub_ios.txt").write_text(
+        HEADER + "\n".join(f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in ios_list),
+        encoding='utf-8'
+    )
+
+    # Общий файл (все прошедшие)
+    (out_path / "sub_all_checked.txt").write_text(
+        HEADER + "\n".join(f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in working),
+        encoding='utf-8'
+    )
+
+    # По протоколам (до 5000)
     for proto in SUPPORTED_PROTOCOLS:
         items = [c for c in working if c.protocol == proto]
         if items:
-            (out_path / f"sub_{proto}.txt").write_text(HEADER + "\n".join(f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in items[:5000]), encoding='utf-8')
+            (out_path / f"sub_{proto}.txt").write_text(
+                HEADER + "\n".join(f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in items[:5000]),
+                encoding='utf-8'
+            )
+
+    # Ссылки
     repo_user = "Darkoflox"; repo_name = "Kfg-analizator"; branch = "main"
     base = f"https://raw.githubusercontent.com/{repo_user}/{repo_name}/{branch}"
     cdn_statically = f"https://cdn.statically.io/gh/{repo_user}/{repo_name}/{branch}"
