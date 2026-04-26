@@ -1,42 +1,21 @@
 #!/usr/bin/env python3
 """
 Финальный парсер «БС» с Xray‑проверкой всех TCP+TLS конфигураций.
-Без фильтрации по UUID/паролям/портам — всё решает Xray.
-Оптимизирован для GitHub Actions.
+Увеличенная параллельность (20 потоков) для ускорения.
 """
-import asyncio
-import base64
-import hashlib
-import json
-import logging
-import os
-import random
-import re
-import socket
-import ssl
-import subprocess
-import tempfile
-import time
+import asyncio, base64, hashlib, json, logging, os, random, re, socket, ssl, subprocess, tempfile, time
 from argparse import ArgumentParser
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlparse, unquote
+import aiohttp, yaml
 
-import aiohttp
-import yaml
-
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
-)
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 SUPPORTED_PROTOCOLS = {'vmess', 'vless', 'trojan', 'ss', 'ssr', 'hysteria2', 'tuic'}
-PROXY_LINK_PATTERN = re.compile(
-    r'(vmess|vless|trojan|ss|ssr|hysteria2|tuic)://[^\s#]+',
-    re.IGNORECASE
-)
+PROXY_LINK_PATTERN = re.compile(r'(vmess|vless|trojan|ss|ssr|hysteria2|tuic)://[^\s#]+', re.IGNORECASE)
 
 TLD_FLAGS = {
     'ru': '🇷🇺', 'us': '🇺🇸', 'de': '🇩🇪', 'nl': '🇳🇱', 'fr': '🇫🇷', 'gb': '🇬🇧', 'uk': '🇬🇧',
@@ -49,10 +28,8 @@ TLD_FLAGS = {
     'by': '🇧🇾', 'lt': '🇱🇹', 'lv': '🇱🇻', 'ee': '🇪🇪', 'sk': '🇸🇰', 'si': '🇸🇮',
     'lu': '🇱🇺', 'mt': '🇲🇹', 'cy': '🇨🇾', 'is': '🇮🇸', 'ie': '🇮🇪', 'be': '🇧🇪',
 }
-
 TLD_TO_CODE = {tld: tld.upper() for tld in TLD_FLAGS}
 
-# Обновлённые живые источники (только те, что работают)
 DEFAULT_SOURCES = [
     "https://raw.githubusercontent.com/mahdibland/V2RayAggregator/master/sub/sub_merge.txt",
     "https://raw.githubusercontent.com/Maskkost93/kizyak-vpn-4.0/refs/heads/main/kizyakbeta6.txt",
@@ -66,8 +43,6 @@ TG_USER_AGENTS = [
     'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
 ]
 TG_REQUEST_DELAY = 2.0
-
-# Расширенный список зеркал Telegram
 TG_MIRRORS = [
     "https://tg.i-c-a.su/s/{}",
     "https://tlgrm.ru/s/{}",
@@ -77,12 +52,8 @@ TG_MIRRORS = [
 
 HEADER = "# profile-title: Niyakwi⚪ | БС | обновление каждые 6 часов\n# profile-update-interval: 6\n"
 
-# ------------------------------------------------------------
-# Инструменты для Xray‑проверки
-# ------------------------------------------------------------
 XRAY_URL = "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
-# Надёжный тестовый URL для GitHub Actions
-TEST_FILE_URL = "http://cp.cloudflare.com/"
+TEST_URL = "http://www.gstatic.com/generate_204"
 
 def ensure_xray() -> str:
     xray_bin = "xray"
@@ -117,31 +88,14 @@ def build_xray_config(cfg: dict, socks_port: int) -> dict:
         outbound["streamSettings"]["wsSettings"] = {"path": cfg["path"]}
 
     if cfg["protocol"] == "vmess":
-        outbound["settings"]["vnext"] = [{
-            "address": cfg["host"], "port": cfg["port"],
-            "users": [{"id": cfg.get("uuid", ""), "alterId": 0}]
-        }]
+        outbound["settings"]["vnext"] = [{"address": cfg["host"], "port": cfg["port"], "users": [{"id": cfg.get("uuid", ""), "alterId": 0}]}]
     elif cfg["protocol"] == "vless":
-        outbound["settings"]["vnext"] = [{
-            "address": cfg["host"], "port": cfg["port"],
-            "users": [{"id": cfg.get("uuid", ""), "encryption": "none"}]
-        }]
+        outbound["settings"]["vnext"] = [{"address": cfg["host"], "port": cfg["port"], "users": [{"id": cfg.get("uuid", ""), "encryption": "none"}]}]
     elif cfg["protocol"] == "trojan":
-        outbound["settings"]["servers"] = [{
-            "address": cfg["host"], "port": cfg["port"],
-            "password": cfg.get("password", "")
-        }]
+        outbound["settings"]["servers"] = [{"address": cfg["host"], "port": cfg["port"], "password": cfg.get("password", "")}]
     elif cfg["protocol"] == "ss":
-        outbound["settings"]["servers"] = [{
-            "address": cfg["host"], "port": cfg["port"],
-            "method": cfg.get("method", ""),
-            "password": cfg.get("password", "")
-        }]
-    return {
-        "log": {"loglevel": "warning"},
-        "inbounds": [{"listen": "127.0.0.1", "port": socks_port, "protocol": "socks"}],
-        "outbounds": [outbound]
-    }
+        outbound["settings"]["servers"] = [{"address": cfg["host"], "port": cfg["port"], "method": cfg.get("method", ""), "password": cfg.get("password", "")}]
+    return {"log": {"loglevel": "warning"}, "inbounds": [{"listen": "127.0.0.1", "port": socks_port, "protocol": "socks"}], "outbounds": [outbound]}
 
 def xray_proxy_test(cfg: dict, xray_path: str) -> bool:
     socks_port = _find_free_port()
@@ -151,41 +105,26 @@ def xray_proxy_test(cfg: dict, xray_path: str) -> bool:
         config_path = f.name
     proc = None
     try:
-        proc = subprocess.Popen(
-            [xray_path, "run", "-c", config_path],
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-        )
-        time.sleep(2.5)
-        cmd = [
-            "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
-            "--socks5-hostname", f"127.0.0.1:{socks_port}",
-            "--max-time", "10",
-            TEST_FILE_URL
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-        return result.stdout.strip() in ("200", "204", "301", "302")
+        proc = subprocess.Popen([xray_path, "run", "-c", config_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        time.sleep(1.5)
+        cmd = ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--socks5-hostname", f"127.0.0.1:{socks_port}", "--max-time", "8", TEST_URL]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+        return result.stdout.strip() in ("200", "204")
     except Exception:
         return False
     finally:
         if proc:
             proc.terminate()
-            try:
-                proc.wait(timeout=2)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-        try:
-            Path(config_path).unlink()
-        except Exception:
-            pass
+            try: proc.wait(timeout=1)
+            except: proc.kill()
+        try: Path(config_path).unlink()
+        except: pass
 
 def _find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
 
-# ------------------------------------------------------------
-# Модель конфигурации
-# ------------------------------------------------------------
 from dataclasses import dataclass, field
 
 @dataclass
@@ -209,10 +148,7 @@ class ProxyConfig:
     def __post_init__(self):
         if not self.remarks:
             self.remarks = f"{self.protocol.upper()}-{self.host}"
-
-    def to_uri(self) -> str:
-        return self.raw
-
+    def to_uri(self) -> str: return self.raw
     def format_name(self) -> str:
         parts = self.host.split('.')
         tld = parts[-1].lower() if len(parts) >= 2 else ''
@@ -220,11 +156,8 @@ class ProxyConfig:
         country_code = TLD_TO_CODE.get(tld, '??')
         return f"{flag} {country_code}"
 
-# ------------------------------------------------------------
-# Чекер (TCP+TLS → Xray для всех)
-# ------------------------------------------------------------
 class ProxyChecker:
-    def __init__(self, max_concurrent: int = 20, xray_max_concurrent: int = 10):
+    def __init__(self, max_concurrent: int = 20, xray_max_concurrent: int = 20):
         self.max_concurrent = max_concurrent
         self.xray_max_concurrent = xray_max_concurrent
         self.xray_path = ensure_xray()
@@ -232,58 +165,39 @@ class ProxyChecker:
     def _parse_uri(self, uri: str) -> Optional[ProxyConfig]:
         try:
             proto = uri.split('://')[0].lower()
-            if proto not in SUPPORTED_PROTOCOLS:
-                return None
+            if proto not in SUPPORTED_PROTOCOLS: return None
             parsed = urlparse(uri)
-            host = parsed.hostname
-            port = parsed.port
-            if not host or not port:
-                return None
+            host, port = parsed.hostname, parsed.port
+            if not host or not port: return None
             cfg = ProxyConfig(raw=uri, protocol=proto, host=host, port=port)
             if proto == 'vmess':
-                b64 = uri[8:]
-                b64 += '=' * ((4 - len(b64) % 4) % 4)
+                b64 = uri[8:] + '=' * ((4 - len(uri[8:]) % 4) % 4)
                 data = json.loads(base64.b64decode(b64).decode('utf-8'))
-                cfg.uuid = data.get('id')
-                cfg.transport = data.get('net', 'tcp')
+                cfg.uuid = data.get('id'); cfg.transport = data.get('net', 'tcp')
                 cfg.tls = 'tls' if data.get('tls') else 'none'
-                cfg.sni = data.get('sni') or data.get('host')
-                cfg.path = data.get('path')
+                cfg.sni = data.get('sni') or data.get('host'); cfg.path = data.get('path')
             elif proto == 'vless':
-                cfg.uuid = parsed.username
-                params = parse_qs(parsed.query)
-                cfg.transport = params.get('type', ['tcp'])[0]
-                cfg.tls = params.get('security', ['none'])[0]
-                cfg.sni = params.get('sni', [None])[0]
-                cfg.path = params.get('path', [None])[0]
+                cfg.uuid = parsed.username; params = parse_qs(parsed.query)
+                cfg.transport = params.get('type', ['tcp'])[0]; cfg.tls = params.get('security', ['none'])[0]
+                cfg.sni = params.get('sni', [None])[0]; cfg.path = params.get('path', [None])[0]
             elif proto == 'trojan':
-                cfg.password = parsed.username
-                params = parse_qs(parsed.query)
-                cfg.sni = params.get('sni', [None])[0]
-                cfg.tls = 'tls'
+                cfg.password = parsed.username; params = parse_qs(parsed.query)
+                cfg.sni = params.get('sni', [None])[0]; cfg.tls = 'tls'
             elif proto == 'ss':
                 userinfo = parsed.username
                 if userinfo:
                     decoded = base64.b64decode(userinfo).decode('utf-8')
                     cfg.method, cfg.password = decoded.split(':', 1)
             elif proto == 'hysteria2':
-                cfg.password = parsed.username
-                params = parse_qs(parsed.query)
-                cfg.sni = params.get('sni', [None])[0]
-                cfg.tls = 'tls'
-                cfg.transport = 'udp'
+                cfg.password = parsed.username; params = parse_qs(parsed.query)
+                cfg.sni = params.get('sni', [None])[0]; cfg.tls = 'tls'; cfg.transport = 'udp'
             elif proto == 'tuic':
                 parts = parsed.username.split(':') if parsed.username else []
-                if len(parts) >= 2:
-                    cfg.uuid = parts[0]
-                    cfg.password = parts[1]
+                if len(parts) >= 2: cfg.uuid, cfg.password = parts[0], parts[1]
                 params = parse_qs(parsed.query)
-                cfg.sni = params.get('sni', [None])[0]
-                cfg.tls = 'tls'
-                cfg.transport = 'udp'
+                cfg.sni = params.get('sni', [None])[0]; cfg.tls = 'tls'; cfg.transport = 'udp'
             return cfg
-        except Exception:
-            return None
+        except Exception: return None
 
     def _tcp_check(self, host: str, port: int, timeout: float = 3.0) -> Tuple[bool, float]:
         start = time.time()
@@ -293,160 +207,115 @@ class ProxyChecker:
             result = sock.connect_ex((host, port))
             sock.close()
             if result == 0:
-                latency = (time.time() - start) * 1000
-                return True, latency
-        except Exception:
-            pass
+                return True, (time.time() - start) * 1000
+        except Exception: pass
         return False, 0.0
 
     def _tls_check(self, host: str, port: int, sni: Optional[str] = None, timeout: float = 4.0) -> bool:
         try:
             context = ssl.create_default_context()
-            context.check_hostname = False
-            context.verify_mode = ssl.CERT_NONE
+            context.check_hostname = False; context.verify_mode = ssl.CERT_NONE
             with socket.create_connection((host, port), timeout=timeout) as sock:
-                with context.wrap_socket(sock, server_hostname=sni or host):
-                    return True
-        except Exception:
-            return False
+                with context.wrap_socket(sock, server_hostname=sni or host): return True
+        except Exception: return False
 
     def test_config_preliminary(self, cfg: ProxyConfig) -> Tuple[bool, float]:
-        """Быстрый TCP+TLS тест."""
         ok, latency = self._tcp_check(cfg.host, cfg.port)
-        if not ok:
-            return False, 0.0
-        if cfg.tls != 'none':
-            if not self._tls_check(cfg.host, cfg.port, cfg.sni):
-                return False, latency
+        if not ok: return False, 0.0
+        if cfg.tls != 'none' and not self._tls_check(cfg.host, cfg.port, cfg.sni): return False, latency
         return True, latency
 
     async def check_batch(self, configs: List[ProxyConfig]) -> List[ProxyConfig]:
-        # Этап 1: TCP+TLS (быстрый)
         total = len(configs)
-        checked = 0
         passed_prelim = []
-        start_time = time.time()
-        semaphore = asyncio.Semaphore(self.max_concurrent)
+        start = time.time()
+        sem = asyncio.Semaphore(self.max_concurrent)
         lock = asyncio.Lock()
-        heartbeat_task = None
+        checked = 0
 
-        async def heartbeat():
-            while True:
-                await asyncio.sleep(30)
-                logger.info("⏳ TCP+TLS проверка продолжается...")
-
-        async def pre_check(cfg: ProxyConfig):
+        async def pre_check(cfg):
             nonlocal checked
-            async with semaphore:
+            async with sem:
                 loop = asyncio.get_event_loop()
-                with ThreadPoolExecutor() as executor:
-                    ok, latency = await loop.run_in_executor(executor, self.test_config_preliminary, cfg)
-                if ok:
-                    cfg.latency = latency
+                with ThreadPoolExecutor() as ex:
+                    ok, lat = await loop.run_in_executor(ex, self.test_config_preliminary, cfg)
+                if ok: cfg.latency = lat
                 async with lock:
                     checked += 1
-                    if checked % 500 == 0 or checked == total:
-                        elapsed = time.time() - start_time
-                        rate = checked / elapsed if elapsed > 0 else 0
-                        logger.info(f"📊 TCP+TLS: {checked}/{total} (прошло: {len(passed_prelim)}) | {rate:.1f} конф/сек")
+                    if checked % 500 == 0:
+                        elapsed = time.time() - start
+                        logger.info(f"📊 TCP+TLS: {checked}/{total} (прошло: {len(passed_prelim)}) | {checked/elapsed:.1f} конф/сек")
                 if ok:
-                    async with lock:
-                        passed_prelim.append(cfg)
+                    async with lock: passed_prelim.append(cfg)
                 return cfg
 
-        if total > 1000:
-            heartbeat_task = asyncio.create_task(heartbeat())
-
-        tasks = [pre_check(cfg) for cfg in configs]
-        await asyncio.gather(*tasks)
-
-        if heartbeat_task:
-            heartbeat_task.cancel()
-
-        elapsed = time.time() - start_time
+        heartbeat = asyncio.create_task(self._heartbeat("TCP+TLS")) if total > 1000 else None
+        await asyncio.gather(*[pre_check(c) for c in configs])
+        if heartbeat: heartbeat.cancel()
+        elapsed = time.time() - start
         logger.info(f"✅ TCP+TLS завершён за {elapsed/60:.1f} мин. Прошло: {len(passed_prelim)} из {total}")
 
-        # Этап 2: Xray для всех прошедших
-        if not passed_prelim:
-            logger.warning("Нет конфигураций для Xray‑проверки.")
-            return []
+        if not passed_prelim: return []
 
         xray_total = len(passed_prelim)
-        xray_checked = 0
         xray_working = []
         xray_start = time.time()
-        xray_semaphore = asyncio.Semaphore(self.xray_max_concurrent)
+        xray_sem = asyncio.Semaphore(self.xray_max_concurrent)
         xray_lock = asyncio.Lock()
+        xray_checked = 0
 
-        async def xray_heartbeat():
-            while True:
-                await asyncio.sleep(30)
-                logger.info("⏳ Xray проверка продолжается...")
-
-        async def xray_check(cfg: ProxyConfig):
+        async def xray_check(cfg):
             nonlocal xray_checked
-            async with xray_semaphore:
+            async with xray_sem:
                 loop = asyncio.get_event_loop()
-                with ThreadPoolExecutor() as executor:
-                    ok = await loop.run_in_executor(executor, xray_proxy_test, vars(cfg), self.xray_path)
-                if ok:
-                    cfg.working = True
+                with ThreadPoolExecutor() as ex:
+                    ok = await loop.run_in_executor(ex, xray_proxy_test, vars(cfg), self.xray_path)
+                if ok: cfg.working = True
                 async with xray_lock:
                     xray_checked += 1
-                    if xray_checked % 100 == 0 or xray_checked == xray_total:
+                    if xray_checked % 100 == 0:
                         elapsed_x = time.time() - xray_start
-                        rate_x = xray_checked / elapsed_x if elapsed_x > 0 else 0
-                        logger.info(f"📊 Xray: {xray_checked}/{xray_total} (рабочих: {len(xray_working)}) | {rate_x:.1f} конф/сек")
+                        logger.info(f"📊 Xray: {xray_checked}/{xray_total} (рабочих: {len(xray_working)}) | {xray_checked/elapsed_x:.1f} конф/сек")
                 if ok:
-                    async with xray_lock:
-                        xray_working.append(cfg)
+                    async with xray_lock: xray_working.append(cfg)
                 return cfg
 
-        xray_heartbeat_task = asyncio.create_task(xray_heartbeat()) if xray_total > 50 else None
-
-        xray_tasks = [xray_check(cfg) for cfg in passed_prelim]
-        await asyncio.gather(*xray_tasks)
-
-        if xray_heartbeat_task:
-            xray_heartbeat_task.cancel()
-
+        xray_heartbeat = asyncio.create_task(self._heartbeat("Xray")) if xray_total > 50 else None
+        await asyncio.gather(*[xray_check(c) for c in passed_prelim])
+        if xray_heartbeat: xray_heartbeat.cancel()
         elapsed_x = time.time() - xray_start
         logger.info(f"✅ Xray завершён за {elapsed_x/60:.1f} мин. Рабочих: {len(xray_working)} из {xray_total}")
         return xray_working
 
-# ------------------------------------------------------------
-# Парсер подписок
-# ------------------------------------------------------------
+    async def _heartbeat(self, name):
+        while True:
+            await asyncio.sleep(30)
+            logger.info(f"⏳ {name} проверка продолжается...")
+
 class SubscriptionParser:
-    def __init__(self, timeout: int = 30, max_concurrent: int = 10, parse_telegram: bool = False):
-        self.timeout = timeout
-        self.semaphore = asyncio.Semaphore(max_concurrent)
-        self.session: Optional[aiohttp.ClientSession] = None
-        self.checker = ProxyChecker()
+    def __init__(self, timeout=30, max_concurrent=10, parse_telegram=False):
+        self.timeout = timeout; self.semaphore = asyncio.Semaphore(max_concurrent)
+        self.session = None; self.checker = ProxyChecker()
         self.source_manager = SourceManager()
         self.parse_telegram = parse_telegram
 
     async def __aenter__(self):
-        connector = aiohttp.TCPConnector(limit=0, ssl=False)
-        self.session = aiohttp.ClientSession(connector=connector,
-                                            timeout=aiohttp.ClientTimeout(total=self.timeout))
+        conn = aiohttp.TCPConnector(limit=0, ssl=False)
+        self.session = aiohttp.ClientSession(connector=conn, timeout=aiohttp.ClientTimeout(total=self.timeout))
         return self
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self.session:
-            await self.session.close()
+    async def __aexit__(self, *args):
+        if self.session: await self.session.close()
 
-    async def fetch_content(self, url: str) -> Optional[str]:
+    async def fetch_content(self, url):
         try:
             async with self.semaphore:
-                async with self.session.get(url) as response:
-                    response.raise_for_status()
-                    return await response.text()
-        except Exception as e:
-            logger.warning(f"Ошибка загрузки {url}: {e}")
-            return None
+                async with self.session.get(url) as resp:
+                    resp.raise_for_status()
+                    return await resp.text()
+        except Exception as e: logger.warning(f"Ошибка загрузки {url}: {e}"); return None
 
-    def decode_subscription(self, content: str) -> List[str]:
+    def decode_subscription(self, content):
         if content.strip().startswith(('proxies:', 'Proxy:')):
             try:
                 data = yaml.safe_load(content)
@@ -455,123 +324,92 @@ class SubscriptionParser:
                 for p in proxies:
                     t = p.get('type', '').lower()
                     if t == 'vmess':
-                        b64 = base64.b64encode(json.dumps({
-                            "v": "2", "ps": p.get('name', ''),
-                            "add": p['server'], "port": str(p['port']),
-                            "id": p['uuid'], "aid": 0, "net": p.get('network', 'tcp')
-                        }).encode()).decode()
+                        b64 = base64.b64encode(json.dumps({"v":"2","ps":p.get('name',''),"add":p['server'],"port":str(p['port']),"id":p['uuid'],"aid":0,"net":p.get('network','tcp')}).encode()).decode()
                         links.append(f"vmess://{b64}")
                     elif t == 'ss':
-                        userinfo = base64.b64encode(
-                            f"{p['cipher']}:{p['password']}".encode()
-                        ).decode().rstrip('=')
+                        userinfo = base64.b64encode(f"{p['cipher']}:{p['password']}".encode()).decode().rstrip('=')
                         links.append(f"ss://{userinfo}@{p['server']}:{p['port']}#{p.get('name','')}")
                     elif t == 'trojan':
-                        links.append(
-                            f"trojan://{p['password']}@{p['server']}:{p['port']}?sni={p.get('sni','')}#{p.get('name','')}")
+                        links.append(f"trojan://{p['password']}@{p['server']}:{p['port']}?sni={p.get('sni','')}#{p.get('name','')}")
                     elif t == 'vless':
-                        links.append(
-                            f"vless://{p['uuid']}@{p['server']}:{p['port']}?security={p.get('security','none')}&type={p.get('network','tcp')}#{p.get('name','')}")
-                if links:
-                    return links
-            except Exception:
-                pass
+                        links.append(f"vless://{p['uuid']}@{p['server']}:{p['port']}?security={p.get('security','none')}&type={p.get('network','tcp')}#{p.get('name','')}")
+                if links: return links
+            except Exception: pass
         try:
             decoded = base64.b64decode(content, validate=True).decode('utf-8', errors='ignore')
-            if any(p in decoded for p in SUPPORTED_PROTOCOLS):
-                return decoded.splitlines()
-        except Exception:
-            pass
+            if any(p in decoded for p in SUPPORTED_PROTOCOLS): return decoded.splitlines()
+        except Exception: pass
         return content.splitlines()
 
-    def extract_links(self, text: str) -> List[str]:
+    def extract_links(self, text):
         links = []
         for match in PROXY_LINK_PATTERN.finditer(text):
             link = match.group(0)
             for proto in SUPPORTED_PROTOCOLS:
                 idx = link.find(f"{proto}://")
-                if idx != -1:
-                    link = link[idx:]
-                    break
+                if idx != -1: link = link[idx:]; break
             links.append(link)
         return links
 
-    async def parse_subscription(self, url: str) -> List[ProxyConfig]:
+    async def parse_subscription(self, url):
         content = await self.fetch_content(url)
-        if not content:
-            return []
+        if not content: return []
         configs = []
-        lines = self.decode_subscription(content)
-        for line in lines:
+        for line in self.decode_subscription(content):
             for link in self.extract_links(line):
                 cfg = self.checker._parse_uri(link)
-                if cfg:
-                    configs.append(cfg)
+                if cfg: configs.append(cfg)
         logger.info(f"Из {url} извлечено {len(configs)} конфигураций")
         return configs
 
-    async def _fetch_tg_page(self, username: str) -> Optional[str]:
-        for mirror_template in TG_MIRRORS:
-            url = mirror_template.format(username)
+    async def _fetch_tg_page(self, username):
+        for mirror in TG_MIRRORS:
+            url = mirror.format(username)
             headers = {'User-Agent': random.choice(TG_USER_AGENTS)}
             try:
                 async with self.session.get(url, headers=headers, allow_redirects=True) as resp:
-                    if resp.status == 200:
-                        return await resp.text()
-            except Exception:
-                continue
+                    if resp.status == 200: return await resp.text()
+            except Exception: continue
         return None
 
-    async def _parse_telegram_channels(self) -> List[ProxyConfig]:
+    async def _parse_telegram_channels(self):
         tg_file = Path("sources_tg.txt")
-        if not tg_file.exists():
-            return []
+        if not tg_file.exists(): return []
         channels = []
-        with open(tg_file, 'r') as f:
+        with open(tg_file) as f:
             for line in f:
                 line = line.strip()
-                if not line or line.startswith('#'):
-                    continue
+                if not line or line.startswith('#'): continue
                 username = line
-                if username.startswith('@'):
-                    username = username[1:]
-                elif 't.me/' in username:
-                    parts = username.split('/')
-                    if len(parts) >= 2:
-                        username = parts[-1]
+                if username.startswith('@'): username = username[1:]
+                elif 't.me/' in username: username = username.split('/')[-1]
                 channels.append(username)
-        if not channels:
-            return []
+        if not channels: return []
         logger.info(f"Начинаем сбор из {len(channels)} Telegram-каналов...")
         all_configs = []
         seen_keys = set()
         for i, channel in enumerate(channels):
-            if i > 0:
-                await asyncio.sleep(TG_REQUEST_DELAY + random.uniform(0.5, 1.5))
+            if i > 0: await asyncio.sleep(TG_REQUEST_DELAY + random.uniform(0.5, 1.5))
             html = await self._fetch_tg_page(channel)
-            if not html:
-                continue
+            if not html: continue
             messages = []
             for block in re.findall(r'<div class="tgme_widget_message_text">(.*?)</div>', html, re.DOTALL):
                 text = re.sub(r'<[^>]+>', '', block).strip()
-                if text:
-                    messages.append(text)
+                if text: messages.append(text)
             if not messages:
                 for block in re.findall(r'<div class="tgme_widget_message_text"[^>]*>(.*?)</div>', html, re.DOTALL):
                     text = re.sub(r'<[^>]+>', '', block).strip()
-                    if text:
-                        messages.append(text)
+                    if text: messages.append(text)
             if not messages:
                 direct_links = self.extract_links(html)
-                if direct_links:
-                    for link in direct_links:
-                        cfg = self.checker._parse_uri(link)
-                        if cfg:
-                            key = f"{cfg.host}:{cfg.port}:{cfg.uuid or cfg.password or cfg.method}"
-                            if key not in seen_keys:
-                                seen_keys.add(key)
-                                all_configs.append(cfg)
-                    continue
+                for link in direct_links:
+                    cfg = self.checker._parse_uri(link)
+                    if cfg:
+                        key = f"{cfg.host}:{cfg.port}:{cfg.uuid or cfg.password or cfg.method}"
+                        if key not in seen_keys:
+                            seen_keys.add(key)
+                            all_configs.append(cfg)
+                continue
             channel_links = []
             for msg in messages[:20]:
                 channel_links.extend(self.extract_links(msg))
@@ -586,19 +424,17 @@ class SubscriptionParser:
         logger.info(f"Telegram-сбор завершён: {len(all_configs)} конфигураций")
         return all_configs
 
-    async def collect_all(self) -> List[ProxyConfig]:
+    async def collect_all(self):
         sources = self.source_manager.load_sources()
         tasks = [self.parse_subscription(url) for url in sources]
         results = await asyncio.gather(*tasks, return_exceptions=True)
         all_configs = []
-        for result in results:
-            if isinstance(result, list):
-                all_configs.extend(result)
+        for r in results:
+            if isinstance(r, list): all_configs.extend(r)
         if self.parse_telegram:
             tg_configs = await self._parse_telegram_channels()
             all_configs.extend(tg_configs)
-        seen = set()
-        unique = []
+        seen, unique = set(), []
         for cfg in all_configs:
             key = f"{cfg.host}:{cfg.port}:{cfg.uuid or cfg.password or cfg.method}"
             if key not in seen:
@@ -607,44 +443,33 @@ class SubscriptionParser:
         logger.info(f"Всего собрано {len(unique)} уникальных конфигураций")
         return unique
 
-# ------------------------------------------------------------
-# SourceManager
-# ------------------------------------------------------------
 class SourceManager:
     def __init__(self, sources_file="sources.txt", failed_file="failed_sources.txt"):
-        self.sources_file = sources_file
-        self.failed_file = failed_file
+        self.sources_file = sources_file; self.failed_file = failed_file
 
-    def load_sources(self) -> List[str]:
+    def load_sources(self):
         try:
-            with open(self.sources_file, 'r') as f:
+            with open(self.sources_file) as f:
                 all_sources = [line.strip() for line in f if line.strip() and not line.startswith('#')]
         except FileNotFoundError:
             logger.warning(f"Файл {self.sources_file} не найден, использую примеры")
             all_sources = DEFAULT_SOURCES
             with open(self.sources_file, 'w') as f:
                 f.write("# Список источников подписок\n")
-                for url in all_sources:
-                    f.write(f"{url}\n")
+                for url in all_sources: f.write(f"{url}\n")
         failed = set()
         if Path(self.failed_file).exists():
-            with open(self.failed_file, 'r') as f:
-                failed = {line.strip() for line in f if line.strip()}
+            with open(self.failed_file) as f: failed = {line.strip() for line in f if line.strip()}
         active = [url for url in all_sources if url not in failed]
         logger.info(f"Активных источников: {len(active)} (пропущено проблемных: {len(failed)})")
         return active
 
-    def mark_failed(self, url: str):
+    def mark_failed(self, url):
         try:
-            with open(self.failed_file, 'a') as f:
-                f.write(f"{url}\n")
-        except Exception as e:
-            logger.error(f"Не удалось записать {self.failed_file}: {e}")
+            with open(self.failed_file, 'a') as f: f.write(f"{url}\n")
+        except Exception as e: logger.error(f"Не удалось записать {self.failed_file}: {e}")
 
-# ------------------------------------------------------------
-# Сохранение подписок
-# ------------------------------------------------------------
-def save_subscriptions(configs: List[ProxyConfig], output_dir: str = "."):
+def save_subscriptions(configs, output_dir="."):
     out_path = Path(output_dir)
     out_path.mkdir(exist_ok=True)
     working = [c for c in configs if c.working]
@@ -653,59 +478,32 @@ def save_subscriptions(configs: List[ProxyConfig], output_dir: str = "."):
     if not working:
         logger.warning("Нет рабочих конфигураций. Выходные файлы будут пустыми.")
         return
-    # Android
-    android_list = working[:5000]
-    with open(out_path / "sub_android.txt", "w", encoding='utf-8') as f:
-        f.write(HEADER)
-        for c in android_list:
-            f.write(f"{c.to_uri().split('#')[0]}#{c.format_name()}\n")
-    # iOS (топ-300 по пингу)
+    (out_path / "sub_android.txt").write_text(HEADER + "\n".join(f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in working[:5000]), encoding='utf-8')
     ios_list = sorted(working, key=lambda x: x.latency if x.latency else 999999)[:300]
-    with open(out_path / "sub_ios.txt", "w", encoding='utf-8') as f:
-        f.write(HEADER)
-        for c in ios_list:
-            f.write(f"{c.to_uri().split('#')[0]}#{c.format_name()}\n")
-    # Все проверенные
-    with open(out_path / "sub_all_checked.txt", "w", encoding='utf-8') as f:
-        f.write(HEADER)
-        for c in working:
-            f.write(f"{c.to_uri().split('#')[0]}#{c.format_name()}\n")
-    # По протоколам
+    (out_path / "sub_ios.txt").write_text(HEADER + "\n".join(f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in ios_list), encoding='utf-8')
+    (out_path / "sub_all_checked.txt").write_text(HEADER + "\n".join(f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in working), encoding='utf-8')
     for proto in SUPPORTED_PROTOCOLS:
-        proto_list = [c for c in working if c.protocol == proto]
-        if proto_list:
-            with open(out_path / f"sub_{proto}.txt", "w", encoding='utf-8') as f:
-                f.write(HEADER)
-                for c in proto_list[:5000]:
-                    f.write(f"{c.to_uri().split('#')[0]}#{c.format_name()}\n")
-    # Ссылки
-    repo_user = "Darkoflox"
-    repo_name = "Kfg-analizator"
-    branch = "main"
+        items = [c for c in working if c.protocol == proto]
+        if items:
+            (out_path / f"sub_{proto}.txt").write_text(HEADER + "\n".join(f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in items[:5000]), encoding='utf-8')
+    repo_user = "Darkoflox"; repo_name = "Kfg-analizator"; branch = "main"
     base = f"https://raw.githubusercontent.com/{repo_user}/{repo_name}/{branch}"
     cdn_statically = f"https://cdn.statically.io/gh/{repo_user}/{repo_name}/{branch}"
     cdn_jsdelivr = f"https://cdn.jsdelivr.net/gh/{repo_user}/{repo_name}@{branch}"
-    sub_files = ["sub_android.txt", "sub_ios.txt", "sub_all_checked.txt"] + \
-                [f"sub_{proto}.txt" for proto in SUPPORTED_PROTOCOLS if (out_path / f"sub_{proto}.txt").exists()]
+    sub_files = ["sub_android.txt", "sub_ios.txt", "sub_all_checked.txt"] + [f"sub_{p}.txt" for p in SUPPORTED_PROTOCOLS if (out_path / f"sub_{p}.txt").exists()]
     with open(out_path / "subscription_urls.txt", "w", encoding='utf-8') as f:
         f.write("# Прямые ссылки (основные)\n")
-        for sf in sub_files:
-            f.write(f"{base}/{sf}\n")
+        for sf in sub_files: f.write(f"{base}/{sf}\n")
         f.write("\n# Обходные ссылки (для регионов с блокировкой raw.githubusercontent.com)\n")
         for sf in sub_files:
-            f.write(f"# {sf}\n")
-            f.write(f"{cdn_statically}/{sf}\n")
-            f.write(f"{cdn_jsdelivr}/{sf}\n")
+            f.write(f"# {sf}\n{cdn_statically}/{sf}\n{cdn_jsdelivr}/{sf}\n")
     logger.info(f"🔗 Файл со ссылками: {out_path / 'subscription_urls.txt'}")
 
-# ------------------------------------------------------------
-# Точка входа
-# ------------------------------------------------------------
 async def main():
     parser_arg = ArgumentParser()
-    parser_arg.add_argument('--threads', type=int, default=20, help='Число потоков TCP+TLS')
-    parser_arg.add_argument('--xray-threads', type=int, default=8, help='Число потоков Xray (меньше из-за нагрузки)')
-    parser_arg.add_argument('--parse-telegram', action='store_true', help='Включить сбор из Telegram-каналов')
+    parser_arg.add_argument('--threads', type=int, default=30)
+    parser_arg.add_argument('--xray-threads', type=int, default=20)
+    parser_arg.add_argument('--parse-telegram', action='store_true')
     args = parser_arg.parse_args()
 
     async with SubscriptionParser(timeout=60, max_concurrent=5, parse_telegram=args.parse_telegram) as parser:
