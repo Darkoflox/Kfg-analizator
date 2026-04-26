@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Финальный парсер «БС» с Xray‑проверкой всех TCP+TLS конфигураций.
-Увеличенная параллельность (20 потоков) для ускорения.
+Финальный парсер «БС» с Xray‑проверкой через сервис определения IP.
+Автоматически определяет страну по IP (GeoIP) и отображает флаг.
 """
 import asyncio, base64, hashlib, json, logging, os, random, re, socket, ssl, subprocess, tempfile, time
 from argparse import ArgumentParser
@@ -10,6 +10,12 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlparse, unquote
 import aiohttp, yaml
+
+try:
+    import geoip2.database
+    GEOIP_AVAILABLE = True
+except ImportError:
+    GEOIP_AVAILABLE = False
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
@@ -53,8 +59,40 @@ TG_MIRRORS = [
 HEADER = "# profile-title: Niyakwi⚪ | БС | обновление каждые 6 часов\n# profile-update-interval: 6\n"
 
 XRAY_URL = "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
-TEST_URL = "http://www.gstatic.com/generate_204"
+IP_SERVICE_URL = "http://ifconfig.me"
+GEOIP_DB_URL = "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-Country.mmdb"
 
+# ---------- GeoIP ----------
+def load_geoip():
+    if not GEOIP_AVAILABLE:
+        return None
+    db_path = Path("GeoLite2-Country.mmdb")
+    if not db_path.exists():
+        logger.info("📥 Скачиваем GeoIP базу...")
+        import urllib.request
+        try:
+            urllib.request.urlretrieve(GEOIP_DB_URL, db_path)
+        except Exception as e:
+            logger.error(f"Не удалось скачать GeoIP базу: {e}")
+            return None
+    try:
+        return geoip2.database.Reader(str(db_path))
+    except Exception as e:
+        logger.error(f"Ошибка загрузки GeoIP: {e}")
+        return None
+
+geoip_reader = load_geoip()
+
+def get_country(ip: str) -> Optional[str]:
+    if not geoip_reader:
+        return None
+    try:
+        response = geoip_reader.country(ip)
+        return response.country.iso_code
+    except Exception:
+        return None
+
+# ---------- Xray ----------
 def ensure_xray() -> str:
     xray_bin = "xray"
     if Path(xray_bin).exists():
@@ -97,7 +135,7 @@ def build_xray_config(cfg: dict, socks_port: int) -> dict:
         outbound["settings"]["servers"] = [{"address": cfg["host"], "port": cfg["port"], "method": cfg.get("method", ""), "password": cfg.get("password", "")}]
     return {"log": {"loglevel": "warning"}, "inbounds": [{"listen": "127.0.0.1", "port": socks_port, "protocol": "socks"}], "outbounds": [outbound]}
 
-def xray_proxy_test(cfg: dict, xray_path: str) -> bool:
+def xray_proxy_test(cfg: dict, xray_path: str) -> Tuple[bool, Optional[str]]:
     socks_port = _find_free_port()
     config = build_xray_config(cfg, socks_port)
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
@@ -107,11 +145,14 @@ def xray_proxy_test(cfg: dict, xray_path: str) -> bool:
     try:
         proc = subprocess.Popen([xray_path, "run", "-c", config_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         time.sleep(1.5)
-        cmd = ["curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "--socks5-hostname", f"127.0.0.1:{socks_port}", "--max-time", "8", TEST_URL]
+        cmd = ["curl", "-s", "--socks5-hostname", f"127.0.0.1:{socks_port}", "--max-time", "8", IP_SERVICE_URL]
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
-        return result.stdout.strip() in ("200", "204")
+        ip = result.stdout.strip()
+        if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", ip):
+            return True, ip
+        return False, None
     except Exception:
-        return False
+        return False, None
     finally:
         if proc:
             proc.terminate()
@@ -125,6 +166,7 @@ def _find_free_port() -> int:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
 
+# ---------- Модель ----------
 from dataclasses import dataclass, field
 
 @dataclass
@@ -142,20 +184,32 @@ class ProxyConfig:
     path: Optional[str] = None
     latency: Optional[float] = None
     working: bool = False
+    resolved_ip: Optional[str] = None
     remarks: Optional[str] = None
     id: str = field(default_factory=lambda: hashlib.md5(str(random.random()).encode()).hexdigest()[:8])
 
     def __post_init__(self):
         if not self.remarks:
             self.remarks = f"{self.protocol.upper()}-{self.host}"
-    def to_uri(self) -> str: return self.raw
-    def format_name(self) -> str:
-        parts = self.host.split('.')
-        tld = parts[-1].lower() if len(parts) >= 2 else ''
-        flag = TLD_FLAGS.get(tld, '🏳️')
-        country_code = TLD_TO_CODE.get(tld, '??')
-        return f"{flag} {country_code}"
 
+    def to_uri(self) -> str:
+        return self.raw
+
+    def format_name(self) -> str:
+        # Определяем страну по IP (если есть) или по TLD
+        country_code = None
+        if self.resolved_ip:
+            country_code = get_country(self.resolved_ip)
+        if not country_code:
+            parts = self.host.split('.')
+            tld = parts[-1].lower() if len(parts) >= 2 else ''
+            country_code = TLD_TO_CODE.get(tld)
+        if country_code:
+            flag = TLD_FLAGS.get(country_code.lower(), '🏳️')
+            return f"{flag} {country_code.upper()}"
+        return "🏳️ ??"
+
+# ---------- Чекер ----------
 class ProxyChecker:
     def __init__(self, max_concurrent: int = 20, xray_max_concurrent: int = 20):
         self.max_concurrent = max_concurrent
@@ -269,8 +323,10 @@ class ProxyChecker:
             async with xray_sem:
                 loop = asyncio.get_event_loop()
                 with ThreadPoolExecutor() as ex:
-                    ok = await loop.run_in_executor(ex, xray_proxy_test, vars(cfg), self.xray_path)
-                if ok: cfg.working = True
+                    ok, ip = await loop.run_in_executor(ex, xray_proxy_test, vars(cfg), self.xray_path)
+                if ok:
+                    cfg.working = True
+                    cfg.resolved_ip = ip
                 async with xray_lock:
                     xray_checked += 1
                     if xray_checked % 100 == 0:
@@ -292,6 +348,7 @@ class ProxyChecker:
             await asyncio.sleep(30)
             logger.info(f"⏳ {name} проверка продолжается...")
 
+# ---------- Парсер ----------
 class SubscriptionParser:
     def __init__(self, timeout=30, max_concurrent=10, parse_telegram=False):
         self.timeout = timeout; self.semaphore = asyncio.Semaphore(max_concurrent)
