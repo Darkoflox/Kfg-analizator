@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-Финальный парсер для «белых списков» без фильтрации по подсетям.
-Трёхэтапная проверка: TCP+TLS → прокси-тест через Xray с загрузкой >20 КБ.
+Финальный парсер для «белых списков».
+Два режима проверки:
+- По умолчанию: TCP+TLS (надёжно, >1000 рабочих)
+- Опционально: Xray с загрузкой >20 КБ (флаг --force-xray)
 Ограничения: Android ≤5000, iOS ≤300.
 """
 import asyncio
@@ -81,7 +83,7 @@ TG_MIRRORS = [
 HEADER = "# profile-title: Niyakwi⚪ | БС | обновление каждые 6 часов\n# profile-update-interval: 6\n"
 
 # ------------------------------------------------------------
-# Инструменты для проверки
+# Инструменты для Xray (только при --force-xray)
 # ------------------------------------------------------------
 XRAY_URL = "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
 TEST_FILE_URL = "http://proof.ovh.net/files/10Mb.dat"
@@ -230,12 +232,13 @@ class ProxyConfig:
         return f"{flag} {country_code}"
 
 # ------------------------------------------------------------
-# Чекер (TCP+TLS + Xray без фильтрации по подсетям)
+# Чекер
 # ------------------------------------------------------------
 class ProxyChecker:
-    def __init__(self, max_concurrent: int = 20):
+    def __init__(self, max_concurrent: int = 20, force_xray: bool = False):
         self.max_concurrent = max_concurrent
-        self.xray_path = ensure_xray()
+        self.force_xray = force_xray
+        self.xray_path = ensure_xray() if force_xray else None
 
     def _parse_uri(self, uri: str) -> Optional[ProxyConfig]:
         try:
@@ -318,12 +321,18 @@ class ProxyChecker:
             except Exception:
                 return False, latency
 
-        # Xray прокси-тест
-        ok = xray_proxy_test(vars(cfg), self.xray_path)
-        if ok:
-            cfg.working = True
-            cfg.latency = latency
-        return ok, latency
+        # Xray (только при force_xray)
+        if self.force_xray:
+            ok = xray_proxy_test(vars(cfg), self.xray_path)
+            if ok:
+                cfg.working = True
+                cfg.latency = latency
+            return ok, latency
+
+        # Без Xray считаем конфигурацию рабочей после TCP+TLS
+        cfg.working = True
+        cfg.latency = latency
+        return True, latency
 
     async def check_batch(self, configs: List[ProxyConfig]) -> List[ProxyConfig]:
         total = len(configs)
@@ -356,17 +365,19 @@ class ProxyChecker:
 # Парсер подписок
 # ------------------------------------------------------------
 class SubscriptionParser:
-    def __init__(self, timeout: int = 30, max_concurrent: int = 10, parse_telegram: bool = False):
+    def __init__(self, timeout: int = 30, max_concurrent: int = 10,
+                 parse_telegram: bool = False, force_xray: bool = False):
         self.timeout = timeout
         self.semaphore = asyncio.Semaphore(max_concurrent)
         self.session: Optional[aiohttp.ClientSession] = None
-        self.checker = ProxyChecker()
+        self.checker = ProxyChecker(force_xray=force_xray)
         self.source_manager = SourceManager()
         self.parse_telegram = parse_telegram
 
     async def __aenter__(self):
         connector = aiohttp.TCPConnector(limit=0, ssl=False)
-        self.session = aiohttp.ClientSession(connector=connector, timeout=aiohttp.ClientTimeout(total=self.timeout))
+        self.session = aiohttp.ClientSession(connector=connector,
+                                            timeout=aiohttp.ClientTimeout(total=self.timeout))
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
@@ -399,12 +410,16 @@ class SubscriptionParser:
                         }).encode()).decode()
                         links.append(f"vmess://{b64}")
                     elif t == 'ss':
-                        userinfo = base64.b64encode(f"{p['cipher']}:{p['password']}".encode()).decode().rstrip('=')
+                        userinfo = base64.b64encode(
+                            f"{p['cipher']}:{p['password']}".encode()
+                        ).decode().rstrip('=')
                         links.append(f"ss://{userinfo}@{p['server']}:{p['port']}#{p.get('name','')}")
                     elif t == 'trojan':
-                        links.append(f"trojan://{p['password']}@{p['server']}:{p['port']}?sni={p.get('sni','')}#{p.get('name','')}")
+                        links.append(
+                            f"trojan://{p['password']}@{p['server']}:{p['port']}?sni={p.get('sni','')}#{p.get('name','')}")
                     elif t == 'vless':
-                        links.append(f"vless://{p['uuid']}@{p['server']}:{p['port']}?security={p.get('security','none')}&type={p.get('network','tcp')}#{p.get('name','')}")
+                        links.append(
+                            f"vless://{p['uuid']}@{p['server']}:{p['port']}?security={p.get('security','none')}&type={p.get('network','tcp')}#{p.get('name','')}")
                 if links:
                     return links
             except Exception:
@@ -541,7 +556,7 @@ class SubscriptionParser:
         return unique
 
 # ------------------------------------------------------------
-# SourceManager (стандартный)
+# SourceManager
 # ------------------------------------------------------------
 class SourceManager:
     def __init__(self, sources_file="sources.txt", failed_file="failed_sources.txt"):
@@ -638,9 +653,12 @@ async def main():
     parser_arg = ArgumentParser()
     parser_arg.add_argument('--threads', type=int, default=20, help='Число потоков проверки')
     parser_arg.add_argument('--parse-telegram', action='store_true', help='Включить сбор из Telegram-каналов')
+    parser_arg.add_argument('--force-xray', action='store_true', help='Включить проверку через Xray с загрузкой файла')
     args = parser_arg.parse_args()
 
-    async with SubscriptionParser(timeout=60, max_concurrent=5, parse_telegram=args.parse_telegram) as parser:
+    async with SubscriptionParser(timeout=60, max_concurrent=5,
+                                 parse_telegram=args.parse_telegram,
+                                 force_xray=args.force_xray) as parser:
         parser.checker.max_concurrent = args.threads
         configs = await parser.collect_all()
         if configs:
