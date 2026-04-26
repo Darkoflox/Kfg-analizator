@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Wi‑Fi парсер (ЧС) с улучшенной фильтрацией и проверкой.
-Гарантирует, что в подписке только действительно рабочие конфигурации.
+Финальный парсер «БС» с Xray‑проверкой всех TCP+TLS конфигураций.
+Без фильтрации по UUID/паролям/портам — всё решает Xray.
+Оптимизирован для GitHub Actions.
 """
 import asyncio
 import base64
@@ -13,6 +14,8 @@ import random
 import re
 import socket
 import ssl
+import subprocess
+import tempfile
 import time
 from argparse import ArgumentParser
 from concurrent.futures import ThreadPoolExecutor
@@ -49,16 +52,12 @@ TLD_FLAGS = {
 
 TLD_TO_CODE = {tld: tld.upper() for tld in TLD_FLAGS}
 
+# Обновлённые живые источники (только те, что работают)
 DEFAULT_SOURCES = [
-    "https://raw.githubusercontent.com/vfarid/v2ray-share/main/all_links.txt",
     "https://raw.githubusercontent.com/mahdibland/V2RayAggregator/master/sub/sub_merge.txt",
-    "https://raw.githubusercontent.com/yebekhe/TVIP/main/all",
-    "https://raw.githubusercontent.com/LalatinaHub/Mineralhe/main/all.txt",
-    "https://raw.githubusercontent.com/Lonelystar/v2ray-configs/main/all.txt",
-    "https://raw.githubusercontent.com/SamanGoli66/v2ray-configs/main/v2ray-clients",
-    "https://raw.githubusercontent.com/Pawel-S-K/free-v2ray-config/main/sub",
-    "https://raw.githubusercontent.com/Emsis/v2ray-configs/main/configs.txt",
-    "https://raw.githubusercontent.com/Bypass-LAN/V2ray/main/Sub.txt",
+    "https://raw.githubusercontent.com/Maskkost93/kizyak-vpn-4.0/refs/heads/main/kizyakbeta6.txt",
+    "https://alley.serv00.net/youtube",
+    "https://alley.serv00.net/other",
 ]
 
 TG_USER_AGENTS = [
@@ -68,6 +67,7 @@ TG_USER_AGENTS = [
 ]
 TG_REQUEST_DELAY = 2.0
 
+# Расширенный список зеркал Telegram
 TG_MIRRORS = [
     "https://tg.i-c-a.su/s/{}",
     "https://tlgrm.ru/s/{}",
@@ -75,10 +75,113 @@ TG_MIRRORS = [
     "https://t.me/s/{}"
 ]
 
-HEADER = "# profile-title: Niyakwi⚪ | ЧС | обновление каждые 6 часов\n# profile-update-interval: 6\n"
+HEADER = "# profile-title: Niyakwi⚪ | БС | обновление каждые 6 часов\n# profile-update-interval: 6\n"
 
-# Допустимые порты для TLS-прокси
-ALLOWED_PORTS = {443, 8443, 2053, 2083, 2087, 2096, 8443}
+# ------------------------------------------------------------
+# Инструменты для Xray‑проверки
+# ------------------------------------------------------------
+XRAY_URL = "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
+# Надёжный тестовый URL для GitHub Actions
+TEST_FILE_URL = "http://cp.cloudflare.com/"
+
+def ensure_xray() -> str:
+    xray_bin = "xray"
+    if Path(xray_bin).exists():
+        return str(Path(xray_bin).absolute())
+    logger.info("📥 Скачиваем Xray...")
+    import urllib.request, zipfile
+    urllib.request.urlretrieve(XRAY_URL, "xray.zip")
+    with zipfile.ZipFile("xray.zip", "r") as zf:
+        for m in zf.namelist():
+            if m.endswith("xray"):
+                zf.extract(m)
+                os.chmod("xray", 0o755)
+                break
+    Path("xray.zip").unlink()
+    return str(Path("xray").absolute())
+
+def build_xray_config(cfg: dict, socks_port: int) -> dict:
+    outbound = {
+        "protocol": cfg["protocol"],
+        "settings": {},
+        "streamSettings": {
+            "network": cfg.get("transport", "tcp"),
+            "security": cfg.get("tls", "none") if cfg.get("tls") != "none" else None,
+        },
+    }
+    if outbound["streamSettings"]["security"] is None:
+        del outbound["streamSettings"]["security"]
+    if cfg.get("sni"):
+        outbound["streamSettings"]["sni"] = cfg["sni"]
+    if cfg.get("transport") == "ws" and cfg.get("path"):
+        outbound["streamSettings"]["wsSettings"] = {"path": cfg["path"]}
+
+    if cfg["protocol"] == "vmess":
+        outbound["settings"]["vnext"] = [{
+            "address": cfg["host"], "port": cfg["port"],
+            "users": [{"id": cfg.get("uuid", ""), "alterId": 0}]
+        }]
+    elif cfg["protocol"] == "vless":
+        outbound["settings"]["vnext"] = [{
+            "address": cfg["host"], "port": cfg["port"],
+            "users": [{"id": cfg.get("uuid", ""), "encryption": "none"}]
+        }]
+    elif cfg["protocol"] == "trojan":
+        outbound["settings"]["servers"] = [{
+            "address": cfg["host"], "port": cfg["port"],
+            "password": cfg.get("password", "")
+        }]
+    elif cfg["protocol"] == "ss":
+        outbound["settings"]["servers"] = [{
+            "address": cfg["host"], "port": cfg["port"],
+            "method": cfg.get("method", ""),
+            "password": cfg.get("password", "")
+        }]
+    return {
+        "log": {"loglevel": "warning"},
+        "inbounds": [{"listen": "127.0.0.1", "port": socks_port, "protocol": "socks"}],
+        "outbounds": [outbound]
+    }
+
+def xray_proxy_test(cfg: dict, xray_path: str) -> bool:
+    socks_port = _find_free_port()
+    config = build_xray_config(cfg, socks_port)
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+        json.dump(config, f)
+        config_path = f.name
+    proc = None
+    try:
+        proc = subprocess.Popen(
+            [xray_path, "run", "-c", config_path],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        time.sleep(2.5)
+        cmd = [
+            "curl", "-s", "-o", "/dev/null", "-w", "%{http_code}",
+            "--socks5-hostname", f"127.0.0.1:{socks_port}",
+            "--max-time", "10",
+            TEST_FILE_URL
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+        return result.stdout.strip() in ("200", "204", "301", "302")
+    except Exception:
+        return False
+    finally:
+        if proc:
+            proc.terminate()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        try:
+            Path(config_path).unlink()
+        except Exception:
+            pass
+
+def _find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
 
 # ------------------------------------------------------------
 # Модель конфигурации
@@ -118,11 +221,13 @@ class ProxyConfig:
         return f"{flag} {country_code}"
 
 # ------------------------------------------------------------
-# Чекер с улучшенной фильтрацией
+# Чекер (TCP+TLS → Xray для всех)
 # ------------------------------------------------------------
 class ProxyChecker:
-    def __init__(self, max_concurrent: int = 20):
+    def __init__(self, max_concurrent: int = 20, xray_max_concurrent: int = 10):
         self.max_concurrent = max_concurrent
+        self.xray_max_concurrent = xray_max_concurrent
+        self.xray_path = ensure_xray()
 
     def _parse_uri(self, uri: str) -> Optional[ProxyConfig]:
         try:
@@ -176,11 +281,6 @@ class ProxyChecker:
                 cfg.sni = params.get('sni', [None])[0]
                 cfg.tls = 'tls'
                 cfg.transport = 'udp'
-            # Фильтрация: отбрасываем конфигурации без ключевых параметров
-            if proto in ('vmess', 'vless', 'tuic') and not cfg.uuid:
-                return None
-            if proto in ('trojan', 'ss', 'hysteria2') and not cfg.password:
-                return None
             return cfg
         except Exception:
             return None
@@ -200,8 +300,6 @@ class ProxyChecker:
         return False, 0.0
 
     def _tls_check(self, host: str, port: int, sni: Optional[str] = None, timeout: float = 4.0) -> bool:
-        if port not in ALLOWED_PORTS:
-            return True
         try:
             context = ssl.create_default_context()
             context.check_hostname = False
@@ -212,27 +310,21 @@ class ProxyChecker:
         except Exception:
             return False
 
-    def test_config(self, cfg: ProxyConfig) -> Tuple[bool, float]:
-        # Отсеиваем нестандартные порты для TLS-протоколов
-        if cfg.tls != 'none' and cfg.port not in ALLOWED_PORTS:
-            return False, 0.0
-
-        # TCP
+    def test_config_preliminary(self, cfg: ProxyConfig) -> Tuple[bool, float]:
+        """Быстрый TCP+TLS тест."""
         ok, latency = self._tcp_check(cfg.host, cfg.port)
         if not ok:
             return False, 0.0
-
-        # TLS
         if cfg.tls != 'none':
             if not self._tls_check(cfg.host, cfg.port, cfg.sni):
                 return False, latency
-
         return True, latency
 
     async def check_batch(self, configs: List[ProxyConfig]) -> List[ProxyConfig]:
+        # Этап 1: TCP+TLS (быстрый)
         total = len(configs)
         checked = 0
-        working = []
+        passed_prelim = []
         start_time = time.time()
         semaphore = asyncio.Semaphore(self.max_concurrent)
         lock = asyncio.Lock()
@@ -241,44 +333,89 @@ class ProxyChecker:
         async def heartbeat():
             while True:
                 await asyncio.sleep(30)
-                logger.info("⏳ Проверка продолжается...")
+                logger.info("⏳ TCP+TLS проверка продолжается...")
 
-        async def check_one(cfg: ProxyConfig):
+        async def pre_check(cfg: ProxyConfig):
             nonlocal checked
             async with semaphore:
                 loop = asyncio.get_event_loop()
                 with ThreadPoolExecutor() as executor:
-                    ok, latency = await loop.run_in_executor(executor, self.test_config, cfg)
+                    ok, latency = await loop.run_in_executor(executor, self.test_config_preliminary, cfg)
                 if ok:
-                    cfg.working = True
                     cfg.latency = latency
                 async with lock:
                     checked += 1
                     if checked % 500 == 0 or checked == total:
                         elapsed = time.time() - start_time
                         rate = checked / elapsed if elapsed > 0 else 0
-                        logger.info(f"📊 Прогресс: {checked}/{total} (рабочих: {len(working)}) | {rate:.1f} конф/сек")
+                        logger.info(f"📊 TCP+TLS: {checked}/{total} (прошло: {len(passed_prelim)}) | {rate:.1f} конф/сек")
                 if ok:
                     async with lock:
-                        working.append(cfg)
+                        passed_prelim.append(cfg)
                 return cfg
 
         if total > 1000:
             heartbeat_task = asyncio.create_task(heartbeat())
 
-        tasks = [check_one(cfg) for cfg in configs]
+        tasks = [pre_check(cfg) for cfg in configs]
         await asyncio.gather(*tasks)
 
         if heartbeat_task:
             heartbeat_task.cancel()
 
         elapsed = time.time() - start_time
-        logger.info(f"✅ Проверка завершена за {elapsed/60:.1f} мин. Рабочих: {len(working)} из {total}")
+        logger.info(f"✅ TCP+TLS завершён за {elapsed/60:.1f} мин. Прошло: {len(passed_prelim)} из {total}")
 
-        return working
+        # Этап 2: Xray для всех прошедших
+        if not passed_prelim:
+            logger.warning("Нет конфигураций для Xray‑проверки.")
+            return []
+
+        xray_total = len(passed_prelim)
+        xray_checked = 0
+        xray_working = []
+        xray_start = time.time()
+        xray_semaphore = asyncio.Semaphore(self.xray_max_concurrent)
+        xray_lock = asyncio.Lock()
+
+        async def xray_heartbeat():
+            while True:
+                await asyncio.sleep(30)
+                logger.info("⏳ Xray проверка продолжается...")
+
+        async def xray_check(cfg: ProxyConfig):
+            nonlocal xray_checked
+            async with xray_semaphore:
+                loop = asyncio.get_event_loop()
+                with ThreadPoolExecutor() as executor:
+                    ok = await loop.run_in_executor(executor, xray_proxy_test, vars(cfg), self.xray_path)
+                if ok:
+                    cfg.working = True
+                async with xray_lock:
+                    xray_checked += 1
+                    if xray_checked % 100 == 0 or xray_checked == xray_total:
+                        elapsed_x = time.time() - xray_start
+                        rate_x = xray_checked / elapsed_x if elapsed_x > 0 else 0
+                        logger.info(f"📊 Xray: {xray_checked}/{xray_total} (рабочих: {len(xray_working)}) | {rate_x:.1f} конф/сек")
+                if ok:
+                    async with xray_lock:
+                        xray_working.append(cfg)
+                return cfg
+
+        xray_heartbeat_task = asyncio.create_task(xray_heartbeat()) if xray_total > 50 else None
+
+        xray_tasks = [xray_check(cfg) for cfg in passed_prelim]
+        await asyncio.gather(*xray_tasks)
+
+        if xray_heartbeat_task:
+            xray_heartbeat_task.cancel()
+
+        elapsed_x = time.time() - xray_start
+        logger.info(f"✅ Xray завершён за {elapsed_x/60:.1f} мин. Рабочих: {len(xray_working)} из {xray_total}")
+        return xray_working
 
 # ------------------------------------------------------------
-# Парсер подписок (сокращён для простоты, но с Telegram)
+# Парсер подписок
 # ------------------------------------------------------------
 class SubscriptionParser:
     def __init__(self, timeout: int = 30, max_concurrent: int = 10, parse_telegram: bool = False):
@@ -471,7 +608,7 @@ class SubscriptionParser:
         return unique
 
 # ------------------------------------------------------------
-# SourceManager (стандартный)
+# SourceManager
 # ------------------------------------------------------------
 class SourceManager:
     def __init__(self, sources_file="sources.txt", failed_file="failed_sources.txt"):
@@ -512,7 +649,7 @@ def save_subscriptions(configs: List[ProxyConfig], output_dir: str = "."):
     out_path.mkdir(exist_ok=True)
     working = [c for c in configs if c.working]
     working.sort(key=lambda x: x.latency if x.latency else 999999)
-    logger.info(f"Рабочих: {len(working)}")
+    logger.info(f"Рабочих (после Xray): {len(working)}")
     if not working:
         logger.warning("Нет рабочих конфигураций. Выходные файлы будут пустыми.")
         return
@@ -543,7 +680,7 @@ def save_subscriptions(configs: List[ProxyConfig], output_dir: str = "."):
                     f.write(f"{c.to_uri().split('#')[0]}#{c.format_name()}\n")
     # Ссылки
     repo_user = "Darkoflox"
-    repo_name = "blacklist"  # замените на имя вашего репозитория
+    repo_name = "Kfg-analizator"
     branch = "main"
     base = f"https://raw.githubusercontent.com/{repo_user}/{repo_name}/{branch}"
     cdn_statically = f"https://cdn.statically.io/gh/{repo_user}/{repo_name}/{branch}"
@@ -566,16 +703,18 @@ def save_subscriptions(configs: List[ProxyConfig], output_dir: str = "."):
 # ------------------------------------------------------------
 async def main():
     parser_arg = ArgumentParser()
-    parser_arg.add_argument('--threads', type=int, default=20, help='Число потоков проверки')
+    parser_arg.add_argument('--threads', type=int, default=20, help='Число потоков TCP+TLS')
+    parser_arg.add_argument('--xray-threads', type=int, default=8, help='Число потоков Xray (меньше из-за нагрузки)')
     parser_arg.add_argument('--parse-telegram', action='store_true', help='Включить сбор из Telegram-каналов')
     args = parser_arg.parse_args()
 
     async with SubscriptionParser(timeout=60, max_concurrent=5, parse_telegram=args.parse_telegram) as parser:
         parser.checker.max_concurrent = args.threads
+        parser.checker.xray_max_concurrent = args.xray_threads
         configs = await parser.collect_all()
         if configs:
             working = await parser.checker.check_batch(configs)
-            save_subscriptions(working)   # <-- исправлено название функции
+            save_subscriptions(working)
 
 if __name__ == "__main__":
     asyncio.run(main())
