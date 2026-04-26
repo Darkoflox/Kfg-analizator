@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Финальный парсер для «белых списков» с фильтрацией по подсетям Yandex / VK / Sber.
-Гарантирует, что в подписку попадают только серверы с IP из разрешённых подсетей.
-Исправлена обработка некорректных хостов.
+Финальный парсер для «белых списков» без фильтрации по подсетям.
+Трёхэтапная проверка: TCP+TLS → прокси-тест через Xray с загрузкой >20 КБ.
+Ограничения: Android ≤5000, iOS ≤300.
 """
 import asyncio
 import base64
 import hashlib
-import ipaddress
 import json
 import logging
 import os
@@ -80,71 +79,6 @@ TG_MIRRORS = [
 ]
 
 HEADER = "# profile-title: Niyakwi⚪ | БС | обновление каждые 6 часов\n# profile-update-interval: 6\n"
-
-# ------------------------------------------------------------
-# Загрузка «белых» подсетей
-# ------------------------------------------------------------
-def load_whitelist_subnets(file_paths: List[str]) -> List[ipaddress.IPv4Network]:
-    subnets = []
-    for file_path in file_paths:
-        if not Path(file_path).exists():
-            logger.warning(f"Файл подсетей {file_path} не найден, пропускаем")
-            continue
-        with open(file_path, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if line and not line.startswith('#'):
-                    try:
-                        subnets.append(ipaddress.IPv4Network(line))
-                    except ValueError:
-                        pass
-    logger.info(f"Загружено {len(subnets)} белых подсетей")
-    return subnets
-
-WHITELIST_FILES = ["yandex_subnets.txt", "vk_subnets.txt", "sber_subnets.txt"]
-WHITELIST_SUBNETS = load_whitelist_subnets(WHITELIST_FILES)
-
-def resolve_host_to_ip(host: str) -> Optional[str]:
-    """Безопасный резолвинг домена в IP‑адрес."""
-    if not host or not isinstance(host, str):
-        return None
-    host = host.strip().lower()
-    # Отсекаем заведомо некорректные значения
-    if host in ('.', '..', '-', 'localhost', '127.0.0.1'):
-        return None
-    # Если это уже IP‑адрес, возвращаем его же
-    try:
-        ipaddress.IPv4Address(host)
-        return host
-    except ValueError:
-        pass
-    try:
-        return socket.gethostbyname(host)
-    except (socket.gaierror, UnicodeError, OSError):
-        return None
-
-def is_ip_in_whitelist(host: str) -> bool:
-    """Проверяет, принадлежит ли хост (IP или доменное имя) белым подсетям."""
-    if not host or not isinstance(host, str):
-        return False
-    host = host.strip().lower()
-    if host in ('.', '..', '-', 'localhost', '127.0.0.1'):
-        return False
-    # Пробуем интерпретировать как IP
-    try:
-        ip = ipaddress.IPv4Address(host)
-        return any(ip in subnet for subnet in WHITELIST_SUBNETS)
-    except ValueError:
-        pass
-    # Это домен – резолвим и проверяем
-    ip = resolve_host_to_ip(host)
-    if ip:
-        try:
-            ip_obj = ipaddress.IPv4Address(ip)
-            return any(ip_obj in subnet for subnet in WHITELIST_SUBNETS)
-        except ValueError:
-            pass
-    return False
 
 # ------------------------------------------------------------
 # Инструменты для проверки
@@ -296,7 +230,7 @@ class ProxyConfig:
         return f"{flag} {country_code}"
 
 # ------------------------------------------------------------
-# Чекер (TCP+TLS + Xray с фильтрацией)
+# Чекер (TCP+TLS + Xray без фильтрации по подсетям)
 # ------------------------------------------------------------
 class ProxyChecker:
     def __init__(self, max_concurrent: int = 20):
@@ -360,10 +294,6 @@ class ProxyChecker:
             return None
 
     def test_config(self, cfg: ProxyConfig) -> Tuple[bool, float]:
-        # Фильтр по подсетям
-        if not is_ip_in_whitelist(cfg.host):
-            return False, 0.0
-
         # TCP
         start = time.time()
         try:
@@ -388,7 +318,7 @@ class ProxyChecker:
             except Exception:
                 return False, latency
 
-        # Xray
+        # Xray прокси-тест
         ok = xray_proxy_test(vars(cfg), self.xray_path)
         if ok:
             cfg.working = True
@@ -611,7 +541,7 @@ class SubscriptionParser:
         return unique
 
 # ------------------------------------------------------------
-# SourceManager
+# SourceManager (стандартный)
 # ------------------------------------------------------------
 class SourceManager:
     def __init__(self, sources_file="sources.txt", failed_file="failed_sources.txt"):
