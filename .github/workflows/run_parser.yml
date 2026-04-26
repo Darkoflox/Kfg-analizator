@@ -20,7 +20,7 @@ jobs:
           python-version: '3.11'
 
       - name: Install dependencies
-        run: pip install -r requirements.txt
+        run: pip install aiohttp pyyaml geoip2
 
       - name: Run parser (Xray 20 threads, Telegram)
         run: python advanced_parser.py --threads 30 --xray-threads 20 --parse-telegram
@@ -31,5 +31,5 @@ jobs:
       - name: Commit and push changes
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "Автообновление (Xray 20 потоков) и README"
+          commit_message: "Автообновление (GeoIP) и README"
           file_pattern: '*.txt README.md'
