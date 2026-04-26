@@ -2,6 +2,7 @@
 """
 Финальный парсер для «белых списков» с фильтрацией по подсетям Yandex / VK / Sber.
 Гарантирует, что в подписку попадают только серверы с IP из разрешённых подсетей.
+Исправлена обработка некорректных хостов.
 """
 import asyncio
 import base64
@@ -84,7 +85,6 @@ HEADER = "# profile-title: Niyakwi⚪ | БС | обновление каждые
 # Загрузка «белых» подсетей
 # ------------------------------------------------------------
 def load_whitelist_subnets(file_paths: List[str]) -> List[ipaddress.IPv4Network]:
-    """Загружает подсети из файлов и возвращает список IPv4Network."""
     subnets = []
     for file_path in file_paths:
         if not Path(file_path).exists():
@@ -105,24 +105,45 @@ WHITELIST_FILES = ["yandex_subnets.txt", "vk_subnets.txt", "sber_subnets.txt"]
 WHITELIST_SUBNETS = load_whitelist_subnets(WHITELIST_FILES)
 
 def resolve_host_to_ip(host: str) -> Optional[str]:
+    """Безопасный резолвинг домена в IP‑адрес."""
+    if not host or not isinstance(host, str):
+        return None
+    host = host.strip().lower()
+    # Отсекаем заведомо некорректные значения
+    if host in ('.', '..', '-', 'localhost', '127.0.0.1'):
+        return None
+    # Если это уже IP‑адрес, возвращаем его же
+    try:
+        ipaddress.IPv4Address(host)
+        return host
+    except ValueError:
+        pass
     try:
         return socket.gethostbyname(host)
-    except socket.gaierror:
+    except (socket.gaierror, UnicodeError, OSError):
         return None
 
 def is_ip_in_whitelist(host: str) -> bool:
-    """Проверяет, принадлежит ли хост (IP или домен) белым подсетям."""
+    """Проверяет, принадлежит ли хост (IP или доменное имя) белым подсетям."""
+    if not host or not isinstance(host, str):
+        return False
+    host = host.strip().lower()
+    if host in ('.', '..', '-', 'localhost', '127.0.0.1'):
+        return False
+    # Пробуем интерпретировать как IP
     try:
         ip = ipaddress.IPv4Address(host)
         return any(ip in subnet for subnet in WHITELIST_SUBNETS)
     except ValueError:
-        ip = resolve_host_to_ip(host)
-        if ip:
-            try:
-                ip_obj = ipaddress.IPv4Address(ip)
-                return any(ip_obj in subnet for subnet in WHITELIST_SUBNETS)
-            except ValueError:
-                pass
+        pass
+    # Это домен – резолвим и проверяем
+    ip = resolve_host_to_ip(host)
+    if ip:
+        try:
+            ip_obj = ipaddress.IPv4Address(ip)
+            return any(ip_obj in subnet for subnet in WHITELIST_SUBNETS)
+        except ValueError:
+            pass
     return False
 
 # ------------------------------------------------------------
@@ -590,7 +611,7 @@ class SubscriptionParser:
         return unique
 
 # ------------------------------------------------------------
-# SourceManager (стандартный)
+# SourceManager
 # ------------------------------------------------------------
 class SourceManager:
     def __init__(self, sources_file="sources.txt", failed_file="failed_sources.txt"):
