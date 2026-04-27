@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """
-Финальный парсер «БС» с Xray‑проверкой через сервис определения IP и GeoIP.
-Android – ровно 5000 рабочих после Xray, iOS – 300 самых быстрых.
+Финальный парсер «БС» — полный набор всех обсуждённых функций.
+Сбор из URL‑подписок и Telegram‑каналов.
+Двухэтапная проверка: TCP+TLS → Xray‑тест через ifconfig.me + GeoIP.
+Приоритет протоколов: VLESS > VMess > Trojan > Hysteria2 > TUIC > SS > SSR.
+Ограничения: Android ≤5000, iOS ≤300 (лучшие по протоколу и пингу).
 """
 import asyncio, base64, hashlib, json, logging, os, random, re, socket, ssl, subprocess, tempfile, time
 from argparse import ArgumentParser
@@ -33,6 +36,10 @@ TLD_FLAGS = {
     'kz': '🇰🇿', 'uz': '🇺🇿', 'ge': '🇬🇪', 'am': '🇦🇲', 'az': '🇦🇿', 'md': '🇲🇩',
     'by': '🇧🇾', 'lt': '🇱🇹', 'lv': '🇱🇻', 'ee': '🇪🇪', 'sk': '🇸🇰', 'si': '🇸🇮',
     'lu': '🇱🇺', 'mt': '🇲🇹', 'cy': '🇨🇾', 'is': '🇮🇸', 'ie': '🇮🇪', 'be': '🇧🇪',
+    # расширенный список
+    'net': '🌐', 'org': '🌐', 'com': '🌐', 'xyz': '🌐', 'info': '🌐', 'online': '🌐',
+    'club': '🌐', 'site': '🌐', 'tech': '🌐', 'dev': '🌐', 'cloud': '🌐', 'blog': '🌐',
+    'shop': '🌐', 'store': '🌐', 'pro': '🌐', 'top': '🌐', 'ltd': '🌐', 'biz': '🌐',
 }
 TLD_TO_CODE = {tld: tld.upper() for tld in TLD_FLAGS}
 
@@ -44,9 +51,9 @@ DEFAULT_SOURCES = [
 ]
 
 TG_USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 …',
-    'Mozilla/5.0 (Macintosh; …',
-    'Mozilla/5.0 (X11; …'
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
+    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
 ]
 TG_REQUEST_DELAY = 2.0
 TG_MIRRORS = [
@@ -60,31 +67,39 @@ HEADER = "# profile-title: Niyakwi⚪ | БС | обновление каждые
 
 XRAY_URL = "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
 IP_SERVICE_URL = "http://ifconfig.me"
-GEOIP_DB_URL = "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-Country.mmdb"
+GEOIP_DB_URLS = [
+    "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-Country.mmdb",
+    "https://github.com/Loyalsoldier/geoip/releases/latest/download/Country.mmdb",
+    "https://cdn.jsdelivr.net/gh/P3TERX/GeoLite.mmdb/GeoLite2-Country.mmdb",
+]
 
 # ---------- GeoIP ----------
 def load_geoip():
     if not GEOIP_AVAILABLE:
         return None
     db_path = Path("GeoLite2-Country.mmdb")
-    if not db_path.exists():
-        logger.info("📥 Скачиваем GeoIP базу...")
-        import urllib.request
+    if db_path.exists():
         try:
-            urllib.request.urlretrieve(GEOIP_DB_URL, db_path)
+            return geoip2.database.Reader(str(db_path))
         except Exception as e:
-            logger.error(f"Не удалось скачать GeoIP базу: {e}")
+            logger.error(f"Ошибка загрузки GeoIP: {e}")
             return None
-    try:
-        return geoip2.database.Reader(str(db_path))
-    except Exception as e:
-        logger.error(f"Ошибка загрузки GeoIP: {e}")
-        return None
+    for url in GEOIP_DB_URLS:
+        try:
+            logger.info(f"📥 Скачиваем GeoIP базу с {url}...")
+            import urllib.request
+            urllib.request.urlretrieve(url, db_path)
+            return geoip2.database.Reader(str(db_path))
+        except Exception as e:
+            logger.warning(f"Не удалось загрузить GeoIP с {url}: {e}")
+            continue
+    logger.error("Не удалось загрузить GeoIP базу ни с одного источника")
+    return None
 
 geoip_reader = load_geoip()
 
 def get_country(ip: str) -> Optional[str]:
-    if not geoip_reader:
+    if not geoip_reader or not ip:
         return None
     try:
         response = geoip_reader.country(ip)
@@ -207,6 +222,22 @@ class ProxyConfig:
             flag = TLD_FLAGS.get(country_code.lower(), '🏳️')
             return f"{flag} {country_code.upper()}"
         return "🏳️ ??"
+
+# ---------- Приоритет протоколов ----------
+PROTO_PRIORITY = {
+    'vless': 100,
+    'vmess': 90,
+    'trojan': 80,
+    'hysteria2': 70,
+    'tuic': 60,
+    'ss': 50,
+    'ssr': 40,
+}
+
+def protocol_sort_key(cfg):
+    priority = PROTO_PRIORITY.get(cfg.protocol, 0)
+    latency = cfg.latency if cfg.latency else 999999
+    return (-priority, latency)
 
 # ---------- Чекер ----------
 class ProxyChecker:
@@ -525,41 +556,43 @@ class SourceManager:
             with open(self.failed_file, 'a') as f: f.write(f"{url}\n")
         except Exception as e: logger.error(f"Не удалось записать {self.failed_file}: {e}")
 
-# ---------- Сохранение подписок ----------
+# ---------- Сохранение ----------
 def save_subscriptions(configs, output_dir="."):
     out_path = Path(output_dir)
     out_path.mkdir(exist_ok=True)
     working = [c for c in configs if c.working]
-    working.sort(key=lambda x: x.latency if x.latency else 999999)
+    # Сортировка по приоритету протокола, затем по пингу
+    working.sort(key=protocol_sort_key)
     logger.info(f"Рабочих (после Xray): {len(working)}")
     if not working:
         logger.warning("Нет рабочих конфигураций. Выходные файлы будут пустыми.")
         return
 
-    # Android – ровно 5000 лучших по пингу из прошедших Xray
+    # Android — 5000 лучших
     android_list = working[:5000]
     (out_path / "sub_android.txt").write_text(
         HEADER + "\n".join(f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in android_list),
         encoding='utf-8'
     )
 
-    # iOS – ровно 300 лучших по пингу из прошедших Xray
+    # iOS — 300 лучших
     ios_list = working[:300]
     (out_path / "sub_ios.txt").write_text(
         HEADER + "\n".join(f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in ios_list),
         encoding='utf-8'
     )
 
-    # Общий файл (все прошедшие)
+    # Общий файл
     (out_path / "sub_all_checked.txt").write_text(
         HEADER + "\n".join(f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in working),
         encoding='utf-8'
     )
 
-    # По протоколам (до 5000)
+    # По протоколам
     for proto in SUPPORTED_PROTOCOLS:
         items = [c for c in working if c.protocol == proto]
         if items:
+            items.sort(key=lambda x: x.latency if x.latency else 999999)
             (out_path / f"sub_{proto}.txt").write_text(
                 HEADER + "\n".join(f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in items[:5000]),
                 encoding='utf-8'
