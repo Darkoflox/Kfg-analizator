@@ -41,3 +41,7 @@ https://raw.githubusercontent.com/Hidashimora/free-vpn-anti-rkn/main/configs/25.
 https://gitflic.ru/project/sigil/my-new-cool-project/blob/raw?file=whitelist
 https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/Vless-Reality-White-Lists-Rus-Mobile-2.txt
 https://raw.githubusercontent.com/Hidashimora/free-vpn-anti-rkn/main/configs/31.txt
+https://raw.githubusercontent.com/Hidashimora/free-vpn-anti-rkn/main/configs/32.1.txt
+https://raw.githubusercontent.com/Hidashimora/free-vpn-anti-rkn/main/configs/30.txt
+https://raw.githubusercontent.com/Hidashimora/free-vpn-anti-rkn/main/configs/32.2.txt
+https://raw.githubusercontent.com/ewecrow78-gif/whitelist1/main/list.txt
