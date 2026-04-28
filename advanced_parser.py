@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Финальный парсер «БС» — полный набор всех обсуждённых функций.
-Сбор из URL‑подписок и Telegram‑каналов.
-Двухэтапная проверка: TCP+TLS → Xray‑тест через ifconfig.me + GeoIP.
-Приоритет протоколов: VLESS > VMess > Trojan > Hysteria2 > TUIC > SS > SSR.
-Ограничения: Android ≤5000, iOS ≤300 (лучшие по протоколу и пингу).
+Финальный парсер «БС» с раздельной проверкой:
+- VLESS / VMess / Trojan / SS → Xray
+- Hysteria2 / TUIC → Sing‑box
+Надёжное определение страны (GeoIP + несколько IP‑сервисов).
+Android: ровно 5000 рабочих, iOS: 300 лучших.
 """
 import asyncio, base64, hashlib, json, logging, os, random, re, socket, ssl, subprocess, tempfile, time
 from argparse import ArgumentParser
@@ -36,7 +36,7 @@ TLD_FLAGS = {
     'kz': '🇰🇿', 'uz': '🇺🇿', 'ge': '🇬🇪', 'am': '🇦🇲', 'az': '🇦🇿', 'md': '🇲🇩',
     'by': '🇧🇾', 'lt': '🇱🇹', 'lv': '🇱🇻', 'ee': '🇪🇪', 'sk': '🇸🇰', 'si': '🇸🇮',
     'lu': '🇱🇺', 'mt': '🇲🇹', 'cy': '🇨🇾', 'is': '🇮🇸', 'ie': '🇮🇪', 'be': '🇧🇪',
-    # расширенный список
+    # расширенный список (глобальные домены)
     'net': '🌐', 'org': '🌐', 'com': '🌐', 'xyz': '🌐', 'info': '🌐', 'online': '🌐',
     'club': '🌐', 'site': '🌐', 'tech': '🌐', 'dev': '🌐', 'cloud': '🌐', 'blog': '🌐',
     'shop': '🌐', 'store': '🌐', 'pro': '🌐', 'top': '🌐', 'ltd': '🌐', 'biz': '🌐',
@@ -66,7 +66,14 @@ TG_MIRRORS = [
 HEADER = "# profile-title: Niyakwi⚪ | БС | обновление каждые 6 часов\n# profile-update-interval: 6\n"
 
 XRAY_URL = "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
-IP_SERVICE_URL = "http://ifconfig.me"
+SINGBOX_URL = "https://github.com/SagerNet/sing-box/releases/download/v1.10.0/sing-box-1.10.0-linux-amd64.tar.gz"
+
+# Несколько сервисов для определения IP (пробуются по очереди)
+IP_SERVICES = [
+    "http://ifconfig.me",
+    "http://icanhazip.com",
+    "http://ipinfo.io/ip",
+]
 GEOIP_DB_URLS = [
     "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-Country.mmdb",
     "https://github.com/Loyalsoldier/geoip/releases/latest/download/Country.mmdb",
@@ -74,40 +81,63 @@ GEOIP_DB_URLS = [
 ]
 
 # ---------- GeoIP ----------
-def load_geoip():
+_geoip_reader = None
+_geoip_lock = asyncio.Lock()
+
+async def get_geoip_reader():
+    global _geoip_reader
     if not GEOIP_AVAILABLE:
         return None
-    db_path = Path("GeoLite2-Country.mmdb")
-    if db_path.exists():
-        try:
-            return geoip2.database.Reader(str(db_path))
-        except Exception as e:
-            logger.error(f"Ошибка загрузки GeoIP: {e}")
-            return None
-    for url in GEOIP_DB_URLS:
-        try:
-            logger.info(f"📥 Скачиваем GeoIP базу с {url}...")
-            import urllib.request
-            urllib.request.urlretrieve(url, db_path)
-            return geoip2.database.Reader(str(db_path))
-        except Exception as e:
-            logger.warning(f"Не удалось загрузить GeoIP с {url}: {e}")
-            continue
-    logger.error("Не удалось загрузить GeoIP базу ни с одного источника")
-    return None
+    if _geoip_reader is not None:
+        return _geoip_reader
+    async with _geoip_lock:
+        if _geoip_reader is not None:
+            return _geoip_reader
+        db_path = Path("GeoLite2-Country.mmdb")
+        if db_path.exists():
+            try:
+                _geoip_reader = geoip2.database.Reader(str(db_path))
+                logger.info("✅ GeoIP база загружена из кэша")
+                return _geoip_reader
+            except Exception as e:
+                logger.error(f"Ошибка загрузки GeoIP: {e}")
+        for url in GEOIP_DB_URLS:
+            try:
+                logger.info(f"📥 Скачиваем GeoIP базу с {url}...")
+                loop = asyncio.get_event_loop()
+                await loop.run_in_executor(None, lambda: __import__('urllib.request').request.urlretrieve(url, db_path))
+                _geoip_reader = geoip2.database.Reader(str(db_path))
+                logger.info("✅ GeoIP база успешно загружена")
+                return _geoip_reader
+            except Exception as e:
+                logger.warning(f"Не удалось загрузить GeoIP с {url}: {e}")
+                continue
+        logger.error("Не удалось загрузить GeoIP базу ни с одного источника")
+        return None
 
-geoip_reader = load_geoip()
+# Кэш IP → страна
+_country_cache: Dict[str, Optional[str]] = {}
 
-def get_country(ip: str) -> Optional[str]:
-    if not geoip_reader or not ip:
+async def get_country(ip: str) -> Optional[str]:
+    if not ip:
+        return None
+    if ip in _country_cache:
+        return _country_cache[ip]
+    reader = await get_geoip_reader()
+    if not reader:
+        _country_cache[ip] = None
         return None
     try:
-        response = geoip_reader.country(ip)
-        return response.country.iso_code
+        loop = asyncio.get_event_loop()
+        response = await loop.run_in_executor(None, reader.country, ip)
+        code = response.country.iso_code
+        _country_cache[ip] = code
+        return code
     except Exception:
+        _country_cache[ip] = None
         return None
 
-# ---------- Xray ----------
+# ---------- Инструменты ----------
 def ensure_xray() -> str:
     xray_bin = "xray"
     if Path(xray_bin).exists():
@@ -124,7 +154,24 @@ def ensure_xray() -> str:
     Path("xray.zip").unlink()
     return str(Path("xray").absolute())
 
+def ensure_singbox() -> str:
+    singbox_bin = "sing-box"
+    if Path(singbox_bin).exists():
+        return str(Path(singbox_bin).absolute())
+    logger.info("📥 Скачиваем Sing‑box...")
+    import urllib.request, tarfile
+    urllib.request.urlretrieve(SINGBOX_URL, "sing-box.tar.gz")
+    with tarfile.open("sing-box.tar.gz", "r:gz") as tar:
+        for member in tar.getmembers():
+            if member.name.endswith("sing-box"):
+                tar.extract(member)
+                os.chmod("sing-box", 0o755)
+                break
+    Path("sing-box.tar.gz").unlink()
+    return str(Path("sing-box").absolute())
+
 def build_xray_config(cfg: dict, socks_port: int) -> dict:
+    # ... без изменений ...
     outbound = {
         "protocol": cfg["protocol"],
         "settings": {},
@@ -150,21 +197,52 @@ def build_xray_config(cfg: dict, socks_port: int) -> dict:
         outbound["settings"]["servers"] = [{"address": cfg["host"], "port": cfg["port"], "method": cfg.get("method", ""), "password": cfg.get("password", "")}]
     return {"log": {"loglevel": "warning"}, "inbounds": [{"listen": "127.0.0.1", "port": socks_port, "protocol": "socks"}], "outbounds": [outbound]}
 
-def xray_proxy_test(cfg: dict, xray_path: str) -> Tuple[bool, Optional[str]]:
+def build_singbox_config(cfg: dict, socks_port: int) -> dict:
+    outbound = {
+        "type": cfg["protocol"],
+        "server": cfg["host"],
+        "server_port": cfg["port"],
+        "tls": {"enabled": cfg.get("tls") != "none", "server_name": cfg.get("sni") or cfg["host"]},
+    }
+    if cfg["protocol"] == "hysteria2":
+        outbound["password"] = cfg.get("password", "")
+    elif cfg["protocol"] == "tuic":
+        outbound["uuid"] = cfg.get("uuid", "")
+        outbound["password"] = cfg.get("password", "")
+    return {
+        "log": {"level": "error"},
+        "inbounds": [{"type": "socks", "listen": "127.0.0.1", "listen_port": socks_port}],
+        "outbounds": [outbound]
+    }
+
+def _find_free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+async def proxy_test(cfg: dict, runner_path: str, runner_type: str) -> Tuple[bool, Optional[str]]:
+    """Универсальный тест для Xray или Sing‑box."""
     socks_port = _find_free_port()
-    config = build_xray_config(cfg, socks_port)
+    if runner_type == "xray":
+        config = build_xray_config(cfg, socks_port)
+    else:
+        config = build_singbox_config(cfg, socks_port)
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
         json.dump(config, f)
         config_path = f.name
     proc = None
     try:
-        proc = subprocess.Popen([xray_path, "run", "-c", config_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        time.sleep(1.5)
-        cmd = ["curl", "-s", "--socks5-hostname", f"127.0.0.1:{socks_port}", "--max-time", "8", IP_SERVICE_URL]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
-        ip = result.stdout.strip()
-        if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", ip):
-            return True, ip
+        proc = subprocess.Popen([runner_path, "run", "-c", config_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        await asyncio.sleep(1.5)
+        for service_url in IP_SERVICES:
+            try:
+                cmd = ["curl", "-s", "--socks5-hostname", f"127.0.0.1:{socks_port}", "--max-time", "8", service_url]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+                ip = result.stdout.strip()
+                if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", ip):
+                    return True, ip
+            except Exception:
+                continue
         return False, None
     except Exception:
         return False, None
@@ -175,11 +253,6 @@ def xray_proxy_test(cfg: dict, xray_path: str) -> Tuple[bool, Optional[str]]:
             except: proc.kill()
         try: Path(config_path).unlink()
         except: pass
-
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
 
 # ---------- Модель ----------
 from dataclasses import dataclass, field
@@ -200,6 +273,7 @@ class ProxyConfig:
     latency: Optional[float] = None
     working: bool = False
     resolved_ip: Optional[str] = None
+    country_code: Optional[str] = None   # кэш страны
     remarks: Optional[str] = None
     id: str = field(default_factory=lambda: hashlib.md5(str(random.random()).encode()).hexdigest()[:8])
 
@@ -210,28 +284,25 @@ class ProxyConfig:
     def to_uri(self) -> str:
         return self.raw
 
-    def format_name(self) -> str:
-        country_code = None
-        if self.resolved_ip:
-            country_code = get_country(self.resolved_ip)
-        if not country_code:
-            parts = self.host.split('.')
-            tld = parts[-1].lower() if len(parts) >= 2 else ''
-            country_code = TLD_TO_CODE.get(tld)
-        if country_code:
-            flag = TLD_FLAGS.get(country_code.lower(), '🏳️')
-            return f"{flag} {country_code.upper()}"
+    async def format_name_async(self) -> str:
+        """Асинхронное получение имени с GeoIP."""
+        if self.country_code is None and self.resolved_ip:
+            self.country_code = await get_country(self.resolved_ip)
+        if self.country_code:
+            flag = TLD_FLAGS.get(self.country_code.lower(), '🏳️')
+            return f"{flag} {self.country_code.upper()}"
+        # fallback на TLD
+        parts = self.host.split('.')
+        tld = parts[-1].lower() if len(parts) >= 2 else ''
+        code = TLD_TO_CODE.get(tld)
+        if code:
+            flag = TLD_FLAGS.get(tld, '🏳️')
+            return f"{flag} {code}"
         return "🏳️ ??"
 
-# ---------- Приоритет протоколов ----------
 PROTO_PRIORITY = {
-    'vless': 100,
-    'vmess': 90,
-    'trojan': 80,
-    'hysteria2': 70,
-    'tuic': 60,
-    'ss': 50,
-    'ssr': 40,
+    'vless': 100, 'vmess': 90, 'trojan': 80,
+    'hysteria2': 70, 'tuic': 60, 'ss': 50, 'ssr': 40,
 }
 
 def protocol_sort_key(cfg):
@@ -239,14 +310,15 @@ def protocol_sort_key(cfg):
     latency = cfg.latency if cfg.latency else 999999
     return (-priority, latency)
 
-# ---------- Чекер ----------
 class ProxyChecker:
     def __init__(self, max_concurrent: int = 20, xray_max_concurrent: int = 20):
         self.max_concurrent = max_concurrent
         self.xray_max_concurrent = xray_max_concurrent
         self.xray_path = ensure_xray()
+        self.singbox_path = ensure_singbox()
 
     def _parse_uri(self, uri: str) -> Optional[ProxyConfig]:
+        # ... без изменений ...
         try:
             proto = uri.split('://')[0].lower()
             if proto not in SUPPORTED_PROTOCOLS: return None
@@ -341,37 +413,76 @@ class ProxyChecker:
 
         if not passed_prelim: return []
 
-        xray_total = len(passed_prelim)
-        xray_working = []
-        xray_start = time.time()
-        xray_sem = asyncio.Semaphore(self.xray_max_concurrent)
-        xray_lock = asyncio.Lock()
-        xray_checked = 0
+        xray_list = [c for c in passed_prelim if c.protocol in ('vmess', 'vless', 'trojan', 'ss', 'ssr')]
+        singbox_list = [c for c in passed_prelim if c.protocol in ('hysteria2', 'tuic')]
 
-        async def xray_check(cfg):
-            nonlocal xray_checked
-            async with xray_sem:
-                loop = asyncio.get_event_loop()
-                with ThreadPoolExecutor() as ex:
-                    ok, ip = await loop.run_in_executor(ex, xray_proxy_test, vars(cfg), self.xray_path)
-                if ok:
-                    cfg.working = True
-                    cfg.resolved_ip = ip
-                async with xray_lock:
-                    xray_checked += 1
-                    if xray_checked % 100 == 0:
-                        elapsed_x = time.time() - xray_start
-                        logger.info(f"📊 Xray: {xray_checked}/{xray_total} (рабочих: {len(xray_working)}) | {xray_checked/elapsed_x:.1f} конф/сек")
-                if ok:
-                    async with xray_lock: xray_working.append(cfg)
-                return cfg
+        all_results = []
 
-        xray_heartbeat = asyncio.create_task(self._heartbeat("Xray")) if xray_total > 50 else None
-        await asyncio.gather(*[xray_check(c) for c in passed_prelim])
-        if xray_heartbeat: xray_heartbeat.cancel()
-        elapsed_x = time.time() - xray_start
-        logger.info(f"✅ Xray завершён за {elapsed_x/60:.1f} мин. Рабочих: {len(xray_working)} из {xray_total}")
-        return xray_working
+        # Xray
+        if xray_list:
+            xray_total = len(xray_list)
+            xray_working = []
+            xray_start = time.time()
+            xray_sem = asyncio.Semaphore(self.xray_max_concurrent)
+            xray_lock = asyncio.Lock()
+            xray_checked = 0
+
+            async def xray_check(cfg):
+                nonlocal xray_checked
+                async with xray_sem:
+                    ok, ip = await proxy_test(vars(cfg), self.xray_path, "xray")
+                    cfg.working = ok
+                    if ok:
+                        cfg.resolved_ip = ip
+                    async with xray_lock:
+                        xray_checked += 1
+                        if xray_checked % 100 == 0:
+                            elapsed_x = time.time() - xray_start
+                            logger.info(f"📊 Xray: {xray_checked}/{xray_total} (рабочих: {len(xray_working)}) | {xray_checked/elapsed_x:.1f} конф/сек")
+                    if ok:
+                        async with xray_lock: xray_working.append(cfg)
+                    return cfg
+
+            xray_heartbeat = asyncio.create_task(self._heartbeat("Xray")) if xray_total > 50 else None
+            await asyncio.gather(*[xray_check(c) for c in xray_list])
+            if xray_heartbeat: xray_heartbeat.cancel()
+            elapsed_x = time.time() - xray_start
+            logger.info(f"✅ Xray завершён за {elapsed_x/60:.1f} мин. Рабочих: {len(xray_working)} из {xray_total}")
+            all_results.extend(xray_working)
+
+        # Sing‑box
+        if singbox_list:
+            sb_total = len(singbox_list)
+            sb_working = []
+            sb_start = time.time()
+            sb_sem = asyncio.Semaphore(10)
+            sb_lock = asyncio.Lock()
+            sb_checked = 0
+
+            async def sb_check(cfg):
+                nonlocal sb_checked
+                async with sb_sem:
+                    ok, ip = await proxy_test(vars(cfg), self.singbox_path, "singbox")
+                    cfg.working = ok
+                    if ok:
+                        cfg.resolved_ip = ip
+                    async with sb_lock:
+                        sb_checked += 1
+                        if sb_checked % 50 == 0:
+                            elapsed_sb = time.time() - sb_start
+                            logger.info(f"📊 Sing‑box: {sb_checked}/{sb_total} (рабочих: {len(sb_working)}) | {sb_checked/elapsed_sb:.1f} конф/сек")
+                    if ok:
+                        async with sb_lock: sb_working.append(cfg)
+                    return cfg
+
+            sb_heartbeat = asyncio.create_task(self._heartbeat("Sing‑box")) if sb_total > 30 else None
+            await asyncio.gather(*[sb_check(c) for c in singbox_list])
+            if sb_heartbeat: sb_heartbeat.cancel()
+            elapsed_sb = time.time() - sb_start
+            logger.info(f"✅ Sing‑box завершён за {elapsed_sb/60:.1f} мин. Рабочих: {len(sb_working)} из {sb_total}")
+            all_results.extend(sb_working)
+
+        return all_results
 
     async def _heartbeat(self, name):
         while True:
@@ -403,6 +514,7 @@ class SubscriptionParser:
         except Exception as e: logger.warning(f"Ошибка загрузки {url}: {e}"); return None
 
     def decode_subscription(self, content):
+        # ... без изменений ...
         if content.strip().startswith(('proxies:', 'Proxy:')):
             try:
                 data = yaml.safe_load(content)
@@ -460,6 +572,7 @@ class SubscriptionParser:
         return None
 
     async def _parse_telegram_channels(self):
+        # ... без изменений ...
         tg_file = Path("sources_tg.txt")
         if not tg_file.exists(): return []
         channels = []
@@ -556,35 +669,38 @@ class SourceManager:
             with open(self.failed_file, 'a') as f: f.write(f"{url}\n")
         except Exception as e: logger.error(f"Не удалось записать {self.failed_file}: {e}")
 
-# ---------- Сохранение ----------
-def save_subscriptions(configs, output_dir="."):
+# ---------- Сохранение с асинхронным форматированием ----------
+async def save_subscriptions(configs, output_dir="."):
     out_path = Path(output_dir)
     out_path.mkdir(exist_ok=True)
     working = [c for c in configs if c.working]
-    # Сортировка по приоритету протокола, затем по пингу
     working.sort(key=protocol_sort_key)
-    logger.info(f"Рабочих (после Xray): {len(working)}")
+    logger.info(f"Рабочих (после финальной проверки): {len(working)}")
     if not working:
         logger.warning("Нет рабочих конфигураций. Выходные файлы будут пустыми.")
         return
 
+    # Прогреваем кэш стран для всех рабочих конфигураций
+    for cfg in working:
+        await cfg.format_name_async()
+
     # Android — 5000 лучших
     android_list = working[:5000]
     (out_path / "sub_android.txt").write_text(
-        HEADER + "\n".join(f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in android_list),
+        HEADER + "\n".join(f"{c.to_uri().split('#')[0]}#{await c.format_name_async()}" for c in android_list),
         encoding='utf-8'
     )
 
     # iOS — 300 лучших
     ios_list = working[:300]
     (out_path / "sub_ios.txt").write_text(
-        HEADER + "\n".join(f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in ios_list),
+        HEADER + "\n".join(f"{c.to_uri().split('#')[0]}#{await c.format_name_async()}" for c in ios_list),
         encoding='utf-8'
     )
 
     # Общий файл
     (out_path / "sub_all_checked.txt").write_text(
-        HEADER + "\n".join(f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in working),
+        HEADER + "\n".join(f"{c.to_uri().split('#')[0]}#{await c.format_name_async()}" for c in working),
         encoding='utf-8'
     )
 
@@ -594,7 +710,7 @@ def save_subscriptions(configs, output_dir="."):
         if items:
             items.sort(key=lambda x: x.latency if x.latency else 999999)
             (out_path / f"sub_{proto}.txt").write_text(
-                HEADER + "\n".join(f"{c.to_uri().split('#')[0]}#{c.format_name()}" for c in items[:5000]),
+                HEADER + "\n".join(f"{c.to_uri().split('#')[0]}#{await c.format_name_async()}" for c in items[:5000]),
                 encoding='utf-8'
             )
 
@@ -625,7 +741,7 @@ async def main():
         configs = await parser.collect_all()
         if configs:
             working = await parser.checker.check_batch(configs)
-            save_subscriptions(working)
+            await save_subscriptions(working)
 
 if __name__ == "__main__":
     asyncio.run(main())
