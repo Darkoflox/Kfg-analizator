@@ -45,3 +45,4 @@ https://raw.githubusercontent.com/Hidashimora/free-vpn-anti-rkn/main/configs/32.
 https://raw.githubusercontent.com/Hidashimora/free-vpn-anti-rkn/main/configs/30.txt
 https://raw.githubusercontent.com/Hidashimora/free-vpn-anti-rkn/main/configs/32.2.txt
 https://raw.githubusercontent.com/ewecrow78-gif/whitelist1/main/list.txt
+https://raw.githubusercontent.com/Maskkost93/kizyak-vpn-4.0/refs/heads/main/kizyakbeta6.txt
