@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """
-Финальный парсер «БС» с раздельной проверкой:
-- VLESS / VMess / Trojan / SS → Xray
-- Hysteria2 / TUIC → Sing‑box
-Надёжное определение страны (GeoIP + несколько IP‑сервисов).
-Android: ровно 5000 рабочих, iOS: 300 лучших.
+Финальный парсер «БС» с максимальным охватом рабочих конфигураций.
+Проверка: Xray (vless/vmess/trojan/ss) + hysteria2 + tuic-client.
+Масштабируемый сбор, надёжное GeoIP, приоритет протоколов.
 """
 import asyncio, base64, hashlib, json, logging, os, random, re, socket, ssl, subprocess, tempfile, time
 from argparse import ArgumentParser
@@ -36,7 +34,6 @@ TLD_FLAGS = {
     'kz': '🇰🇿', 'uz': '🇺🇿', 'ge': '🇬🇪', 'am': '🇦🇲', 'az': '🇦🇿', 'md': '🇲🇩',
     'by': '🇧🇾', 'lt': '🇱🇹', 'lv': '🇱🇻', 'ee': '🇪🇪', 'sk': '🇸🇰', 'si': '🇸🇮',
     'lu': '🇱🇺', 'mt': '🇲🇹', 'cy': '🇨🇾', 'is': '🇮🇸', 'ie': '🇮🇪', 'be': '🇧🇪',
-    # расширенный список (глобальные домены)
     'net': '🌐', 'org': '🌐', 'com': '🌐', 'xyz': '🌐', 'info': '🌐', 'online': '🌐',
     'club': '🌐', 'site': '🌐', 'tech': '🌐', 'dev': '🌐', 'cloud': '🌐', 'blog': '🌐',
     'shop': '🌐', 'store': '🌐', 'pro': '🌐', 'top': '🌐', 'ltd': '🌐', 'biz': '🌐',
@@ -66,14 +63,10 @@ TG_MIRRORS = [
 HEADER = "# profile-title: Niyakwi⚪ | БС | обновление каждые 6 часов\n# profile-update-interval: 6\n"
 
 XRAY_URL = "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
-SINGBOX_URL = "https://github.com/SagerNet/sing-box/releases/download/v1.10.0/sing-box-1.10.0-linux-amd64.tar.gz"
+HYSTERIA2_URL = "https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-amd64"
+TUIC_CLIENT_URL = "https://github.com/EAimTY/tuic/releases/latest/download/tuic-client-linux-amd64"
 
-# Несколько сервисов для определения IP (пробуются по очереди)
-IP_SERVICES = [
-    "http://ifconfig.me",
-    "http://icanhazip.com",
-    "http://ipinfo.io/ip",
-]
+IP_SERVICES = ["http://ifconfig.me", "http://icanhazip.com", "http://ipinfo.io/ip"]
 GEOIP_DB_URLS = [
     "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-Country.mmdb",
     "https://github.com/Loyalsoldier/geoip/releases/latest/download/Country.mmdb",
@@ -97,25 +90,21 @@ async def get_geoip_reader():
         if db_path.exists():
             try:
                 _geoip_reader = geoip2.database.Reader(str(db_path))
-                logger.info("✅ GeoIP база загружена из кэша")
                 return _geoip_reader
-            except Exception as e:
-                logger.error(f"Ошибка загрузки GeoIP: {e}")
+            except Exception:
+                pass
         for url in GEOIP_DB_URLS:
             try:
                 logger.info(f"📥 Скачиваем GeoIP базу с {url}...")
                 loop = asyncio.get_event_loop()
                 await loop.run_in_executor(None, lambda: __import__('urllib.request').request.urlretrieve(url, db_path))
                 _geoip_reader = geoip2.database.Reader(str(db_path))
-                logger.info("✅ GeoIP база успешно загружена")
                 return _geoip_reader
-            except Exception as e:
-                logger.warning(f"Не удалось загрузить GeoIP с {url}: {e}")
+            except Exception:
                 continue
-        logger.error("Не удалось загрузить GeoIP базу ни с одного источника")
+        logger.error("Не удалось загрузить GeoIP базу")
         return None
 
-# Кэш IP → страна
 _country_cache: Dict[str, Optional[str]] = {}
 
 async def get_country(ip: str) -> Optional[str]:
@@ -154,24 +143,35 @@ def ensure_xray() -> str:
     Path("xray.zip").unlink()
     return str(Path("xray").absolute())
 
-def ensure_singbox() -> str:
-    singbox_bin = "sing-box"
-    if Path(singbox_bin).exists():
-        return str(Path(singbox_bin).absolute())
-    logger.info("📥 Скачиваем Sing‑box...")
-    import urllib.request, tarfile
-    urllib.request.urlretrieve(SINGBOX_URL, "sing-box.tar.gz")
-    with tarfile.open("sing-box.tar.gz", "r:gz") as tar:
-        for member in tar.getmembers():
-            if member.name.endswith("sing-box"):
-                tar.extract(member)
-                os.chmod("sing-box", 0o755)
-                break
-    Path("sing-box.tar.gz").unlink()
-    return str(Path("sing-box").absolute())
+def ensure_hysteria2() -> Optional[str]:
+    bin_name = "hysteria2"
+    if Path(bin_name).exists():
+        return str(Path(bin_name).absolute())
+    logger.info("📥 Скачиваем Hysteria2...")
+    try:
+        import urllib.request
+        urllib.request.urlretrieve(HYSTERIA2_URL, bin_name)
+        os.chmod(bin_name, 0o755)
+        return str(Path(bin_name).absolute())
+    except Exception as e:
+        logger.error(f"Не удалось загрузить Hysteria2: {e}")
+        return None
+
+def ensure_tuic_client() -> Optional[str]:
+    bin_name = "tuic-client"
+    if Path(bin_name).exists():
+        return str(Path(bin_name).absolute())
+    logger.info("📥 Скачиваем TUIC-клиент...")
+    try:
+        import urllib.request
+        urllib.request.urlretrieve(TUIC_CLIENT_URL, bin_name)
+        os.chmod(bin_name, 0o755)
+        return str(Path(bin_name).absolute())
+    except Exception as e:
+        logger.error(f"Не удалось загрузить TUIC-клиент: {e}")
+        return None
 
 def build_xray_config(cfg: dict, socks_port: int) -> dict:
-    # ... без изменений ...
     outbound = {
         "protocol": cfg["protocol"],
         "settings": {},
@@ -197,22 +197,27 @@ def build_xray_config(cfg: dict, socks_port: int) -> dict:
         outbound["settings"]["servers"] = [{"address": cfg["host"], "port": cfg["port"], "method": cfg.get("method", ""), "password": cfg.get("password", "")}]
     return {"log": {"loglevel": "warning"}, "inbounds": [{"listen": "127.0.0.1", "port": socks_port, "protocol": "socks"}], "outbounds": [outbound]}
 
-def build_singbox_config(cfg: dict, socks_port: int) -> dict:
-    outbound = {
-        "type": cfg["protocol"],
-        "server": cfg["host"],
-        "server_port": cfg["port"],
-        "tls": {"enabled": cfg.get("tls") != "none", "server_name": cfg.get("sni") or cfg["host"]},
-    }
-    if cfg["protocol"] == "hysteria2":
-        outbound["password"] = cfg.get("password", "")
-    elif cfg["protocol"] == "tuic":
-        outbound["uuid"] = cfg.get("uuid", "")
-        outbound["password"] = cfg.get("password", "")
+def build_hysteria2_config(cfg: dict, socks_port: int) -> dict:
     return {
-        "log": {"level": "error"},
-        "inbounds": [{"type": "socks", "listen": "127.0.0.1", "listen_port": socks_port}],
-        "outbounds": [outbound]
+        "server": f"{cfg['host']}:{cfg['port']}",
+        "auth": cfg.get("password", ""),
+        "socks5": {"listen": f"127.0.0.1:{socks_port}"},
+        "tls": {
+            "sni": cfg.get("sni", cfg["host"]),
+            "insecure": True
+        }
+    }
+
+def build_tuic_config(cfg: dict, socks_port: int) -> dict:
+    return {
+        "server": f"{cfg['host']}:{cfg['port']}",
+        "uuid": cfg.get("uuid", ""),
+        "password": cfg.get("password", ""),
+        "socks5": {"listen": f"127.0.0.1:{socks_port}"},
+        "tls": {
+            "sni": cfg.get("sni", cfg["host"]),
+            "insecure": True
+        }
     }
 
 def _find_free_port() -> int:
@@ -221,23 +226,28 @@ def _find_free_port() -> int:
         return s.getsockname()[1]
 
 async def proxy_test(cfg: dict, runner_path: str, runner_type: str) -> Tuple[bool, Optional[str]]:
-    """Универсальный тест для Xray или Sing‑box."""
     socks_port = _find_free_port()
     if runner_type == "xray":
         config = build_xray_config(cfg, socks_port)
+    elif runner_type == "hysteria2":
+        config = build_hysteria2_config(cfg, socks_port)
+    elif runner_type == "tuic":
+        config = build_tuic_config(cfg, socks_port)
     else:
-        config = build_singbox_config(cfg, socks_port)
+        return False, None
+
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
         json.dump(config, f)
         config_path = f.name
     proc = None
     try:
-        proc = subprocess.Popen([runner_path, "run", "-c", config_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        cmd = [runner_path, "run", "-c", config_path] if runner_type == "xray" else [runner_path, "-c", config_path]
+        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         await asyncio.sleep(1.5)
         for service_url in IP_SERVICES:
             try:
-                cmd = ["curl", "-s", "--socks5-hostname", f"127.0.0.1:{socks_port}", "--max-time", "8", service_url]
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=12)
+                curl_cmd = ["curl", "-s", "--socks5-hostname", f"127.0.0.1:{socks_port}", "--max-time", "8", service_url]
+                result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=12)
                 ip = result.stdout.strip()
                 if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", ip):
                     return True, ip
@@ -273,7 +283,7 @@ class ProxyConfig:
     latency: Optional[float] = None
     working: bool = False
     resolved_ip: Optional[str] = None
-    country_code: Optional[str] = None   # кэш страны
+    country_code: Optional[str] = None
     remarks: Optional[str] = None
     id: str = field(default_factory=lambda: hashlib.md5(str(random.random()).encode()).hexdigest()[:8])
 
@@ -285,13 +295,11 @@ class ProxyConfig:
         return self.raw
 
     async def format_name_async(self) -> str:
-        """Асинхронное получение имени с GeoIP."""
         if self.country_code is None and self.resolved_ip:
             self.country_code = await get_country(self.resolved_ip)
         if self.country_code:
             flag = TLD_FLAGS.get(self.country_code.lower(), '🏳️')
             return f"{flag} {self.country_code.upper()}"
-        # fallback на TLD
         parts = self.host.split('.')
         tld = parts[-1].lower() if len(parts) >= 2 else ''
         code = TLD_TO_CODE.get(tld)
@@ -310,21 +318,24 @@ def protocol_sort_key(cfg):
     latency = cfg.latency if cfg.latency else 999999
     return (-priority, latency)
 
+# ---------- Чекер ----------
 class ProxyChecker:
     def __init__(self, max_concurrent: int = 20, xray_max_concurrent: int = 20):
         self.max_concurrent = max_concurrent
         self.xray_max_concurrent = xray_max_concurrent
         self.xray_path = ensure_xray()
-        self.singbox_path = ensure_singbox()
+        self.hysteria2_path = ensure_hysteria2()
+        self.tuic_client_path = ensure_tuic_client()
 
     def _parse_uri(self, uri: str) -> Optional[ProxyConfig]:
-        # ... без изменений ...
         try:
             proto = uri.split('://')[0].lower()
-            if proto not in SUPPORTED_PROTOCOLS: return None
+            if proto not in SUPPORTED_PROTOCOLS:
+                return None
             parsed = urlparse(uri)
             host, port = parsed.hostname, parsed.port
-            if not host or not port: return None
+            if not host or not port:
+                return None
             cfg = ProxyConfig(raw=uri, protocol=proto, host=host, port=port)
             if proto == 'vmess':
                 b64 = uri[8:] + '=' * ((4 - len(uri[8:]) % 4) % 4)
@@ -353,7 +364,8 @@ class ProxyChecker:
                 params = parse_qs(parsed.query)
                 cfg.sni = params.get('sni', [None])[0]; cfg.tls = 'tls'; cfg.transport = 'udp'
             return cfg
-        except Exception: return None
+        except Exception:
+            return None
 
     def _tcp_check(self, host: str, port: int, timeout: float = 3.0) -> Tuple[bool, float]:
         start = time.time()
@@ -364,7 +376,8 @@ class ProxyChecker:
             sock.close()
             if result == 0:
                 return True, (time.time() - start) * 1000
-        except Exception: pass
+        except Exception:
+            pass
         return False, 0.0
 
     def _tls_check(self, host: str, port: int, sni: Optional[str] = None, timeout: float = 4.0) -> bool:
@@ -372,13 +385,17 @@ class ProxyChecker:
             context = ssl.create_default_context()
             context.check_hostname = False; context.verify_mode = ssl.CERT_NONE
             with socket.create_connection((host, port), timeout=timeout) as sock:
-                with context.wrap_socket(sock, server_hostname=sni or host): return True
-        except Exception: return False
+                with context.wrap_socket(sock, server_hostname=sni or host):
+                    return True
+        except Exception:
+            return False
 
     def test_config_preliminary(self, cfg: ProxyConfig) -> Tuple[bool, float]:
         ok, latency = self._tcp_check(cfg.host, cfg.port)
-        if not ok: return False, 0.0
-        if cfg.tls != 'none' and not self._tls_check(cfg.host, cfg.port, cfg.sni): return False, latency
+        if not ok:
+            return False, 0.0
+        if cfg.tls != 'none' and not self._tls_check(cfg.host, cfg.port, cfg.sni):
+            return False, latency
         return True, latency
 
     async def check_batch(self, configs: List[ProxyConfig]) -> List[ProxyConfig]:
@@ -395,26 +412,31 @@ class ProxyChecker:
                 loop = asyncio.get_event_loop()
                 with ThreadPoolExecutor() as ex:
                     ok, lat = await loop.run_in_executor(ex, self.test_config_preliminary, cfg)
-                if ok: cfg.latency = lat
+                if ok:
+                    cfg.latency = lat
                 async with lock:
                     checked += 1
                     if checked % 500 == 0:
                         elapsed = time.time() - start
                         logger.info(f"📊 TCP+TLS: {checked}/{total} (прошло: {len(passed_prelim)}) | {checked/elapsed:.1f} конф/сек")
                 if ok:
-                    async with lock: passed_prelim.append(cfg)
+                    async with lock:
+                        passed_prelim.append(cfg)
                 return cfg
 
         heartbeat = asyncio.create_task(self._heartbeat("TCP+TLS")) if total > 1000 else None
         await asyncio.gather(*[pre_check(c) for c in configs])
-        if heartbeat: heartbeat.cancel()
+        if heartbeat:
+            heartbeat.cancel()
         elapsed = time.time() - start
         logger.info(f"✅ TCP+TLS завершён за {elapsed/60:.1f} мин. Прошло: {len(passed_prelim)} из {total}")
 
-        if not passed_prelim: return []
+        if not passed_prelim:
+            return []
 
         xray_list = [c for c in passed_prelim if c.protocol in ('vmess', 'vless', 'trojan', 'ss', 'ssr')]
-        singbox_list = [c for c in passed_prelim if c.protocol in ('hysteria2', 'tuic')]
+        hysteria2_list = [c for c in passed_prelim if c.protocol == 'hysteria2']
+        tuic_list = [c for c in passed_prelim if c.protocol == 'tuic']
 
         all_results = []
 
@@ -440,47 +462,81 @@ class ProxyChecker:
                             elapsed_x = time.time() - xray_start
                             logger.info(f"📊 Xray: {xray_checked}/{xray_total} (рабочих: {len(xray_working)}) | {xray_checked/elapsed_x:.1f} конф/сек")
                     if ok:
-                        async with xray_lock: xray_working.append(cfg)
+                        async with xray_lock:
+                            xray_working.append(cfg)
                     return cfg
 
             xray_heartbeat = asyncio.create_task(self._heartbeat("Xray")) if xray_total > 50 else None
             await asyncio.gather(*[xray_check(c) for c in xray_list])
-            if xray_heartbeat: xray_heartbeat.cancel()
+            if xray_heartbeat:
+                xray_heartbeat.cancel()
             elapsed_x = time.time() - xray_start
             logger.info(f"✅ Xray завершён за {elapsed_x/60:.1f} мин. Рабочих: {len(xray_working)} из {xray_total}")
             all_results.extend(xray_working)
 
-        # Sing‑box
-        if singbox_list:
-            sb_total = len(singbox_list)
-            sb_working = []
-            sb_start = time.time()
-            sb_sem = asyncio.Semaphore(10)
-            sb_lock = asyncio.Lock()
-            sb_checked = 0
+        # Hysteria2
+        if hysteria2_list and self.hysteria2_path:
+            hyst_total = len(hysteria2_list)
+            hyst_working = []
+            hyst_start = time.time()
+            hyst_sem = asyncio.Semaphore(10)
+            hyst_lock = asyncio.Lock()
+            hyst_checked = 0
 
-            async def sb_check(cfg):
-                nonlocal sb_checked
-                async with sb_sem:
-                    ok, ip = await proxy_test(vars(cfg), self.singbox_path, "singbox")
+            async def hyst_check(cfg):
+                nonlocal hyst_checked
+                async with hyst_sem:
+                    ok, ip = await proxy_test(vars(cfg), self.hysteria2_path, "hysteria2")
                     cfg.working = ok
                     if ok:
                         cfg.resolved_ip = ip
-                    async with sb_lock:
-                        sb_checked += 1
-                        if sb_checked % 50 == 0:
-                            elapsed_sb = time.time() - sb_start
-                            logger.info(f"📊 Sing‑box: {sb_checked}/{sb_total} (рабочих: {len(sb_working)}) | {sb_checked/elapsed_sb:.1f} конф/сек")
+                    async with hyst_lock:
+                        hyst_checked += 1
+                        if hyst_checked % 50 == 0:
+                            elapsed_h = time.time() - hyst_start
+                            logger.info(f"📊 Hysteria2: {hyst_checked}/{hyst_total} (рабочих: {len(hyst_working)}) | {hyst_checked/elapsed_h:.1f} конф/сек")
                     if ok:
-                        async with sb_lock: sb_working.append(cfg)
+                        async with hyst_lock:
+                            hyst_working.append(cfg)
                     return cfg
 
-            sb_heartbeat = asyncio.create_task(self._heartbeat("Sing‑box")) if sb_total > 30 else None
-            await asyncio.gather(*[sb_check(c) for c in singbox_list])
-            if sb_heartbeat: sb_heartbeat.cancel()
-            elapsed_sb = time.time() - sb_start
-            logger.info(f"✅ Sing‑box завершён за {elapsed_sb/60:.1f} мин. Рабочих: {len(sb_working)} из {sb_total}")
-            all_results.extend(sb_working)
+            await asyncio.gather(*[hyst_check(c) for c in hysteria2_list])
+            logger.info(f"✅ Hysteria2 завершён. Рабочих: {len(hyst_working)} из {hyst_total}")
+            all_results.extend(hyst_working)
+        elif hysteria2_list:
+            logger.warning("Hysteria2-клиент недоступен – проверка пропущена.")
+
+        # TUIC
+        if tuic_list and self.tuic_client_path:
+            tuic_total = len(tuic_list)
+            tuic_working = []
+            tuic_start = time.time()
+            tuic_sem = asyncio.Semaphore(10)
+            tuic_lock = asyncio.Lock()
+            tuic_checked = 0
+
+            async def tuic_check(cfg):
+                nonlocal tuic_checked
+                async with tuic_sem:
+                    ok, ip = await proxy_test(vars(cfg), self.tuic_client_path, "tuic")
+                    cfg.working = ok
+                    if ok:
+                        cfg.resolved_ip = ip
+                    async with tuic_lock:
+                        tuic_checked += 1
+                        if tuic_checked % 50 == 0:
+                            elapsed_t = time.time() - tuic_start
+                            logger.info(f"📊 TUIC: {tuic_checked}/{tuic_total} (рабочих: {len(tuic_working)}) | {tuic_checked/elapsed_t:.1f} конф/сек")
+                    if ok:
+                        async with tuic_lock:
+                            tuic_working.append(cfg)
+                    return cfg
+
+            await asyncio.gather(*[tuic_check(c) for c in tuic_list])
+            logger.info(f"✅ TUIC завершён. Рабочих: {len(tuic_working)} из {tuic_total}")
+            all_results.extend(tuic_working)
+        elif tuic_list:
+            logger.warning("TUIC-клиент недоступен – проверка пропущена.")
 
         return all_results
 
@@ -492,8 +548,10 @@ class ProxyChecker:
 # ---------- Парсер ----------
 class SubscriptionParser:
     def __init__(self, timeout=30, max_concurrent=10, parse_telegram=False):
-        self.timeout = timeout; self.semaphore = asyncio.Semaphore(max_concurrent)
-        self.session = None; self.checker = ProxyChecker()
+        self.timeout = timeout
+        self.semaphore = asyncio.Semaphore(max_concurrent)
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.checker = ProxyChecker()
         self.source_manager = SourceManager()
         self.parse_telegram = parse_telegram
 
@@ -502,8 +560,9 @@ class SubscriptionParser:
         self.session = aiohttp.ClientSession(connector=conn, timeout=aiohttp.ClientTimeout(total=self.timeout))
         return self
 
-    async def __aexit__(self, *args):
-        if self.session: await self.session.close()
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self.session:
+            await self.session.close()
 
     async def fetch_content(self, url):
         try:
@@ -511,10 +570,11 @@ class SubscriptionParser:
                 async with self.session.get(url) as resp:
                     resp.raise_for_status()
                     return await resp.text()
-        except Exception as e: logger.warning(f"Ошибка загрузки {url}: {e}"); return None
+        except Exception as e:
+            logger.warning(f"Ошибка загрузки {url}: {e}")
+            return None
 
     def decode_subscription(self, content):
-        # ... без изменений ...
         if content.strip().startswith(('proxies:', 'Proxy:')):
             try:
                 data = yaml.safe_load(content)
@@ -532,12 +592,16 @@ class SubscriptionParser:
                         links.append(f"trojan://{p['password']}@{p['server']}:{p['port']}?sni={p.get('sni','')}#{p.get('name','')}")
                     elif t == 'vless':
                         links.append(f"vless://{p['uuid']}@{p['server']}:{p['port']}?security={p.get('security','none')}&type={p.get('network','tcp')}#{p.get('name','')}")
-                if links: return links
-            except Exception: pass
+                if links:
+                    return links
+            except Exception:
+                pass
         try:
             decoded = base64.b64decode(content, validate=True).decode('utf-8', errors='ignore')
-            if any(p in decoded for p in SUPPORTED_PROTOCOLS): return decoded.splitlines()
-        except Exception: pass
+            if any(p in decoded for p in SUPPORTED_PROTOCOLS):
+                return decoded.splitlines()
+        except Exception:
+            pass
         return content.splitlines()
 
     def extract_links(self, text):
@@ -546,18 +610,22 @@ class SubscriptionParser:
             link = match.group(0)
             for proto in SUPPORTED_PROTOCOLS:
                 idx = link.find(f"{proto}://")
-                if idx != -1: link = link[idx:]; break
+                if idx != -1:
+                    link = link[idx:]
+                    break
             links.append(link)
         return links
 
     async def parse_subscription(self, url):
         content = await self.fetch_content(url)
-        if not content: return []
+        if not content:
+            return []
         configs = []
         for line in self.decode_subscription(content):
             for link in self.extract_links(line):
                 cfg = self.checker._parse_uri(link)
-                if cfg: configs.append(cfg)
+                if cfg:
+                    configs.append(cfg)
         logger.info(f"Из {url} извлечено {len(configs)} конфигураций")
         return configs
 
@@ -567,39 +635,51 @@ class SubscriptionParser:
             headers = {'User-Agent': random.choice(TG_USER_AGENTS)}
             try:
                 async with self.session.get(url, headers=headers, allow_redirects=True) as resp:
-                    if resp.status == 200: return await resp.text()
-            except Exception: continue
+                    if resp.status == 200:
+                        return await resp.text()
+            except Exception:
+                continue
         return None
 
     async def _parse_telegram_channels(self):
-        # ... без изменений ...
         tg_file = Path("sources_tg.txt")
-        if not tg_file.exists(): return []
+        if not tg_file.exists():
+            return []
         channels = []
         with open(tg_file) as f:
             for line in f:
                 line = line.strip()
-                if not line or line.startswith('#'): continue
+                if not line or line.startswith('#'):
+                    continue
                 username = line
-                if username.startswith('@'): username = username[1:]
-                elif 't.me/' in username: username = username.split('/')[-1]
+                if username.startswith('@'):
+                    username = username[1:]
+                elif 't.me/' in username:
+                    parts = username.split('/')
+                    if len(parts) >= 2:
+                        username = parts[-1]
                 channels.append(username)
-        if not channels: return []
+        if not channels:
+            return []
         logger.info(f"Начинаем сбор из {len(channels)} Telegram-каналов...")
         all_configs = []
         seen_keys = set()
         for i, channel in enumerate(channels):
-            if i > 0: await asyncio.sleep(TG_REQUEST_DELAY + random.uniform(0.5, 1.5))
+            if i > 0:
+                await asyncio.sleep(TG_REQUEST_DELAY + random.uniform(0.5, 1.5))
             html = await self._fetch_tg_page(channel)
-            if not html: continue
+            if not html:
+                continue
             messages = []
             for block in re.findall(r'<div class="tgme_widget_message_text">(.*?)</div>', html, re.DOTALL):
                 text = re.sub(r'<[^>]+>', '', block).strip()
-                if text: messages.append(text)
+                if text:
+                    messages.append(text)
             if not messages:
                 for block in re.findall(r'<div class="tgme_widget_message_text"[^>]*>(.*?)</div>', html, re.DOTALL):
                     text = re.sub(r'<[^>]+>', '', block).strip()
-                    if text: messages.append(text)
+                    if text:
+                        messages.append(text)
             if not messages:
                 direct_links = self.extract_links(html)
                 for link in direct_links:
@@ -630,7 +710,8 @@ class SubscriptionParser:
         results = await asyncio.gather(*tasks, return_exceptions=True)
         all_configs = []
         for r in results:
-            if isinstance(r, list): all_configs.extend(r)
+            if isinstance(r, list):
+                all_configs.extend(r)
         if self.parse_telegram:
             tg_configs = await self._parse_telegram_channels()
             all_configs.extend(tg_configs)
@@ -645,7 +726,8 @@ class SubscriptionParser:
 
 class SourceManager:
     def __init__(self, sources_file="sources.txt", failed_file="failed_sources.txt"):
-        self.sources_file = sources_file; self.failed_file = failed_file
+        self.sources_file = sources_file
+        self.failed_file = failed_file
 
     def load_sources(self):
         try:
@@ -656,20 +738,24 @@ class SourceManager:
             all_sources = DEFAULT_SOURCES
             with open(self.sources_file, 'w') as f:
                 f.write("# Список источников подписок\n")
-                for url in all_sources: f.write(f"{url}\n")
+                for url in all_sources:
+                    f.write(f"{url}\n")
         failed = set()
         if Path(self.failed_file).exists():
-            with open(self.failed_file) as f: failed = {line.strip() for line in f if line.strip()}
+            with open(self.failed_file) as f:
+                failed = {line.strip() for line in f if line.strip()}
         active = [url for url in all_sources if url not in failed]
         logger.info(f"Активных источников: {len(active)} (пропущено проблемных: {len(failed)})")
         return active
 
     def mark_failed(self, url):
         try:
-            with open(self.failed_file, 'a') as f: f.write(f"{url}\n")
-        except Exception as e: logger.error(f"Не удалось записать {self.failed_file}: {e}")
+            with open(self.failed_file, 'a') as f:
+                f.write(f"{url}\n")
+        except Exception as e:
+            logger.error(f"Не удалось записать {self.failed_file}: {e}")
 
-# ---------- Сохранение с асинхронным форматированием ----------
+# ---------- Сохранение ----------
 async def save_subscriptions(configs, output_dir="."):
     out_path = Path(output_dir)
     out_path.mkdir(exist_ok=True)
@@ -680,18 +766,18 @@ async def save_subscriptions(configs, output_dir="."):
         logger.warning("Нет рабочих конфигураций. Выходные файлы будут пустыми.")
         return
 
-    # Прогреваем кэш стран для всех рабочих конфигураций
+    # Прогрев кэша GeoIP
     for cfg in working:
         await cfg.format_name_async()
 
-    # Android — 5000 лучших
+    # Android (5000)
     android_list = working[:5000]
     (out_path / "sub_android.txt").write_text(
         HEADER + "\n".join(f"{c.to_uri().split('#')[0]}#{await c.format_name_async()}" for c in android_list),
         encoding='utf-8'
     )
 
-    # iOS — 300 лучших
+    # iOS (300)
     ios_list = working[:300]
     (out_path / "sub_ios.txt").write_text(
         HEADER + "\n".join(f"{c.to_uri().split('#')[0]}#{await c.format_name_async()}" for c in ios_list),
@@ -715,14 +801,18 @@ async def save_subscriptions(configs, output_dir="."):
             )
 
     # Ссылки
-    repo_user = "Darkoflox"; repo_name = "Kfg-analizator"; branch = "main"
+    repo_user = "Darkoflox"
+    repo_name = "Kfg-analizator"
+    branch = "main"
     base = f"https://raw.githubusercontent.com/{repo_user}/{repo_name}/{branch}"
     cdn_statically = f"https://cdn.statically.io/gh/{repo_user}/{repo_name}/{branch}"
     cdn_jsdelivr = f"https://cdn.jsdelivr.net/gh/{repo_user}/{repo_name}@{branch}"
-    sub_files = ["sub_android.txt", "sub_ios.txt", "sub_all_checked.txt"] + [f"sub_{p}.txt" for p in SUPPORTED_PROTOCOLS if (out_path / f"sub_{p}.txt").exists()]
+    sub_files = ["sub_android.txt", "sub_ios.txt", "sub_all_checked.txt"] + \
+                [f"sub_{p}.txt" for p in SUPPORTED_PROTOCOLS if (out_path / f"sub_{p}.txt").exists()]
     with open(out_path / "subscription_urls.txt", "w", encoding='utf-8') as f:
         f.write("# Прямые ссылки (основные)\n")
-        for sf in sub_files: f.write(f"{base}/{sf}\n")
+        for sf in sub_files:
+            f.write(f"{base}/{sf}\n")
         f.write("\n# Обходные ссылки (для регионов с блокировкой raw.githubusercontent.com)\n")
         for sf in sub_files:
             f.write(f"# {sf}\n{cdn_statically}/{sf}\n{cdn_jsdelivr}/{sf}\n")
