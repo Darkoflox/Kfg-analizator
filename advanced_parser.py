@@ -2,16 +2,31 @@
 """
 Финальный парсер «БС» с максимальным охватом рабочих конфигураций.
 Проверка: Xray (vless/vmess/trojan/ss) + hysteria2 + tuic-client.
-Оптимизирован для скорости: асинхронное ожидание SOCKS, уменьшенные таймауты, быстрые IP‑сервисы.
 Масштабируемый сбор, надёжное GeoIP, приоритет протоколов.
+Оптимизированная скорость.
 """
-import asyncio, base64, hashlib, json, logging, os, random, re, socket, ssl, subprocess, tempfile, time
+
+import asyncio
+import base64
+import hashlib
+import json
+import logging
+import os
+import random
+import re
+import socket
+import ssl
+import subprocess
+import tempfile
+import time
 from argparse import ArgumentParser
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlparse, unquote
-import aiohttp, yaml
+
+import aiohttp
+import yaml
 
 try:
     import geoip2.database
@@ -19,9 +34,13 @@ try:
 except ImportError:
     GEOIP_AVAILABLE = False
 
+# Настройка логгера
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# ------------------------------------------------------------
+# Конфигурация и константы
+# ------------------------------------------------------------
 SUPPORTED_PROTOCOLS = {'vmess', 'vless', 'trojan', 'ss', 'ssr', 'hysteria2', 'tuic'}
 PROXY_LINK_PATTERN = re.compile(r'(vmess|vless|trojan|ss|ssr|hysteria2|tuic)://[^\s#]+', re.IGNORECASE)
 
@@ -67,7 +86,6 @@ XRAY_URL = "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linu
 HYSTERIA2_URL = "https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-amd64"
 TUIC_CLIENT_URL = "https://github.com/EAimTY/tuic/releases/latest/download/tuic-client-linux-amd64"
 
-# Порядок сервисов: самый быстрый первым
 IP_SERVICES = [
     "http://icanhazip.com",
     "http://ipinfo.io/ip",
@@ -79,7 +97,9 @@ GEOIP_DB_URLS = [
     "https://cdn.jsdelivr.net/gh/P3TERX/GeoLite.mmdb/GeoLite2-Country.mmdb",
 ]
 
-# ---------- GeoIP ----------
+# ------------------------------------------------------------
+# GeoIP (асинхронная загрузка и кэширование)
+# ------------------------------------------------------------
 _geoip_reader = None
 _geoip_lock = asyncio.Lock()
 
@@ -132,7 +152,9 @@ async def get_country(ip: str) -> Optional[str]:
         _country_cache[ip] = None
         return None
 
-# ---------- Инструменты ----------
+# ------------------------------------------------------------
+# Инструменты проверки (загрузка и тестирование)
+# ------------------------------------------------------------
 def ensure_xray() -> str:
     xray_bin = "xray"
     if Path(xray_bin).exists():
@@ -232,7 +254,6 @@ def _find_free_port() -> int:
         return s.getsockname()[1]
 
 async def _wait_for_socks(port: int, timeout: float = 3.0) -> bool:
-    """Ожидание открытия SOCKS-порта."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         try:
@@ -265,7 +286,6 @@ async def proxy_test(cfg: dict, runner_path: str, runner_type: str) -> Tuple[boo
     try:
         cmd = [runner_path, "run", "-c", config_path] if runner_type == "xray" else [runner_path, "-c", config_path]
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        # Ожидаем открытия порта вместо фиксированной задержки
         if not await _wait_for_socks(socks_port, timeout=3.0):
             return False, None
         for service_url in IP_SERVICES:
@@ -288,7 +308,9 @@ async def proxy_test(cfg: dict, runner_path: str, runner_type: str) -> Tuple[boo
         try: Path(config_path).unlink()
         except: pass
 
-# ---------- Модель ----------
+# ------------------------------------------------------------
+# Модель конфигурации
+# ------------------------------------------------------------
 from dataclasses import dataclass, field
 
 @dataclass
@@ -342,7 +364,9 @@ def protocol_sort_key(cfg):
     latency = cfg.latency if cfg.latency else 999999
     return (-priority, latency)
 
-# ---------- Чекер ----------
+# ------------------------------------------------------------
+# Чекер (TCP+TLS и специфические проверки)
+# ------------------------------------------------------------
 class ProxyChecker:
     def __init__(self, max_concurrent: int = 20, xray_max_concurrent: int = 30):
         self.max_concurrent = max_concurrent
@@ -503,7 +527,7 @@ class ProxyChecker:
             hyst_total = len(hysteria2_list)
             hyst_working = []
             hyst_start = time.time()
-            hyst_sem = asyncio.Semaphore(min(10, self.xray_max_concurrent))  # не более 10, чтобы не перегружать
+            hyst_sem = asyncio.Semaphore(min(10, self.xray_max_concurrent))
             hyst_lock = asyncio.Lock()
             hyst_checked = 0
 
@@ -569,7 +593,9 @@ class ProxyChecker:
             await asyncio.sleep(30)
             logger.info(f"⏳ {name} проверка продолжается...")
 
-# ---------- Парсер ----------
+# ------------------------------------------------------------
+# Парсер подписок (URL + Telegram)
+# ------------------------------------------------------------
 class SubscriptionParser:
     def __init__(self, timeout=30, max_concurrent=10, parse_telegram=False):
         self.timeout = timeout
@@ -748,6 +774,9 @@ class SubscriptionParser:
         logger.info(f"Всего собрано {len(unique)} уникальных конфигураций")
         return unique
 
+# ------------------------------------------------------------
+# Источники и управление ими
+# ------------------------------------------------------------
 class SourceManager:
     def __init__(self, sources_file="sources.txt", failed_file="failed_sources.txt"):
         self.sources_file = sources_file
@@ -779,7 +808,9 @@ class SourceManager:
         except Exception as e:
             logger.error(f"Не удалось записать {self.failed_file}: {e}")
 
-# ---------- Сохранение ----------
+# ------------------------------------------------------------
+# Сохранение подписок (с GeoIP)
+# ------------------------------------------------------------
 async def save_subscriptions(configs, output_dir="."):
     out_path = Path(output_dir)
     out_path.mkdir(exist_ok=True)
@@ -796,21 +827,30 @@ async def save_subscriptions(configs, output_dir="."):
 
     # Android (5000)
     android_list = working[:5000]
+    android_lines = []
+    for c in android_list:
+        android_lines.append(f"{c.to_uri().split('#')[0]}#{await c.format_name_async()}")
     (out_path / "sub_android.txt").write_text(
-        HEADER + "\n".join(f"{c.to_uri().split('#')[0]}#{await c.format_name_async()}" for c in android_list),
+        HEADER + "\n".join(android_lines),
         encoding='utf-8'
     )
 
     # iOS (300)
     ios_list = working[:300]
+    ios_lines = []
+    for c in ios_list:
+        ios_lines.append(f"{c.to_uri().split('#')[0]}#{await c.format_name_async()}")
     (out_path / "sub_ios.txt").write_text(
-        HEADER + "\n".join(f"{c.to_uri().split('#')[0]}#{await c.format_name_async()}" for c in ios_list),
+        HEADER + "\n".join(ios_lines),
         encoding='utf-8'
     )
 
     # Общий файл
+    all_lines = []
+    for c in working:
+        all_lines.append(f"{c.to_uri().split('#')[0]}#{await c.format_name_async()}")
     (out_path / "sub_all_checked.txt").write_text(
-        HEADER + "\n".join(f"{c.to_uri().split('#')[0]}#{await c.format_name_async()}" for c in working),
+        HEADER + "\n".join(all_lines),
         encoding='utf-8'
     )
 
@@ -819,8 +859,11 @@ async def save_subscriptions(configs, output_dir="."):
         items = [c for c in working if c.protocol == proto]
         if items:
             items.sort(key=lambda x: x.latency if x.latency else 999999)
+            proto_lines = []
+            for c in items[:5000]:
+                proto_lines.append(f"{c.to_uri().split('#')[0]}#{await c.format_name_async()}")
             (out_path / f"sub_{proto}.txt").write_text(
-                HEADER + "\n".join(f"{c.to_uri().split('#')[0]}#{await c.format_name_async()}" for c in items[:5000]),
+                HEADER + "\n".join(proto_lines),
                 encoding='utf-8'
             )
 
@@ -842,10 +885,13 @@ async def save_subscriptions(configs, output_dir="."):
             f.write(f"# {sf}\n{cdn_statically}/{sf}\n{cdn_jsdelivr}/{sf}\n")
     logger.info(f"🔗 Файл со ссылками: {out_path / 'subscription_urls.txt'}")
 
+# ------------------------------------------------------------
+# Точка входа
+# ------------------------------------------------------------
 async def main():
     parser_arg = ArgumentParser()
     parser_arg.add_argument('--threads', type=int, default=30)
-    parser_arg.add_argument('--xray-threads', type=int, default=40)  # увеличено
+    parser_arg.add_argument('--xray-threads', type=int, default=40)
     parser_arg.add_argument('--parse-telegram', action='store_true')
     args = parser_arg.parse_args()
 
