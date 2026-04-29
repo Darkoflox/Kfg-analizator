@@ -7,7 +7,7 @@ on:
 
 jobs:
   update:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     timeout-minutes: 90
     permissions:
       contents: write
@@ -22,8 +22,8 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run parser (Telegram, all checks)
-        run: python advanced_parser.py --threads 30 --xray-threads 20 --parse-telegram
+      - name: Run parser (Telegram, all checks, high parallelism)
+        run: python advanced_parser.py --threads 30 --xray-threads 40 --parse-telegram
 
       - name: Update README with subscription links
         run: python update_readme.py
@@ -31,5 +31,5 @@ jobs:
       - name: Commit and push changes
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "Автообновление (расширенная проверка) и README"
+          commit_message: "Автообновление (оптимизированное) и README"
           file_pattern: '*.txt README.md'
