@@ -2,6 +2,7 @@
 """
 Финальный парсер «БС» с максимальным охватом рабочих конфигураций.
 Проверка: Xray (vless/vmess/trojan/ss) + hysteria2 + tuic-client.
+Оптимизирован для скорости: асинхронное ожидание SOCKS, уменьшенные таймауты, быстрые IP‑сервисы.
 Масштабируемый сбор, надёжное GeoIP, приоритет протоколов.
 """
 import asyncio, base64, hashlib, json, logging, os, random, re, socket, ssl, subprocess, tempfile, time
@@ -66,7 +67,12 @@ XRAY_URL = "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linu
 HYSTERIA2_URL = "https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-amd64"
 TUIC_CLIENT_URL = "https://github.com/EAimTY/tuic/releases/latest/download/tuic-client-linux-amd64"
 
-IP_SERVICES = ["http://ifconfig.me", "http://icanhazip.com", "http://ipinfo.io/ip"]
+# Порядок сервисов: самый быстрый первым
+IP_SERVICES = [
+    "http://icanhazip.com",
+    "http://ipinfo.io/ip",
+    "http://ifconfig.me",
+]
 GEOIP_DB_URLS = [
     "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-Country.mmdb",
     "https://github.com/Loyalsoldier/geoip/releases/latest/download/Country.mmdb",
@@ -225,6 +231,22 @@ def _find_free_port() -> int:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
 
+async def _wait_for_socks(port: int, timeout: float = 3.0) -> bool:
+    """Ожидание открытия SOCKS-порта."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(0.3)
+            if sock.connect_ex(("127.0.0.1", port)) == 0:
+                sock.close()
+                return True
+            sock.close()
+        except Exception:
+            pass
+        await asyncio.sleep(0.3)
+    return False
+
 async def proxy_test(cfg: dict, runner_path: str, runner_type: str) -> Tuple[bool, Optional[str]]:
     socks_port = _find_free_port()
     if runner_type == "xray":
@@ -243,11 +265,13 @@ async def proxy_test(cfg: dict, runner_path: str, runner_type: str) -> Tuple[boo
     try:
         cmd = [runner_path, "run", "-c", config_path] if runner_type == "xray" else [runner_path, "-c", config_path]
         proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        await asyncio.sleep(1.5)
+        # Ожидаем открытия порта вместо фиксированной задержки
+        if not await _wait_for_socks(socks_port, timeout=3.0):
+            return False, None
         for service_url in IP_SERVICES:
             try:
-                curl_cmd = ["curl", "-s", "--socks5-hostname", f"127.0.0.1:{socks_port}", "--max-time", "8", service_url]
-                result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=12)
+                curl_cmd = ["curl", "-s", "--socks5-hostname", f"127.0.0.1:{socks_port}", "--max-time", "5", service_url]
+                result = subprocess.run(curl_cmd, capture_output=True, text=True, timeout=8)
                 ip = result.stdout.strip()
                 if re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", ip):
                     return True, ip
@@ -320,7 +344,7 @@ def protocol_sort_key(cfg):
 
 # ---------- Чекер ----------
 class ProxyChecker:
-    def __init__(self, max_concurrent: int = 20, xray_max_concurrent: int = 20):
+    def __init__(self, max_concurrent: int = 20, xray_max_concurrent: int = 30):
         self.max_concurrent = max_concurrent
         self.xray_max_concurrent = xray_max_concurrent
         self.xray_path = ensure_xray()
@@ -479,7 +503,7 @@ class ProxyChecker:
             hyst_total = len(hysteria2_list)
             hyst_working = []
             hyst_start = time.time()
-            hyst_sem = asyncio.Semaphore(10)
+            hyst_sem = asyncio.Semaphore(min(10, self.xray_max_concurrent))  # не более 10, чтобы не перегружать
             hyst_lock = asyncio.Lock()
             hyst_checked = 0
 
@@ -511,7 +535,7 @@ class ProxyChecker:
             tuic_total = len(tuic_list)
             tuic_working = []
             tuic_start = time.time()
-            tuic_sem = asyncio.Semaphore(10)
+            tuic_sem = asyncio.Semaphore(min(10, self.xray_max_concurrent))
             tuic_lock = asyncio.Lock()
             tuic_checked = 0
 
@@ -821,7 +845,7 @@ async def save_subscriptions(configs, output_dir="."):
 async def main():
     parser_arg = ArgumentParser()
     parser_arg.add_argument('--threads', type=int, default=30)
-    parser_arg.add_argument('--xray-threads', type=int, default=20)
+    parser_arg.add_argument('--xray-threads', type=int, default=40)  # увеличено
     parser_arg.add_argument('--parse-telegram', action='store_true')
     args = parser_arg.parse_args()
 
