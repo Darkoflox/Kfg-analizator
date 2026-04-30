@@ -1,32 +1,16 @@
 #!/usr/bin/env python3
 """
-Финальный парсер «БС» с максимальным охватом рабочих конфигураций.
-Проверка: Xray (vless/vmess/trojan/ss) + hysteria2 + tuic-client.
-Масштабируемый сбор, надёжное GeoIP, приоритет протоколов.
-Оптимизированная скорость.
+Финальный парсер «БС» с качественной Xray‑проверкой.
+Оптимизирован для работы за 40‑55 минут (80 потоков).
+Дедупликация, надёжное GeoIP, приоритет протоколов.
 """
-
-import asyncio
-import base64
-import hashlib
-import json
-import logging
-import os
-import random
-import re
-import socket
-import ssl
-import subprocess
-import tempfile
-import time
+import asyncio, base64, hashlib, json, logging, os, random, re, socket, ssl, subprocess, tempfile, time
 from argparse import ArgumentParser
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 from urllib.parse import parse_qs, urlparse, unquote
-
-import aiohttp
-import yaml
+import aiohttp, yaml
 
 try:
     import geoip2.database
@@ -34,13 +18,9 @@ try:
 except ImportError:
     GEOIP_AVAILABLE = False
 
-# Настройка логгера
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# ------------------------------------------------------------
-# Конфигурация и константы
-# ------------------------------------------------------------
 SUPPORTED_PROTOCOLS = {'vmess', 'vless', 'trojan', 'ss', 'ssr', 'hysteria2', 'tuic'}
 PROXY_LINK_PATTERN = re.compile(r'(vmess|vless|trojan|ss|ssr|hysteria2|tuic)://[^\s#]+', re.IGNORECASE)
 
@@ -83,23 +63,14 @@ TG_MIRRORS = [
 HEADER = "# profile-title: Niyakwi⚪ | БС | обновление каждые 6 часов\n# profile-update-interval: 6\n"
 
 XRAY_URL = "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
-HYSTERIA2_URL = "https://github.com/apernet/hysteria/releases/latest/download/hysteria-linux-amd64"
-TUIC_CLIENT_URL = "https://github.com/EAimTY/tuic/releases/latest/download/tuic-client-linux-amd64"
-
-IP_SERVICES = [
-    "http://icanhazip.com",
-    "http://ipinfo.io/ip",
-    "http://ifconfig.me",
-]
+IP_SERVICES = ["http://icanhazip.com", "http://ipinfo.io/ip", "http://ifconfig.me"]
 GEOIP_DB_URLS = [
     "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-Country.mmdb",
     "https://github.com/Loyalsoldier/geoip/releases/latest/download/Country.mmdb",
     "https://cdn.jsdelivr.net/gh/P3TERX/GeoLite.mmdb/GeoLite2-Country.mmdb",
 ]
 
-# ------------------------------------------------------------
-# GeoIP (асинхронная загрузка и кэширование)
-# ------------------------------------------------------------
+# ---------- GeoIP ----------
 _geoip_reader = None
 _geoip_lock = asyncio.Lock()
 
@@ -152,9 +123,7 @@ async def get_country(ip: str) -> Optional[str]:
         _country_cache[ip] = None
         return None
 
-# ------------------------------------------------------------
-# Инструменты проверки (загрузка и тестирование)
-# ------------------------------------------------------------
+# ---------- Xray ----------
 def ensure_xray() -> str:
     xray_bin = "xray"
     if Path(xray_bin).exists():
@@ -170,34 +139,6 @@ def ensure_xray() -> str:
                 break
     Path("xray.zip").unlink()
     return str(Path("xray").absolute())
-
-def ensure_hysteria2() -> Optional[str]:
-    bin_name = "hysteria2"
-    if Path(bin_name).exists():
-        return str(Path(bin_name).absolute())
-    logger.info("📥 Скачиваем Hysteria2...")
-    try:
-        import urllib.request
-        urllib.request.urlretrieve(HYSTERIA2_URL, bin_name)
-        os.chmod(bin_name, 0o755)
-        return str(Path(bin_name).absolute())
-    except Exception as e:
-        logger.error(f"Не удалось загрузить Hysteria2: {e}")
-        return None
-
-def ensure_tuic_client() -> Optional[str]:
-    bin_name = "tuic-client"
-    if Path(bin_name).exists():
-        return str(Path(bin_name).absolute())
-    logger.info("📥 Скачиваем TUIC-клиент...")
-    try:
-        import urllib.request
-        urllib.request.urlretrieve(TUIC_CLIENT_URL, bin_name)
-        os.chmod(bin_name, 0o755)
-        return str(Path(bin_name).absolute())
-    except Exception as e:
-        logger.error(f"Не удалось загрузить TUIC-клиент: {e}")
-        return None
 
 def build_xray_config(cfg: dict, socks_port: int) -> dict:
     outbound = {
@@ -225,29 +166,6 @@ def build_xray_config(cfg: dict, socks_port: int) -> dict:
         outbound["settings"]["servers"] = [{"address": cfg["host"], "port": cfg["port"], "method": cfg.get("method", ""), "password": cfg.get("password", "")}]
     return {"log": {"loglevel": "warning"}, "inbounds": [{"listen": "127.0.0.1", "port": socks_port, "protocol": "socks"}], "outbounds": [outbound]}
 
-def build_hysteria2_config(cfg: dict, socks_port: int) -> dict:
-    return {
-        "server": f"{cfg['host']}:{cfg['port']}",
-        "auth": cfg.get("password", ""),
-        "socks5": {"listen": f"127.0.0.1:{socks_port}"},
-        "tls": {
-            "sni": cfg.get("sni", cfg["host"]),
-            "insecure": True
-        }
-    }
-
-def build_tuic_config(cfg: dict, socks_port: int) -> dict:
-    return {
-        "server": f"{cfg['host']}:{cfg['port']}",
-        "uuid": cfg.get("uuid", ""),
-        "password": cfg.get("password", ""),
-        "socks5": {"listen": f"127.0.0.1:{socks_port}"},
-        "tls": {
-            "sni": cfg.get("sni", cfg["host"]),
-            "insecure": True
-        }
-    }
-
 def _find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.bind(("127.0.0.1", 0))
@@ -268,24 +186,15 @@ async def _wait_for_socks(port: int, timeout: float = 3.0) -> bool:
         await asyncio.sleep(0.3)
     return False
 
-async def proxy_test(cfg: dict, runner_path: str, runner_type: str) -> Tuple[bool, Optional[str]]:
+async def proxy_test(cfg: dict, xray_path: str) -> Tuple[bool, Optional[str]]:
     socks_port = _find_free_port()
-    if runner_type == "xray":
-        config = build_xray_config(cfg, socks_port)
-    elif runner_type == "hysteria2":
-        config = build_hysteria2_config(cfg, socks_port)
-    elif runner_type == "tuic":
-        config = build_tuic_config(cfg, socks_port)
-    else:
-        return False, None
-
+    config = build_xray_config(cfg, socks_port)
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
         json.dump(config, f)
         config_path = f.name
     proc = None
     try:
-        cmd = [runner_path, "run", "-c", config_path] if runner_type == "xray" else [runner_path, "-c", config_path]
-        proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        proc = subprocess.Popen([xray_path, "run", "-c", config_path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         if not await _wait_for_socks(socks_port, timeout=3.0):
             return False, None
         for service_url in IP_SERVICES:
@@ -308,9 +217,7 @@ async def proxy_test(cfg: dict, runner_path: str, runner_type: str) -> Tuple[boo
         try: Path(config_path).unlink()
         except: pass
 
-# ------------------------------------------------------------
-# Модель конфигурации
-# ------------------------------------------------------------
+# ---------- Модель ----------
 from dataclasses import dataclass, field
 
 @dataclass
@@ -364,16 +271,12 @@ def protocol_sort_key(cfg):
     latency = cfg.latency if cfg.latency else 999999
     return (-priority, latency)
 
-# ------------------------------------------------------------
-# Чекер (TCP+TLS и специфические проверки)
-# ------------------------------------------------------------
+# ---------- Чекер ----------
 class ProxyChecker:
-    def __init__(self, max_concurrent: int = 20, xray_max_concurrent: int = 30):
+    def __init__(self, max_concurrent: int = 20, xray_max_concurrent: int = 80):
         self.max_concurrent = max_concurrent
         self.xray_max_concurrent = xray_max_concurrent
         self.xray_path = ensure_xray()
-        self.hysteria2_path = ensure_hysteria2()
-        self.tuic_client_path = ensure_tuic_client()
 
     def _parse_uri(self, uri: str) -> Optional[ProxyConfig]:
         try:
@@ -482,120 +385,44 @@ class ProxyChecker:
         if not passed_prelim:
             return []
 
-        xray_list = [c for c in passed_prelim if c.protocol in ('vmess', 'vless', 'trojan', 'ss', 'ssr')]
-        hysteria2_list = [c for c in passed_prelim if c.protocol == 'hysteria2']
-        tuic_list = [c for c in passed_prelim if c.protocol == 'tuic']
+        xray_total = len(passed_prelim)
+        xray_working = []
+        xray_start = time.time()
+        xray_sem = asyncio.Semaphore(self.xray_max_concurrent)
+        xray_lock = asyncio.Lock()
+        xray_checked = 0
 
-        all_results = []
-
-        # Xray
-        if xray_list:
-            xray_total = len(xray_list)
-            xray_working = []
-            xray_start = time.time()
-            xray_sem = asyncio.Semaphore(self.xray_max_concurrent)
-            xray_lock = asyncio.Lock()
-            xray_checked = 0
-
-            async def xray_check(cfg):
-                nonlocal xray_checked
-                async with xray_sem:
-                    ok, ip = await proxy_test(vars(cfg), self.xray_path, "xray")
-                    cfg.working = ok
-                    if ok:
-                        cfg.resolved_ip = ip
+        async def xray_check(cfg):
+            nonlocal xray_checked
+            async with xray_sem:
+                ok, ip = await proxy_test(vars(cfg), self.xray_path)
+                cfg.working = ok
+                if ok:
+                    cfg.resolved_ip = ip
+                async with xray_lock:
+                    xray_checked += 1
+                    if xray_checked % 100 == 0:
+                        elapsed_x = time.time() - xray_start
+                        logger.info(f"📊 Xray: {xray_checked}/{xray_total} (рабочих: {len(xray_working)}) | {xray_checked/elapsed_x:.1f} конф/сек")
+                if ok:
                     async with xray_lock:
-                        xray_checked += 1
-                        if xray_checked % 100 == 0:
-                            elapsed_x = time.time() - xray_start
-                            logger.info(f"📊 Xray: {xray_checked}/{xray_total} (рабочих: {len(xray_working)}) | {xray_checked/elapsed_x:.1f} конф/сек")
-                    if ok:
-                        async with xray_lock:
-                            xray_working.append(cfg)
-                    return cfg
+                        xray_working.append(cfg)
+                return cfg
 
-            xray_heartbeat = asyncio.create_task(self._heartbeat("Xray")) if xray_total > 50 else None
-            await asyncio.gather(*[xray_check(c) for c in xray_list])
-            if xray_heartbeat:
-                xray_heartbeat.cancel()
-            elapsed_x = time.time() - xray_start
-            logger.info(f"✅ Xray завершён за {elapsed_x/60:.1f} мин. Рабочих: {len(xray_working)} из {xray_total}")
-            all_results.extend(xray_working)
-
-        # Hysteria2
-        if hysteria2_list and self.hysteria2_path:
-            hyst_total = len(hysteria2_list)
-            hyst_working = []
-            hyst_start = time.time()
-            hyst_sem = asyncio.Semaphore(min(10, self.xray_max_concurrent))
-            hyst_lock = asyncio.Lock()
-            hyst_checked = 0
-
-            async def hyst_check(cfg):
-                nonlocal hyst_checked
-                async with hyst_sem:
-                    ok, ip = await proxy_test(vars(cfg), self.hysteria2_path, "hysteria2")
-                    cfg.working = ok
-                    if ok:
-                        cfg.resolved_ip = ip
-                    async with hyst_lock:
-                        hyst_checked += 1
-                        if hyst_checked % 50 == 0:
-                            elapsed_h = time.time() - hyst_start
-                            logger.info(f"📊 Hysteria2: {hyst_checked}/{hyst_total} (рабочих: {len(hyst_working)}) | {hyst_checked/elapsed_h:.1f} конф/сек")
-                    if ok:
-                        async with hyst_lock:
-                            hyst_working.append(cfg)
-                    return cfg
-
-            await asyncio.gather(*[hyst_check(c) for c in hysteria2_list])
-            logger.info(f"✅ Hysteria2 завершён. Рабочих: {len(hyst_working)} из {hyst_total}")
-            all_results.extend(hyst_working)
-        elif hysteria2_list:
-            logger.warning("Hysteria2-клиент недоступен – проверка пропущена.")
-
-        # TUIC
-        if tuic_list and self.tuic_client_path:
-            tuic_total = len(tuic_list)
-            tuic_working = []
-            tuic_start = time.time()
-            tuic_sem = asyncio.Semaphore(min(10, self.xray_max_concurrent))
-            tuic_lock = asyncio.Lock()
-            tuic_checked = 0
-
-            async def tuic_check(cfg):
-                nonlocal tuic_checked
-                async with tuic_sem:
-                    ok, ip = await proxy_test(vars(cfg), self.tuic_client_path, "tuic")
-                    cfg.working = ok
-                    if ok:
-                        cfg.resolved_ip = ip
-                    async with tuic_lock:
-                        tuic_checked += 1
-                        if tuic_checked % 50 == 0:
-                            elapsed_t = time.time() - tuic_start
-                            logger.info(f"📊 TUIC: {tuic_checked}/{tuic_total} (рабочих: {len(tuic_working)}) | {tuic_checked/elapsed_t:.1f} конф/сек")
-                    if ok:
-                        async with tuic_lock:
-                            tuic_working.append(cfg)
-                    return cfg
-
-            await asyncio.gather(*[tuic_check(c) for c in tuic_list])
-            logger.info(f"✅ TUIC завершён. Рабочих: {len(tuic_working)} из {tuic_total}")
-            all_results.extend(tuic_working)
-        elif tuic_list:
-            logger.warning("TUIC-клиент недоступен – проверка пропущена.")
-
-        return all_results
+        xray_heartbeat = asyncio.create_task(self._heartbeat("Xray")) if xray_total > 50 else None
+        await asyncio.gather(*[xray_check(c) for c in passed_prelim])
+        if xray_heartbeat:
+            xray_heartbeat.cancel()
+        elapsed_x = time.time() - xray_start
+        logger.info(f"✅ Xray завершён за {elapsed_x/60:.1f} мин. Рабочих: {len(xray_working)} из {xray_total}")
+        return xray_working
 
     async def _heartbeat(self, name):
         while True:
             await asyncio.sleep(30)
             logger.info(f"⏳ {name} проверка продолжается...")
 
-# ------------------------------------------------------------
-# Парсер подписок (URL + Telegram)
-# ------------------------------------------------------------
+# ---------- Парсер ----------
 class SubscriptionParser:
     def __init__(self, timeout=30, max_concurrent=10, parse_telegram=False):
         self.timeout = timeout
@@ -675,7 +502,10 @@ class SubscriptionParser:
             for link in self.extract_links(line):
                 cfg = self.checker._parse_uri(link)
                 if cfg:
-                    configs.append(cfg)
+                    key = f"{cfg.host}:{cfg.port}:{cfg.uuid or cfg.password or cfg.method}"
+                    if key not in self._seen_sub_keys:
+                        self._seen_sub_keys.add(key)
+                        configs.append(cfg)
         logger.info(f"Из {url} извлечено {len(configs)} конфигураций")
         return configs
 
@@ -755,6 +585,7 @@ class SubscriptionParser:
         return all_configs
 
     async def collect_all(self):
+        self._seen_sub_keys = set()
         sources = self.source_manager.load_sources()
         tasks = [self.parse_subscription(url) for url in sources]
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -774,9 +605,6 @@ class SubscriptionParser:
         logger.info(f"Всего собрано {len(unique)} уникальных конфигураций")
         return unique
 
-# ------------------------------------------------------------
-# Источники и управление ими
-# ------------------------------------------------------------
 class SourceManager:
     def __init__(self, sources_file="sources.txt", failed_file="failed_sources.txt"):
         self.sources_file = sources_file
@@ -808,9 +636,7 @@ class SourceManager:
         except Exception as e:
             logger.error(f"Не удалось записать {self.failed_file}: {e}")
 
-# ------------------------------------------------------------
-# Сохранение подписок (с GeoIP)
-# ------------------------------------------------------------
+# ---------- Сохранение ----------
 async def save_subscriptions(configs, output_dir="."):
     out_path = Path(output_dir)
     out_path.mkdir(exist_ok=True)
@@ -821,40 +647,24 @@ async def save_subscriptions(configs, output_dir="."):
         logger.warning("Нет рабочих конфигураций. Выходные файлы будут пустыми.")
         return
 
-    # Прогрев кэша GeoIP
     for cfg in working:
         await cfg.format_name_async()
 
-    # Android (5000)
-    android_list = working[:5000]
     android_lines = []
-    for c in android_list:
+    for c in working[:5000]:
         android_lines.append(f"{c.to_uri().split('#')[0]}#{await c.format_name_async()}")
-    (out_path / "sub_android.txt").write_text(
-        HEADER + "\n".join(android_lines),
-        encoding='utf-8'
-    )
+    (out_path / "sub_android.txt").write_text(HEADER + "\n".join(android_lines), encoding='utf-8')
 
-    # iOS (300)
-    ios_list = working[:300]
     ios_lines = []
-    for c in ios_list:
+    for c in working[:300]:
         ios_lines.append(f"{c.to_uri().split('#')[0]}#{await c.format_name_async()}")
-    (out_path / "sub_ios.txt").write_text(
-        HEADER + "\n".join(ios_lines),
-        encoding='utf-8'
-    )
+    (out_path / "sub_ios.txt").write_text(HEADER + "\n".join(ios_lines), encoding='utf-8')
 
-    # Общий файл
     all_lines = []
     for c in working:
         all_lines.append(f"{c.to_uri().split('#')[0]}#{await c.format_name_async()}")
-    (out_path / "sub_all_checked.txt").write_text(
-        HEADER + "\n".join(all_lines),
-        encoding='utf-8'
-    )
+    (out_path / "sub_all_checked.txt").write_text(HEADER + "\n".join(all_lines), encoding='utf-8')
 
-    # По протоколам
     for proto in SUPPORTED_PROTOCOLS:
         items = [c for c in working if c.protocol == proto]
         if items:
@@ -862,12 +672,8 @@ async def save_subscriptions(configs, output_dir="."):
             proto_lines = []
             for c in items[:5000]:
                 proto_lines.append(f"{c.to_uri().split('#')[0]}#{await c.format_name_async()}")
-            (out_path / f"sub_{proto}.txt").write_text(
-                HEADER + "\n".join(proto_lines),
-                encoding='utf-8'
-            )
+            (out_path / f"sub_{proto}.txt").write_text(HEADER + "\n".join(proto_lines), encoding='utf-8')
 
-    # Ссылки
     repo_user = "Darkoflox"
     repo_name = "Kfg-analizator"
     branch = "main"
@@ -885,13 +691,10 @@ async def save_subscriptions(configs, output_dir="."):
             f.write(f"# {sf}\n{cdn_statically}/{sf}\n{cdn_jsdelivr}/{sf}\n")
     logger.info(f"🔗 Файл со ссылками: {out_path / 'subscription_urls.txt'}")
 
-# ------------------------------------------------------------
-# Точка входа
-# ------------------------------------------------------------
 async def main():
     parser_arg = ArgumentParser()
     parser_arg.add_argument('--threads', type=int, default=30)
-    parser_arg.add_argument('--xray-threads', type=int, default=40)
+    parser_arg.add_argument('--xray-threads', type=int, default=80)
     parser_arg.add_argument('--parse-telegram', action='store_true')
     args = parser_arg.parse_args()
 
