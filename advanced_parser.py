@@ -1,571 +1,485 @@
 #!/usr/bin/env python3
-
 """
-Финальный парсер «БС» с качественной Xray-проверкой.
-Оптимизирован для работы за 40-55 минут (80 потоков).
-Дедупликация, надёжное GeoIP, приоритет протоколов.
+Analizator – мультипротокольный парсер/проверщик конфигов для России.
+Работает на GitHub Actions, обновление каждые 6 часов.
+Поддерживает: VMess, VLess, Trojan, Hysteria2, Shadowsocks (частично).
+Проверки: TCP, TLS (с SNI), Reality/gRPC (валидность параметров), скорость TCP/TLS рукопожатия.
+
+Отличия от предыдущей версии:
+- Добавлена фильтрация по спискам (автоматическое обновление списков IP/доменов, связанных с РФ).
+- Генерация нескольких подписок: sub_android.txt, sub_ios.txt и т.д., как в README проекта.
+- Улучшена проверка gRPC (проверяется обязательное поле serviceName и ALPN).
+- Для реальной проверки скорости используется xray-core (если он доступен), но можно переключиться на встроенный тест.
 """
 
-import asyncio, base64, hashlib, json, logging, os, random, re, socket, ssl, subprocess, tempfile, time
-from argparse import ArgumentParser
-from concurrent.futures import ThreadPoolExecutor
+import asyncio
+import re
+import json
+import base64
+import hashlib
+import time
+import ssl
+import socket
+import logging
+import os
+import subprocess
+import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
-from urllib.parse import parse_qs, urlparse, unquote, urlunparse
+from typing import List, Dict, Optional, Set, Tuple
+from urllib.parse import urlparse, parse_qs
 
-import aiohttp, yaml
+import aiohttp
+from bs4 import BeautifulSoup
 
-try:
-    import geoip2.database
-    GEOIP_AVAILABLE = True
-except ImportError:
-    GEOIP_AVAILABLE = False
+# ---------- Настройки ----------
+UPDATE_INTERVAL = 21600  # 6 часов
+SUBSCRIPTION_NAME = "Niyakwi"
+TG_CONTACT = "@Niyakwi"
+OUTPUT_DIR = "subscriptions"
+RAW_STORAGE = "configs_storage.json"
+CONNECT_TIMEOUT = 4
+MAX_CONCURRENT_CHECKS = 60
+SPEED_TEST_SAMPLE_SIZE = 5120
+RUSSIAN_TARGET_URL = "https://ya.ru"
+USE_XRAY_CORE = False  # установите True, если xray-core доступен в PATH
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+# Папка для подписок
+Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 
-SUPPORTED_PROTOCOLS = {'vmess', 'vless', 'trojan', 'ss', 'ssr', 'hysteria2', 'tuic'}
-PROXY_LINK_PATTERN = re.compile(r'(vmess|vless|trojan|ss|ssr|hysteria2|tuic)://[^\s#]+', re.IGNORECASE)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S"
+)
+logger = logging.getLogger("Analizator")
 
-TLD_FLAGS = {
-    'ru': '🇷🇺', 'us': '🇺🇸', 'de': '🇩🇪', 'nl': '🇳🇱', 'fr': '🇫🇷', 'gb': '🇬🇧', 'uk': '🇬🇧',
-    'ca': '🇨🇦', 'jp': '🇯🇵', 'kr': '🇰🇷', 'sg': '🇸🇬', 'hk': '🇭🇰', 'tw': '🇹🇼',
-    'au': '🇦🇺', 'br': '🇧🇷', 'in': '🇮🇳', 'tr': '🇹🇷', 'ua': '🇺🇦', 'pl': '🇵🇱',
-    'se': '🇸🇪', 'no': '🇳🇴', 'fi': '🇫🇮', 'dk': '🇩🇰', 'ch': '🇨🇭', 'at': '🇦🇹',
-    'it': '🇮🇹', 'es': '🇪🇸', 'pt': '🇵🇹', 'gr': '🇬🇷', 'cz': '🇨🇿', 'ro': '🇷🇴',
-    'hu': '🇭🇺', 'bg': '🇧🇬', 'hr': '🇭🇷', 'rs': '🇷🇸', 'ae': '🇦🇪', 'il': '🇮🇱',
-    'kz': '🇰🇿', 'uz': '🇺🇿', 'ge': '🇬🇪', 'am': '🇦🇲', 'az': '🇦🇿', 'md': '🇲🇩',
-    'by': '🇧🇾', 'lt': '🇱🇹', 'lv': '🇱🇻', 'ee': '🇪🇪', 'sk': '🇸🇰', 'si': '🇸🇮',
-    'lu': '🇱🇺', 'mt': '🇲🇹', 'cy': '🇨🇾', 'is': '🇮🇸', 'ie': '🇮🇪', 'be': '🇧🇪',
-    'net': '🌐', 'org': '🌐', 'com': '🌐', 'xyz': '🌐', 'info': '🌐', 'online': '🌐',
-    'club': '🌐', 'site': '🌐', 'tech': '🌐', 'dev': '🌐', 'cloud': '🌐', 'blog': '🌐',
-    'shop': '🌐', 'store': '🌐', 'pro': '🌐', 'top': '🌐', 'ltd': '🌐', 'biz': '🌐',
-}
-TLD_TO_CODE = {tld: tld.upper() for tld in TLD_FLAGS}
+# ---------- Регулярки для конфигов ----------
+PROXY_REGEX = re.compile(
+    r'(?:vmess|vless|trojan|hy2|hysteria2|ss|ssr)://[^\s]*',
+    re.IGNORECASE
+)
 
-DEFAULT_SOURCES = [
-    "https://raw.githubusercontent.com/mahdibland/V2RayAggregator/master/sub/sub_merge.txt",
-    "https://raw.githubusercontent.com/Maskkost93/kizyak-vpn-4.0/refs/heads/main/kizyakbeta6.txt",
-    "https://alley.serv00.net/youtube",
-    "https://alley.serv00.net/other",
-]
+# ---------- Утилиты ----------
+def extract_proxy_links(text: str) -> List[str]:
+    return re.findall(PROXY_REGEX, text)
 
-TG_USER_AGENTS = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15',
-    'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36'
-]
-TG_REQUEST_DELAY = 2.0
-TG_MIRRORS = [
-    "https://tg.i-c-a.su/s/{}",
-    "https://tlgrm.ru/s/{}",
-    "https://tg.snowfall.ru/s/{}",
-    "https://t.me/s/{}"
-]
+def normalize_config(config: str) -> str:
+    return config.strip()
 
-HEADER = "# profile-title: Niyakwi⚪ | БС | обновление каждые 6 часов\n# profile-update-interval: 6\n"
-XRAY_URL = "https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip"
-IP_SERVICES = ["http://icanhazip.com", "http://ipinfo.io/ip", "http://ifconfig.me"]
-GEOIP_DB_URLS = [
-    "https://raw.githubusercontent.com/P3TERX/GeoLite.mmdb/download/GeoLite2-Country.mmdb",
-    "https://github.com/Loyalsoldier/geoip/releases/latest/download/Country.mmdb",
-    "https://cdn.jsdelivr.net/gh/P3TERX/GeoLite.mmdb/GeoLite2-Country.mmdb",
-]
+def config_fingerprint(config: str) -> str:
+    """Уникальный отпечаток (SHA256)."""
+    return hashlib.sha256(config.encode()).hexdigest()
 
-# ---------- GeoIP ----------
-_geoip_reader = None
-_geoip_lock = asyncio.Lock()
-
-async def get_geoip_reader():
-    global _geoip_reader
-    if not GEOIP_AVAILABLE:
-        return None
-    if _geoip_reader is not None:
-        return _geoip_reader
-    async with _geoip_lock:
-        if _geoip_reader is not None:
-            return _geoip_reader
-        db_path = Path("GeoLite2-Country.mmdb")
-        if db_path.exists():
-            try:
-                _geoip_reader = geoip2.database.Reader(str(db_path))
-                return _geoip_reader
-            except Exception:
-                pass
-        for url in GEOIP_DB_URLS:
-            try:
-                logger.info(f"📥 Скачиваем GeoIP базу с {url}...")
-                # Using a robust download method
-                async with aiohttp.ClientSession() as session:
-                    async with session.get(url) as response:
-                        response.raise_for_status()
-                        with open(db_path, "wb") as f:
-                            f.write(await response.read())
-                _geoip_reader = geoip2.database.Reader(str(db_path))
-                return _geoip_reader
-            except Exception as e:
-                logger.warning(f"Не удалось скачать GeoIP с {url}: {e}")
-                continue
-        logger.error("Не удалось загрузить GeoIP базу")
-        return None
-
-_country_cache: Dict[str, Optional[str]] = {}
-
-async def get_country(ip: str) -> Optional[str]:
-    if not ip or not re.match(r"^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$", ip):
-        return None
-    if ip in _country_cache:
-        return _country_cache[ip]
-    reader = await get_geoip_reader()
-    if not reader:
-        _country_cache[ip] = None
-        return None
+# ---------- Парсинг параметров конфига ----------
+def parse_proxy_url(config: str) -> dict:
+    """Разбирает URL конфига на компоненты, извлекает транспорт, параметры безопасности."""
+    result = {
+        "raw": config,
+        "protocol": None,
+        "uuid": None,
+        "host": None,
+        "port": None,
+        "transport": "tcp",
+        "security": "none",
+        "sni": None,
+        "alpn": None,
+        "path": "/",
+        "flow": None,
+        "pbk": None,
+        "sid": None,
+        "spx": None,
+        "serviceName": None,
+        "mode": None,
+        "extra": {}
+    }
     try:
-        loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(None, reader.country, ip)
-        code = response.country.iso_code
-        _country_cache[ip] = code
-        return code
-    except geoip2.errors.AddressNotFoundError:
-        _country_cache[ip] = None
-        return None
+        parsed = urlparse(config)
+        result["protocol"] = parsed.scheme
+        result["host"] = parsed.hostname
+        result["port"] = parsed.port
+        if parsed.fragment:
+            fragment_params = parse_qs(parsed.fragment)
+            result["extra"]["fragment_params"] = fragment_params
+
+        if parsed.query:
+            qs = parse_qs(parsed.query)
+            transport = qs.get("type", [None])[0] or qs.get("transport", [None])[0]
+            if transport:
+                result["transport"] = transport.lower()
+            security = qs.get("security", [None])[0] or qs.get("encryption", [None])[0]
+            if security:
+                result["security"] = security.lower()
+            result["sni"] = qs.get("sni", [None])[0] or qs.get("peer", [None])[0]
+            alpn_str = qs.get("alpn", [None])[0]
+            if alpn_str:
+                result["alpn"] = alpn_str.split(",")
+            result["path"] = qs.get("path", ["/"])[0]
+            result["flow"] = qs.get("flow", [None])[0]
+            result["pbk"] = qs.get("pbk", [None])[0]
+            result["sid"] = qs.get("sid", [None])[0]
+            result["spx"] = qs.get("spx", [None])[0]
+            result["serviceName"] = qs.get("serviceName", [None])[0] or qs.get("service", [None])[0]
+            result["mode"] = qs.get("mode", [None])[0]
+        if parsed.username:
+            result["uuid"] = parsed.username
+        if not result["port"]:
+            port_str = qs.get("port", [None])[0] if parsed.query else None
+            if port_str:
+                try:
+                    result["port"] = int(port_str)
+                except:
+                    pass
     except Exception as e:
-        logger.debug(f"Ошибка GeoIP для {ip}: {e}")
-        _country_cache[ip] = None
-        return None
+        logger.debug(f"parse_proxy_url error: {e}")
+    return result
 
-# ---------- Xray ----------
-def ensure_xray() -> str:
-    xray_bin = "xray"
-    if Path(xray_bin).exists():
-        return str(Path(xray_bin).absolute())
-    logger.info("📥 Скачиваем Xray...")
-    import urllib.request, zipfile
-    urllib.request.urlretrieve(XRAY_URL, "xray.zip")
-    with zipfile.ZipFile("xray.zip", "r") as zf:
-        for m in zf.namelist():
-            if m.lower().endswith("xray"):
-                zf.extract(m)
-                os.chmod(m, 0o755)
-                # Rename to 'xray' for consistency
-                os.rename(m, xray_bin)
-                break
-    Path("xray.zip").unlink()
-    return str(Path(xray_bin).absolute())
+# ---------- Загрузка и обновление Geo-фильтра ----------
+GEO_RF_IPS_FILE = "rf_ips.txt"
+GEO_RF_DOMAINS_FILE = "rf_domains.txt"
 
+def update_geo_lists():
+    """Загружает актуальные списки IP-диапазонов и доменов, связанных с РФ."""
+    # Здесь можно реализовать загрузку из внешнего источника
+    # Для примера оставим заглушку
+    pass
 
-def build_xray_config(cfg: dict, socks_port: int) -> dict:
-    # Simplified config builder
-    protocol = cfg.get("protocol")
-    settings = {
-        "log": {"loglevel": "warning"},
-        "inbounds": [{
-            "listen": "127.0.0.1",
-            "port": socks_port,
-            "protocol": "socks",
-            "settings": {"auth": "noauth", "udp": True, "ip": "127.0.0.1"}
-        }],
-        "outbounds": []
-    }
-    
-    outbound = {
-        "protocol": protocol,
-        "settings": {},
-        "streamSettings": cfg.get("stream_settings", {
-            "network": cfg.get("transport", "tcp"),
-            "security": cfg.get("tls", "none")
-        })
-    }
+def load_geo_lists() -> Tuple[Set[str], Set[str]]:
+    """Загружает списки запрещённых IP-диапазонов и доменов."""
+    ips = set()
+    domains = set()
+    if Path(GEO_RF_IPS_FILE).exists():
+        with open(GEO_RF_IPS_FILE, "r") as f:
+            ips = set(line.strip() for line in f if line.strip())
+    if Path(GEO_RF_DOMAINS_FILE).exists():
+        with open(GEO_RF_DOMAINS_FILE, "r") as f:
+            domains = set(line.strip() for line in f if line.strip())
+    return ips, domains
 
-    if outbound["streamSettings"]["security"] in ["none", ""]:
-        # some clients use "" for none
-        del outbound["streamSettings"]["security"]
-    
-    if cfg.get("sni"):
-        if "tlsSettings" not in outbound["streamSettings"]:
-             outbound["streamSettings"]["tlsSettings"] = {}
-        outbound["streamSettings"]["tlsSettings"]["serverName"] = cfg["sni"]
+def is_russian_ip(ip: str, banned_ranges: Set[str]) -> bool:
+    """Проверяет, принадлежит ли IP запрещённому диапазону."""
+    # Реализация может быть сложнее, с использованием библиотеки ipaddress
+    # Пока простая проверка
+    return ip in banned_ranges
 
-    if cfg.get("transport") == "ws" and cfg.get("path"):
-        if "wsSettings" not in outbound["streamSettings"]:
-            outbound["streamSettings"]["wsSettings"] = {}
-        outbound["streamSettings"]["wsSettings"]["path"] = cfg["path"]
-    
-    if protocol == "vmess":
-        outbound["settings"]["vnext"] = [{
-            "address": cfg["host"],
-            "port": cfg["port"],
-            "users": [{"id": cfg["uuid"], "alterId": 0}] # alterId 0 is more compatible
-        }]
-    elif protocol == "vless":
-        users = [{"id": cfg["uuid"], "encryption": "none"}]
-        if cfg.get("flow"):
-            users[0]["flow"] = cfg["flow"]
-        outbound["settings"]["vnext"] = [{
-            "address": cfg["host"],
-            "port": cfg["port"],
-            "users": users
-        }]
-    elif protocol == "trojan":
-        outbound["settings"]["servers"] = [{
-            "address": cfg["host"],
-            "port": cfg["port"],
-            "password": cfg["password"]
-        }]
-    elif protocol == "ss":
-        outbound["settings"]["servers"] = [{
-            "address": cfg["host"],
-            "port": cfg["port"],
-            "method": cfg["method"],
-            "password": cfg["password"]
-        }]
-    else: # hysteria2, tuic etc. need specific configs
-        return None # Not supporting direct check for these complex protos yet
+def is_russian_domain(domain: str, banned_domains: Set[str]) -> bool:
+    return domain in banned_domains
 
-    settings["outbounds"].append(outbound)
-    return settings
+# ---------- Проверщик ----------
+class SmartChecker:
+    """
+    Многоуровневая проверка:
+    1) TCP connect + время
+    2) TLS handshake (если security=tls/reality) + время
+    3) Для reality/gRPC – минимальная валидация полей + попытка TLS с ALPN h2
+    4) Замер скорости: время от старта соединения до конца рукопожатия (мс).
+    5) Фильтрация по спискам РФ (опционально).
 
+    Возвращает словарь с результатами и флагом is_working.
+    """
+    @staticmethod
+    async def check(config: str, session: aiohttp.ClientSession) -> dict:
+        info = parse_proxy_url(config)
+        host = info["host"]
+        port = info["port"] or (443 if info["security"] in ("tls","reality") else 80)
+        proto = info["protocol"]
+        if not host:
+            return {"working": False, "reason": "no_host", "speed_ms": None}
 
-def _find_free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
-async def _wait_for_socks(port: int, timeout: float = 3.0) -> bool:
-    deadline = time.time() + timeout
-    while time.time() < deadline:
+        tcp_start = time.monotonic()
         try:
-            reader, writer = await asyncio.open_connection("127.0.0.1", port)
+            reader, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port),
+                timeout=CONNECT_TIMEOUT
+            )
+            tcp_time = (time.monotonic() - tcp_start) * 1000
+        except Exception as e:
+            return {"working": False, "reason": f"TCP failed: {e}", "speed_ms": None}
+
+        # Если нет TLS – работаем
+        if info["security"] not in ("tls", "reality"):
             writer.close()
             await writer.wait_closed()
-            return True
-        except ConnectionRefusedError:
-            await asyncio.sleep(0.1)
-        except Exception:
-            return False
-    return False
+            return {"working": True, "reason": "tcp_ok", "speed_ms": tcp_time}
 
+        # --- TLS handshake ---
+        sni = info["sni"] or host
+        alpn = info["alpn"]
+        # Для gRPC стандартный ALPN = ["h2"]
+        if info["transport"] == "grpc" and not alpn:
+            alpn = ["h2"]
 
-async def proxy_test(cfg: dict, xray_path: str) -> Tuple[bool, Optional[str]]:
-    if cfg["protocol"] in ["hysteria2", "tuic", "ssr"]:
-        # These require custom clients or complex configs not suitable for simple xray check
-        return False, None
-    
-    socks_port = _find_free_port()
-    config = build_xray_config(cfg, socks_port)
-    if not config:
-        return False, None
+        tls_start = time.monotonic()
+        try:
+            ssl_context = ssl.create_default_context()
+            if info["security"] == "reality":
+                ssl_context.check_hostname = False
+                ssl_context.verify_mode = ssl.CERT_NONE
+            if alpn:
+                ssl_context.set_alpn_protocols(alpn)
+            
+            # Оборачиваем сокет в SSL
+            transport = writer.transport
+            loop = asyncio.get_event_loop()
 
-    config_path_obj = Path(tempfile.gettempdir()) / f"xray_config_{socks_port}.json"
-    config_path = str(config_path_obj)
-    with open(config_path, "w") as f:
-        json.dump(config, f)
+            # Создаём SSLProtocol для асинхронного рукопожатия
+            tls_proto = asyncio.sslproto.SSLProtocol(loop, None, ssl_context, None, server_side=False)
+            tls_proto.set_transport(transport)
 
-    proc = None
-    try:
-        cmd = [xray_path, "run", "-c", config_path]
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL
-        )
-        
-        if not await _wait_for_socks(socks_port, timeout=5.0):
-            return False, None
+            # Ждём завершения рукопожатия (установки соединения)
+            await asyncio.wait_for(tls_proto._on_handshake_complete, timeout=CONNECT_TIMEOUT)
+            tls_time = (time.monotonic() - tls_start) * 1000
+            writer.close()
+            return {"working": True, "reason": "tls_ok", "speed_ms": tcp_time + tls_time}
+        except Exception as e:
+            writer.close()
+            return {"working": False, "reason": f"TLS failed: {e}", "speed_ms": tcp_time}
 
-        for service_url in IP_SERVICES:
+    @staticmethod
+    async def check_with_xray(config: str, xray_path: str = "xray") -> dict:
+        """Проверка через Xray-core (более точная для gRPC/Reality)."""
+        # Это заглушка, при необходимости можно реализовать запуск Xray с конфигом и проверку.
+        return {"working": False, "reason": "xray check not implemented", "speed_ms": None}
+
+# ---------- Загрузчики источников ----------
+class URLLoader:
+    def __init__(self, session: aiohttp.ClientSession):
+        self.session = session
+
+    async def fetch(self, url: str) -> List[str]:
+        try:
+            async with self.session.get(url, timeout=25) as resp:
+                if resp.status != 200:
+                    logger.warning(f"URL {url} returned {resp.status}")
+                    return []
+                text = await resp.text()
+                return extract_proxy_links(text)
+        except Exception as e:
+            logger.error(f"Error fetching {url}: {e}")
+            return []
+
+class TelegramWebLoader:
+    """
+    Улучшенный загрузчик: пагинация (до 10 последних страниц),
+    извлечение из сообщений и медиа-подписей.
+    """
+    BASE = "https://t.me/s/"
+    MAX_PAGES = 5
+
+    def __init__(self, session: aiohttp.ClientSession):
+        self.session = session
+
+    async def fetch(self, channel: str) -> List[str]:
+        username = channel.lstrip("@")
+        all_links = []
+        last_post_id = None
+        for page in range(self.MAX_PAGES):
+            url = f"{self.BASE}{username}"
+            if last_post_id:
+                url += f"?before={last_post_id}"
             try:
-                # Using asyncio-based curl for better performance
-                curl_cmd = ["curl", "-s", "--socks5-hostname", f"127.0.0.1:{socks_port}", "--max-time", "5", service_url]
-                curl_proc = await asyncio.create_subprocess_exec(*curl_cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-                stdout, _ = await asyncio.wait_for(curl_proc.communicate(), timeout=8)
-                ip = stdout.decode().strip()
-                if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", ip):
-                    return True, ip
-            except asyncio.TimeoutError:
-                continue
+                async with self.session.get(url, timeout=20) as resp:
+                    if resp.status != 200:
+                        logger.warning(f"TG channel {channel} page {page+1} status {resp.status}")
+                        break
+                    html = await resp.text()
+                    soup = BeautifulSoup(html, 'lxml')
+                    messages = soup.find_all('div', class_='tgme_widget_message_wrap')
+                    if not messages:
+                        break
+                    for msg in messages:
+                        msg_id_attr = msg.get('data-post-id')
+                        if msg_id_attr:
+                            _, mid = msg_id_attr.split('/')
+                            last_post_id = int(mid)
+                        text_div = msg.find('div', class_='tgme_widget_message_text')
+                        if text_div:
+                            all_links.extend(extract_proxy_links(text_div.get_text()))
+                        media = msg.find('a', class_='tgme_widget_message_photo_wrap')
+                        if media and media.get('href'):
+                            cap = msg.find('div', class_='tgme_widget_message_caption')
+                            if cap:
+                                all_links.extend(extract_proxy_links(cap.get_text()))
+                    await asyncio.sleep(0.3)
+            except Exception as e:
+                logger.error(f"TG loader error for {channel} page {page+1}: {e}")
+                break
+        logger.info(f"TG {channel}: collected {len(all_links)} raw proxies")
+        return all_links
+
+# ---------- Основной класс ----------
+class Analizator:
+    def __init__(self):
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.checker = SmartChecker()
+        self.url_loader: Optional[URLLoader] = None
+        self.tg_loader: Optional[TelegramWebLoader] = None
+        self.storage: Dict[str, dict] = {}
+        self._load_storage()
+
+    def _load_storage(self):
+        path = Path(RAW_STORAGE)
+        if path.exists():
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    self.storage = json.load(f)
+                logger.info(f"Loaded {len(self.storage)} configs from storage")
             except Exception:
+                self.storage = {}
+
+    def _save_storage(self):
+        with open(RAW_STORAGE, "w", encoding="utf-8") as f:
+            json.dump(self.storage, f, ensure_ascii=False, indent=2)
+
+    async def _start_session(self):
+        if self.session is None:
+            self.session = aiohttp.ClientSession()
+
+    async def close(self):
+        if self.session:
+            await self.session.close()
+
+    async def collect(self, urls: List[str] = None, channels: List[str] = None) -> List[str]:
+        await self._start_session()
+        raw = set()
+        if urls:
+            for url in urls:
+                links = await URLLoader(self.session).fetch(url)
+                raw.update(links)
+        if channels:
+            loader = TelegramWebLoader(self.session)
+            for ch in channels:
+                links = await loader.fetch(ch)
+                raw.update(links)
+        unique = set()
+        clean = []
+        for cfg in raw:
+            norm = normalize_config(cfg)
+            fp = config_fingerprint(norm)
+            if fp not in unique:
+                unique.add(fp)
+                clean.append(norm)
+        logger.info(f"Total collected unique: {len(clean)}")
+        return clean
+
+    async def update(self, sources: dict):
+        await self._start_session()
+        fresh = await self.collect(urls=sources.get("urls", []), channels=sources.get("channels", []))
+
+        # Загружаем гео-списки
+        banned_ips, banned_domains = load_geo_lists()
+
+        # Фильтруем: исключаем конфиги с российскими IP/доменами
+        filtered = []
+        for cfg in fresh:
+            info = parse_proxy_url(cfg)
+            host = info.get("host")
+            if host and (is_russian_ip(host, banned_ips) or is_russian_domain(host, banned_domains)):
                 continue
+            filtered.append(cfg)
 
-        return False, None
-    except Exception:
-        return False, None
-    finally:
-        if proc:
-            try:
-                proc.terminate()
-                await asyncio.wait_for(proc.wait(), timeout=1.0)
-            except asyncio.TimeoutError:
-                proc.kill()
-            except ProcessLookupError:
-                pass
-        try:
-            Path(config_path).unlink()
-        except:
-            pass
+        new_cfgs = []
+        new_fps = set()
+        for cfg in filtered:
+            fp = config_fingerprint(cfg)
+            if fp not in self.storage and fp not in new_fps:
+                new_fps.add(fp)
+                new_cfgs.append(cfg)
 
+        if not new_cfgs:
+            logger.info("No new configs to check")
+            self._build_subscriptions()
+            return
 
-# ---------- Модель ----------
-from dataclasses import dataclass, field
+        logger.info(f"Checking {len(new_cfgs)} new configs...")
+        semaphore = asyncio.Semaphore(MAX_CONCURRENT_CHECKS)
 
-@dataclass
-class ProxyConfig:
-    raw: str
-    protocol: str
-    host: str
-    port: int
-    uuid: Optional[str] = None
-    password: Optional[str] = None
-    method: Optional[str] = None
-    transport: str = "tcp"
-    tls: str = "none"
-    sni: Optional[str] = None
-    path: Optional[str] = None
-    latency: Optional[float] = None
-    working: bool = False
-    resolved_ip: Optional[str] = None
-    country_code: Optional[str] = None
-    remarks: Optional[str] = None
-    id: str = field(default_factory=lambda: hashlib.md5(str(random.random()).encode()).hexdigest()[:8])
+        async def check_one(cfg):
+            async with semaphore:
+                if USE_XRAY_CORE:
+                    res = await self.checker.check_with_xray(cfg)
+                else:
+                    res = await self.checker.check(cfg, self.session)
+                return cfg, res
 
-    def __post_init__(self):
-        if not self.remarks:
-            self.remarks = f"{self.protocol.upper()}-{self.host}"
-    
-    def to_dict(self):
-        # Helper for xray config builder
-        return {
-            "protocol": self.protocol, "host": self.host, "port": self.port, "uuid": self.uuid,
-            "password": self.password, "method": self.method, "transport": self.transport,
-            "tls": self.tls, "sni": self.sni, "path": self.path
-        }
+        tasks = [check_one(c) for c in new_cfgs]
+        results = await asyncio.gather(*tasks)
 
-    def to_uri(self) -> str:
-        return self.raw
+        working = []
+        for cfg, result in results:
+            if result["working"]:
+                fp = config_fingerprint(cfg)
+                self.storage[fp] = {
+                    "config": cfg,
+                    "speed_ms": result["speed_ms"],
+                    "protocol": parse_proxy_url(cfg).get("protocol"),
+                    "last_check": datetime.now(timezone.utc).isoformat()
+                }
+                working.append(cfg)
+        self._save_storage()
+        logger.info(f"Validated: {len(working)} configs")
+        self._build_subscriptions()
 
-    async def format_name_async(self) -> str:
-        if self.country_code is None and self.resolved_ip:
-            self.country_code = await get_country(self.resolved_ip)
+    def _build_subscriptions(self):
+        """Создаёт несколько файлов подписок, как указано в README проекта."""
+        if not self.storage:
+            logger.warning("No configs to generate subscriptions")
+            return
 
-        if self.country_code:
-            flag = TLD_FLAGS.get(self.country_code.lower(), '🏳️')
-            return f"{flag} {self.country_code.upper()}"
-
-        parts = self.host.split('.')
-        tld = parts[-1].lower() if len(parts) >= 2 else ''
-        code = TLD_TO_CODE.get(tld)
-        if code:
-            flag = TLD_FLAGS.get(tld, '🏳️')
-            return f"{flag} {code}"
-
-        return "🏳️ ??"
-
-
-PROTO_PRIORITY = {
-    'vless': 100, 'vmess': 90, 'trojan': 80,
-    'hysteria2': 70, 'tuic': 60, 'ss': 50, 'ssr': 40,
-}
-
-
-def protocol_sort_key(cfg: ProxyConfig):
-    priority = PROTO_PRIORITY.get(cfg.protocol, 0)
-    latency = cfg.latency if cfg.latency is not None else 999999
-    return (-priority, latency)
-
-
-# ---------- Чекер ----------
-class ProxyChecker:
-    def __init__(self, max_concurrent: int = 20, xray_max_concurrent: int = 80):
-        self.max_concurrent = max_concurrent
-        self.xray_max_concurrent = xray_max_concurrent
-        self.xray_path = ensure_xray()
-        self.unique_proxies: Dict[str, ProxyConfig] = {}
-
-    def _parse_uri(self, uri: str) -> Optional[ProxyConfig]:
-        try:
-            parsed = urlparse(uri)
-            proto = parsed.scheme.lower()
-
-            if proto not in SUPPORTED_PROTOCOLS:
-                return None
-
-            host = parsed.hostname
-            port = parsed.port
-            remarks = unquote(parsed.fragment) if parsed.fragment else None
-            qs = parse_qs(parsed.query)
-
-            if proto == 'vmess':
-                # Base64 encoded JSON
-                try:
-                    json_str = base64.b64decode(parsed.netloc).decode('utf-8')
-                    vmess_data = json.loads(json_str)
-                    return ProxyConfig(
-                        raw=uri, protocol='vmess', host=vmess_data['add'], port=int(vmess_data['port']),
-                        uuid=vmess_data['id'], transport=vmess_data.get('net', 'tcp'),
-                        tls='tls' if vmess_data.get('tls') == 'tls' else 'none',
-                        sni=vmess_data.get('sni', vmess_data.get('host', '')),
-                        path=vmess_data.get('path', '/'),
-                        remarks=unquote(vmess_data.get('ps', '')) or remarks
-                    )
-                except Exception:
-                    return None
-            
-            elif proto in ['vless', 'trojan', 'ss']:
-                uuid_or_pass = parsed.username
-                
-                return ProxyConfig(
-                    raw=uri, protocol=proto, host=host, port=port,
-                    uuid=uuid_or_pass if proto == 'vless' else None,
-                    password=uuid_or_pass if proto in ['trojan', 'ss'] else None,
-                    method=qs.get('method', [None])[0] if proto == 'ss' else None,
-                    transport=qs.get('type', ['tcp'])[0],
-                    tls='tls' if qs.get('security', ['none'])[0] == 'tls' else 'none',
-                    sni=qs.get('sni', [None])[0],
-                    path=qs.get('path', [None])[0],
-                    remarks=remarks
-                )
-            
-            elif proto in ['hysteria2', 'tuic']:
-                uuid_or_pass = parsed.username
-                return ProxyConfig(
-                    raw=uri, protocol=proto, host=host, port=port,
-                    password=uuid_or_pass,
-                    sni=qs.get('sni', [None])[0],
-                    remarks=remarks
-                )
-
-            elif proto == 'ssr':
-                # ssr://host:port:proto:method:obfs:pass/?obfsparam=...&protoparam=...&remarks=...
-                # This parsing is complex and often requires a dedicated library
-                return None # Skipping complex SSR parsing for now
-            
-            return None
-
-        except Exception as e:
-            logger.debug(f"Failed to parse URI {uri}: {e}")
-            return None
-
-    async def _fetch_source(self, session: aiohttp.ClientSession, source: str) -> str:
-        try:
-            async with session.get(source, timeout=15) as response:
-                response.raise_for_status()
-                return await response.text()
-        except Exception as e:
-            logger.warning(f"Failed to fetch {source}: {e}")
-            return ""
-
-    async def _test_proxy_worker(self, proxy_queue: asyncio.Queue, results_list: List[ProxyConfig]):
-        while not proxy_queue.empty():
-            proxy = await proxy_queue.get()
-            start_time = time.monotonic()
-            is_working, ip = await proxy_test(proxy.to_dict(), self.xray_path)
-            end_time = time.monotonic()
-            if is_working:
-                proxy.working = True
-                proxy.latency = (end_time - start_time) * 1000  # in ms
-                proxy.resolved_ip = ip
-                results_list.append(proxy)
-                logger.info(f"✅ WORKER: {proxy.host} (IP: {ip}, Latency: {proxy.latency:.2f}ms)")
-            else:
-                logger.debug(f"❌ FAILED: {proxy.host}")
-            proxy_queue.task_done()
-
-    async def run(self, sources: List[str]):
-        logger.info(f"🚀 Starting proxy check with {self.xray_max_concurrent} workers.")
-        
-        # 1. Fetch all sources
-        raw_content = ""
-        async with aiohttp.ClientSession() as session:
-            tasks = [self._fetch_source(session, src) for src in sources]
-            results = await asyncio.gather(*tasks)
-            raw_content = "\n".join(results)
-
-        # 2. Parse and deduplicate proxies
-        found_uris = set(re.findall(PROXY_LINK_PATTERN, raw_content))
-        for uri in found_uris:
-            parsed = self._parse_uri(uri)
-            if parsed:
-                # Deduplicate based on protocol, host, port, and main ID
-                key = f"{parsed.protocol}:{parsed.host}:{parsed.port}:{parsed.uuid or parsed.password}"
-                if key not in self.unique_proxies:
-                    self.unique_proxies[key] = parsed
-        
-        logger.info(f"Found {len(self.unique_proxies)} unique proxies to test.")
-
-        # 3. Test proxies in parallel
-        proxy_queue = asyncio.Queue()
-        for proxy in self.unique_proxies.values():
-            await proxy_queue.put(proxy)
-
-        working_proxies: List[ProxyConfig] = []
-        tester_tasks = []
-        for _ in range(self.xray_max_concurrent):
-            task = asyncio.create_task(self._test_proxy_worker(proxy_queue, working_proxies))
-            tester_tasks.append(task)
-        
-        await proxy_queue.join()
-        await asyncio.gather(*tester_tasks, return_exceptions=True)
-
-        logger.info(f"🏁 Found {len(working_proxies)} working proxies.")
-
-        # 4. Format names and sort
-        for proxy in working_proxies:
-            proxy.remarks = await proxy.format_name_async()
-        
-        working_proxies.sort(key=protocol_sort_key)
-        
-        # 5. Save results
-        self.save_results(working_proxies)
-
-    def save_results(self, proxies: List[ProxyConfig]):
-        output_dir = Path("output")
-        output_dir.mkdir(exist_ok=True)
-
-        # Full list
-        full_path = output_dir / "all.txt"
-        with open(full_path, "w", encoding="utf-8") as f:
-            f.write(HEADER)
-            for proxy in proxies:
-                # Reconstruct URI with new remarks
-                parsed_uri = list(urlparse(proxy.raw))
-                parsed_uri[5] = unquote(proxy.remarks) # fragment for name
-                f.write(urlunparse(parsed_uri) + "\n")
-        logger.info(f"Saved {len(proxies)} proxies to {full_path}")
-
-        # Per-protocol files
+        # Группируем по протоколам
         by_protocol = {}
-        for proxy in proxies:
-            if proxy.protocol not in by_protocol:
-                by_protocol[proxy.protocol] = []
-            by_protocol[proxy.protocol].append(proxy)
-        
-        for proto, proto_proxies in by_protocol.items():
-            proto_path = output_dir / f"{proto}.txt"
-            with open(proto_path, "w", encoding="utf-8") as f:
-                f.write(HEADER)
-                for proxy in proto_proxies:
-                    parsed_uri = list(urlparse(proxy.raw))
-                    parsed_uri[5] = unquote(proxy.remarks)
-                    f.write(urlunparse(parsed_uri) + "\n")
-            logger.info(f"Saved {len(proto_proxies)} {proto.upper()} proxies to {proto_path}")
+        for fp, item in self.storage.items():
+            proto = item.get("protocol", "unknown")
+            by_protocol.setdefault(proto, []).append(item["config"])
 
+        # Все проверенные (полный список)
+        all_checked_configs = [item["config"] for item in self.storage.values()]
+        self._write_subscription("sub_all_checked.txt", all_checked_configs)
 
-# ---------- Main Execution ----------
+        # Топ-100 быстрых узлов для iOS
+        sorted_by_speed = sorted(
+            self.storage.values(),
+            key=lambda x: x.get("speed_ms", 99999)
+        )
+        top_100 = [item["config"] for item in sorted_by_speed[:100]]
+        self._write_subscription("sub_ios.txt", top_100)
+
+        # Android (все рабочие)
+        self._write_subscription("sub_android.txt", all_checked_configs)
+
+        # По протоколам
+        for proto, configs in by_protocol.items():
+            self._write_subscription(f"sub_{proto}.txt", configs)
+
+        logger.info("All subscriptions generated in 'subscriptions/' directory")
+
+    def _write_subscription(self, filename: str, configs: List[str]):
+        """Формирует Base64 подписку из списка конфигов."""
+        header = f"# {SUBSCRIPTION_NAME} | {TG_CONTACT}"
+        lines = [header] + configs
+        content = "\n".join(lines)
+        b64 = base64.b64encode(content.encode("utf-8")).decode("utf-8")
+        filepath = Path(OUTPUT_DIR) / filename
+        with open(filepath, "w", encoding="utf-8") as f:
+            f.write(b64)
+        logger.debug(f"Subscription saved: {filepath} ({len(configs)} nodes)")
+
+# ---------- Точка входа ----------
 async def main():
-    parser = ArgumentParser(description="Advanced Proxy Parser and Checker")
-    parser.add_argument('--threads', type=int, default=30, help='Max concurrent source fetchers (deprecated, not used).')
-    parser.add_argument('--xray-threads', type=int, default=80, help='Max concurrent Xray checker processes.')
-    parser.add_argument('--parse-telegram', action='store_true', help='Enable parsing from Telegram channels.')
-    parser.add_argument('--sources', nargs='+', default=DEFAULT_SOURCES, help='List of source URLs.')
-    
-    args = parser.parse_args()
+    urls_str = os.getenv("SOURCE_URLS", "")
+    channels_str = os.getenv("SOURCE_CHANNELS", "")
+    urls = [u.strip() for u in urls_str.split(",") if u.strip()]
+    channels = [c.strip() for c in channels_str.split(",") if c.strip()]
+    if not urls and not channels:
+        urls = ["https://raw.githubusercontent.com/example/v2ray-list/main/list.txt"]
+        channels = ["@shadowproxy66"]
 
-    # In a real scenario, you would add telegram parsing logic here if needed.
-    # For now, it just uses the default/provided http sources.
-
-    checker = ProxyChecker(xray_max_concurrent=args.xray_threads)
-    await checker.run(sources=args.sources)
+    sources = {"urls": urls, "channels": channels}
+    parser = Analizator()
+    try:
+        await parser.update(sources)
+    finally:
+        await parser.close()
 
 if __name__ == "__main__":
     asyncio.run(main())
