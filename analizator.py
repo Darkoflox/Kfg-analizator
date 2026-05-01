@@ -26,17 +26,14 @@ import aiohttp
 from bs4 import BeautifulSoup
 
 # ---------- Настройки ----------
-UPDATE_INTERVAL = 21600  # 6 часов (справочно, не используется в этом скрипте)
 SUBSCRIPTION_NAME = "Niyakwi"
 TG_CONTACT = "@Niyakwi"
 OUTPUT_DIR = "subscriptions"
 RAW_STORAGE = "configs_storage.json"
-CONNECT_TIMEOUT = 4               # секунды на TCP/TLS подключение
+CONNECT_TIMEOUT = 4
 MAX_CONCURRENT_CHECKS = 60
-SPEED_TEST_SAMPLE_SIZE = 5120     # байт (не используется, скорость меряется по рукопожатию)
-USE_XRAY_CORE = False             # установите True, если xray-core доступен в PATH
+USE_XRAY_CORE = False
 
-# Папка для подписок
 Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
@@ -46,13 +43,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("Analizator")
 
-# ---------- Регулярки для конфигов ----------
+# ---------- Регулярки ----------
 PROXY_REGEX = re.compile(
     r'(?:vmess|vless|trojan|hy2|hysteria2|ss|ssr)://[^\s]*',
     re.IGNORECASE
 )
 
-# ---------- Утилиты ----------
 def extract_proxy_links(text: str) -> List[str]:
     return re.findall(PROXY_REGEX, text)
 
@@ -60,12 +56,9 @@ def normalize_config(config: str) -> str:
     return config.strip()
 
 def config_fingerprint(config: str) -> str:
-    """SHA256 от нормализованного конфига."""
     return hashlib.sha256(config.encode()).hexdigest()
 
-# ---------- Парсинг параметров конфига ----------
 def parse_proxy_url(config: str) -> dict:
-    """Разбирает URL конфига на компоненты, извлекает транспорт, параметры безопасности."""
     result = {
         "raw": config,
         "protocol": None,
@@ -91,9 +84,7 @@ def parse_proxy_url(config: str) -> dict:
         result["host"] = parsed.hostname
         result["port"] = parsed.port
         if parsed.fragment:
-            fragment_params = parse_qs(parsed.fragment)
-            result["extra"]["fragment_params"] = fragment_params
-
+            result["extra"]["fragment_params"] = parse_qs(parsed.fragment)
         if parsed.query:
             qs = parse_qs(parsed.query)
             transport = qs.get("type", [None])[0] or qs.get("transport", [None])[0]
@@ -126,12 +117,10 @@ def parse_proxy_url(config: str) -> dict:
         logger.debug(f"parse_proxy_url error: {e}")
     return result
 
-# ---------- Загрузка и обновление Geo-фильтра ----------
 GEO_RF_IPS_FILE = "rf_ips.txt"
 GEO_RF_DOMAINS_FILE = "rf_domains.txt"
 
 def load_geo_lists() -> Tuple[Set[str], Set[str]]:
-    """Загружает списки запрещённых IP-диапазонов и доменов."""
     ips = set()
     domains = set()
     if Path(GEO_RF_IPS_FILE).exists():
@@ -143,22 +132,12 @@ def load_geo_lists() -> Tuple[Set[str], Set[str]]:
     return ips, domains
 
 def is_russian_ip(ip: str, banned_ranges: Set[str]) -> bool:
-    """Упрощённая проверка: является ли IP одним из запрещённых."""
     return ip in banned_ranges
 
 def is_russian_domain(domain: str, banned_domains: Set[str]) -> bool:
     return domain in banned_domains
 
-# ---------- Проверщик ----------
 class SmartChecker:
-    """
-    Многоуровневая проверка:
-    1) TCP connect + время
-    2) TLS handshake (если security=tls/reality) + время
-    3) Для reality/gRPC – минимальная валидация полей + попытка TLS с ALPN h2
-    4) Замер скорости: время от старта соединения до конца рукопожатия (мс).
-    Возвращает словарь с результатами и флагом is_working.
-    """
     @staticmethod
     async def check(config: str, session: aiohttp.ClientSession) -> dict:
         info = parse_proxy_url(config)
@@ -177,16 +156,13 @@ class SmartChecker:
         except Exception as e:
             return {"working": False, "reason": f"TCP failed: {e}", "speed_ms": None}
 
-        # Если нет TLS – работаем
         if info["security"] not in ("tls", "reality"):
             writer.close()
             await writer.wait_closed()
             return {"working": True, "reason": "tcp_ok", "speed_ms": tcp_time}
 
-        # --- TLS handshake ---
         sni = info["sni"] or host
         alpn = info["alpn"]
-        # Для gRPC стандартный ALPN = ["h2"]
         if info["transport"] == "grpc" and not alpn:
             alpn = ["h2"]
 
@@ -199,14 +175,12 @@ class SmartChecker:
             if alpn:
                 ssl_context.set_alpn_protocols(alpn)
 
-            # Асинхронное TLS рукопожатие поверх существующего сокета
             transport = writer.transport
             loop = asyncio.get_event_loop()
             tls_proto = asyncio.sslproto.SSLProtocol(
                 loop, None, ssl_context, None, server_side=False
             )
             tls_proto.set_transport(transport)
-            # asyncio.wait_for на _on_handshake_complete
             await asyncio.wait_for(
                 tls_proto._on_handshake_complete, timeout=CONNECT_TIMEOUT
             )
@@ -219,10 +193,8 @@ class SmartChecker:
 
     @staticmethod
     async def check_with_xray(config: str, xray_path: str = "xray") -> dict:
-        """Проверка через Xray-core (заглушка)."""
         return {"working": False, "reason": "xray check not implemented", "speed_ms": None}
 
-# ---------- Загрузчики источников ----------
 class URLLoader:
     def __init__(self, session: aiohttp.ClientSession):
         self.session = session
@@ -241,8 +213,10 @@ class URLLoader:
 
 class TelegramWebLoader:
     """
-    Улучшенный загрузчик: пагинация (до 10 последних страниц),
-    извлечение из сообщений и медиа-подписей.
+    Улучшенный загрузчик Telegram:
+    - парсит текст, код-блоки (<code>, <pre>)
+    - извлекает ссылки из встроенных кнопок (inline buttons)
+    - поддерживает пагинацию (до 5 страниц)
     """
     BASE = "https://t.me/s/"
     MAX_PAGES = 5
@@ -254,10 +228,12 @@ class TelegramWebLoader:
         username = channel.lstrip("@")
         all_links = []
         last_post_id = None
+
         for page in range(self.MAX_PAGES):
             url = f"{self.BASE}{username}"
             if last_post_id:
                 url += f"?before={last_post_id}"
+
             try:
                 async with self.session.get(url, timeout=20) as resp:
                     if resp.status != 200:
@@ -268,27 +244,52 @@ class TelegramWebLoader:
                     messages = soup.find_all('div', class_='tgme_widget_message_wrap')
                     if not messages:
                         break
+
                     for msg in messages:
+                        # ID сообщения для пагинации
                         msg_id_attr = msg.get('data-post-id')
                         if msg_id_attr:
-                            _, mid = msg_id_attr.split('/')
-                            last_post_id = int(mid)
+                            try:
+                                _, mid = msg_id_attr.split('/')
+                                last_post_id = int(mid)
+                            except:
+                                pass
+
+                        # 1. Основной текст сообщения
                         text_div = msg.find('div', class_='tgme_widget_message_text')
                         if text_div:
                             all_links.extend(extract_proxy_links(text_div.get_text()))
-                        media = msg.find('a', class_='tgme_widget_message_photo_wrap')
-                        if media and media.get('href'):
-                            cap = msg.find('div', class_='tgme_widget_message_caption')
-                            if cap:
-                                all_links.extend(extract_proxy_links(cap.get_text()))
+
+                        # 2. Кодовые блоки (моноширинный текст) – часто конфиги вставляют в <code>
+                        code_tags = msg.find_all(['code', 'pre'])
+                        for code_tag in code_tags:
+                            all_links.extend(extract_proxy_links(code_tag.get_text()))
+
+                        # 3. Встроенные кнопки (inline buttons) – могут содержать ссылки на подписки/конфиги
+                        buttons = msg.find_all('a', class_='tgme_widget_message_inline_button')
+                        for btn in buttons:
+                            href = btn.get('href')
+                            if href:
+                                # прямая ссылка может вести на файл подписки или одиночный конфиг
+                                all_links.extend(extract_proxy_links(href))
+                                # также добавляем саму ссылку как потенциальный источник, если это URL с прокси-протоколом
+                                if any(proto in href for proto in ['vmess://', 'vless://', 'trojan://', 'hy2://', 'ss://', 'ssr://']):
+                                    all_links.append(href)
+
+                        # 4. Подписи к медиа (фото/видео)
+                        caption = msg.find('div', class_='tgme_widget_message_caption')
+                        if caption:
+                            all_links.extend(extract_proxy_links(caption.get_text()))
+
                     await asyncio.sleep(0.3)
+
             except Exception as e:
                 logger.error(f"TG loader error for {channel} page {page+1}: {e}")
                 break
+
         logger.info(f"TG {channel}: collected {len(all_links)} raw proxies")
         return all_links
 
-# ---------- Основной класс ----------
 class Analizator:
     def __init__(self):
         self.session: Optional[aiohttp.ClientSession] = None
@@ -331,7 +332,7 @@ class Analizator:
             for ch in channels:
                 links = await tg_loader.fetch(ch)
                 raw.update(links)
-        # Дедупликация внутри собранного
+        # Дедупликация внутри пачки
         unique = set()
         clean = []
         for cfg in raw:
@@ -347,10 +348,8 @@ class Analizator:
         await self._start_session()
         fresh = await self.collect(urls=sources.get("urls", []), channels=sources.get("channels", []))
 
-        # Загружаем гео-списки
         banned_ips, banned_domains = load_geo_lists()
 
-        # Фильтруем: исключаем конфиги с российскими IP/доменами
         filtered = []
         for cfg in fresh:
             info = parse_proxy_url(cfg)
@@ -402,39 +401,32 @@ class Analizator:
         self._build_subscriptions()
 
     def _build_subscriptions(self):
-        """Создаёт несколько файлов подписок, как указано в README проекта."""
         if not self.storage:
             logger.warning("No configs to generate subscriptions")
             return
 
-        # Группируем по протоколам
         by_protocol = {}
         for fp, item in self.storage.items():
             proto = item.get("protocol", "unknown")
             by_protocol.setdefault(proto, []).append(item["config"])
 
-        all_checked_configs = [item["config"] for item in self.storage.values()]
-        self._write_subscription("sub_all_checked.txt", all_checked_configs)
+        all_checked = [item["config"] for item in self.storage.values()]
+        self._write_subscription("sub_all_checked.txt", all_checked)
 
-        # Топ-100 быстрых узлов для iOS
         sorted_by_speed = sorted(
             self.storage.values(),
             key=lambda x: x.get("speed_ms", 99999)
         )
         top_100 = [item["config"] for item in sorted_by_speed[:100]]
         self._write_subscription("sub_ios.txt", top_100)
+        self._write_subscription("sub_android.txt", all_checked)
 
-        # Android (все рабочие)
-        self._write_subscription("sub_android.txt", all_checked_configs)
-
-        # По протоколам
         for proto, configs in by_protocol.items():
             self._write_subscription(f"sub_{proto}.txt", configs)
 
         logger.info("All subscriptions generated in 'subscriptions/' directory")
 
     def _write_subscription(self, filename: str, configs: List[str]):
-        """Формирует Base64 подписку из списка конфигов."""
         header = f"# {SUBSCRIPTION_NAME} | {TG_CONTACT}"
         lines = [header] + configs
         content = "\n".join(lines)
@@ -444,15 +436,14 @@ class Analizator:
             f.write(b64)
         logger.debug(f"Subscription saved: {filepath} ({len(configs)} nodes)")
 
-# ---------- Точка входа ----------
 async def main():
     urls_str = os.getenv("SOURCE_URLS", "")
     channels_str = os.getenv("SOURCE_CHANNELS", "")
     urls = [u.strip() for u in urls_str.split(",") if u.strip()]
     channels = [c.strip() for c in channels_str.split(",") if c.strip()]
 
-    # Если переменные не заданы (на время тестов) – используем примеры
     if not urls and not channels:
+        # Значения по умолчанию (можно заменить на свои)
         urls = ["https://raw.githubusercontent.com/example/v2ray-list/main/list.txt"]
         channels = ["@shadowproxy66"]
 
