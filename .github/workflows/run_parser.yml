@@ -1,43 +1,30 @@
-name: 🚀 Kfg-analizator Runner
+name: Analizator Update
 
 on:
-  workflow_dispatch: # Позволяет запускать вручную со страницы Actions
   schedule:
-    - cron: '0 */6 * * *' # Запускать каждые 6 часов
+    - cron: '0 */6 * * *'          # каждые 6 часов
+  workflow_dispatch:                # ручной запуск
 
 jobs:
-  build-and-commit:
+  parse-and-commit:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
 
     steps:
-      - name:  checkout code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: 🐍 Set up Python
+      - name: Setup Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11' # Используем стабильную версию Python
+          python-version: '3.11'
 
-      - name: 📦 Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+      - name: Install dependencies
+        run: pip install -r requirements.txt
 
-      - name: 🚀 Run Parser
-        run: |
-          python advanced_parser.py --threads 30 --xray-threads 80 --parse-telegram
-        # Аргументы взяты из вашего первоначального запроса.
-        # --threads в текущем коде не используется, но оставлен для совместимости.
-
-      - name: 💾 Commit results
-        run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add output/ # Добавляем директорию с результатами
-          # Проверяем, есть ли изменения для коммита
-          if ! git diff --staged --quiet; then
-            git commit -m "📊 Update proxy lists - $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-            git push
-          else
-            echo "✅ No changes to commit."
-          fi
+      - name: Run Analizator & Commit
+        env:
+          SOURCE_URLS: ${{ secrets.SOURCE_URLS }}
+          SOURCE_CHANNELS: ${{ secrets.SOURCE_CHANNELS }}
+        run: python run_action.py
