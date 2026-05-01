@@ -1,23 +1,32 @@
 #!/usr/bin/env python3
-import asyncio
+"""
+Скрипт для GitHub Actions: запускает analizator.py и фиксирует изменения.
+"""
 import subprocess
 import sys
+import os
+from datetime import datetime, timezone
 
-async def run_and_commit():
-    # Импортируем основной модуль и запускаем обновление
-    import analizator
-    await analizator.main()
+def run_and_commit():
+    # Запускаем основной парсер как отдельный процесс
+    result = subprocess.run([sys.executable, "analizator.py"], check=False)
+    if result.returncode != 0:
+        print(f"analizator.py завершился с ошибкой (код {result.returncode})")
+        sys.exit(result.returncode)
 
-    # Фиксируем изменения, если они есть
+    # Настраиваем git
     subprocess.run(["git", "config", "user.name", "github-actions[bot]"])
     subprocess.run(["git", "config", "user.email", "github-actions[bot]@users.noreply.github.com"])
-    # Добавляем все изменённые файлы
+
+    # Добавляем изменённые файлы
     subprocess.run(["git", "add", "subscriptions/", "configs_storage.json"])
+
     # Проверяем, есть ли что коммитить
-    result = subprocess.run(["git", "diff", "--staged", "--quiet"])
-    if result.returncode != 0:
-        subprocess.run(["git", "commit", "-m", f"🔄 Update subscription {datetime.now().isoformat()}"])
+    diff = subprocess.run(["git", "diff", "--staged", "--quiet"])
+    if diff.returncode != 0:
+        commit_msg = f"🔄 Update subscription {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"
+        subprocess.run(["git", "commit", "-m", commit_msg])
         subprocess.run(["git", "push"])
 
 if __name__ == "__main__":
-    asyncio.run(run_and_commit())
+    run_and_commit()
