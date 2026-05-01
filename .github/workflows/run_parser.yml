@@ -1,35 +1,43 @@
-name: "Update Subscriptions (BS)"
+name: 🚀 Kfg-analizator Runner
 
 on:
+  workflow_dispatch: # Позволяет запускать вручную со страницы Actions
   schedule:
-    - cron: '0 */6 * * *'
-  workflow_dispatch:
+    - cron: '0 */6 * * *' # Запускать каждые 6 часов
 
 jobs:
-  update:
-    runs-on: ubuntu-22.04
-    timeout-minutes: 60
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v4
+  build-and-commit:
+    runs-on: ubuntu-latest
 
-      - name: Set up Python
+    steps:
+      - name:  checkout code
+        uses: actions/checkout@v4
+
+      - name: 🐍 Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
+          python-version: '3.11' # Используем стабильную версию Python
 
-      - name: Install dependencies
-        run: pip install aiohttp pyyaml geoip2
+      - name: 📦 Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Run parser (Xray 80 threads)
-        run: python advanced_parser.py --threads 30 --xray-threads 80 --parse-telegram
+      - name: 🚀 Run Parser
+        run: |
+          python advanced_parser.py --threads 30 --xray-threads 80 --parse-telegram
+        # Аргументы взяты из вашего первоначального запроса.
+        # --threads в текущем коде не используется, но оставлен для совместимости.
 
-      - name: Update README with subscription links
-        run: python update_readme.py
-
-      - name: Commit and push changes
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "Автообновление (быстрое) и README"
-          file_pattern: '*.txt README.md'
+      - name: 💾 Commit results
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add output/ # Добавляем директорию с результатами
+          # Проверяем, есть ли изменения для коммита
+          if ! git diff --staged --quiet; then
+            git commit -m "📊 Update proxy lists - $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+            git push
+          else
+            echo "✅ No changes to commit."
+          fi
